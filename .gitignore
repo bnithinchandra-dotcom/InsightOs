@@ -1,0 +1,82 @@
+# ============================================
+# InsightOS - Git Ignore
+# ============================================
+
+# Environment / Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Node / React
+node_modules/
+dist/
+build/
+.vite/
+*.tsbuildinfo
+
+# IDE / Editors
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Database / local runtime
+*.db
+*.sqlite
+*.sqlite3
+
+# Data / generated analytics artifacts
+data/
+datasets/
+artifacts/
+exports/
+cache/
+
+# Machine Learning artifacts
+*.joblib
+*.pkl
+*.pickle
+*.onnx
+
+# Docker
+docker-compose.override.yml
+
+# Coverage / test output
+coverage/
+test-results/
+playwright-report/
+
+# Generated documentation
+site/
+
+# Local InsightOS runtime files
