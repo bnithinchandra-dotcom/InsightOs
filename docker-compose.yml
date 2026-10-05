@@ -33,7 +33,7 @@ services:
       retries: 10
 
   minio:
-    image: minio/minio:latest
+    image: quay.io/minio/aistor/minio:RELEASE.2026-09-19T17-05-25Z    
     container_name: insightos-minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
