@@ -1,5 +1,22 @@
 services:
 
+  backend:
+    build:
+      context: ./backend
+    container_name: insightos-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${BACKEND_PORT}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
   postgres:
     image: postgres:16
     container_name: insightos-postgres
