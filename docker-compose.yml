@@ -9,6 +9,8 @@ services:
       - .env
     ports:
       - "${BACKEND_PORT}:8000"
+    volumes:
+      - ./backend:/app
     depends_on:
       postgres:
         condition: service_healthy
@@ -50,7 +52,9 @@ services:
       retries: 10
 
   minio:
-    image: quay.io/minio/aistor/minio:RELEASE.2026-09-19T17-05-25Z    
+    build:
+      context: .
+      dockerfile: infrastructure/docker/minio.Dockerfile
     container_name: insightos-minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
@@ -72,3 +76,4 @@ volumes:
   postgres_data:
   redis_data:
   minio_data:
+    name: insightos_minio_community_data

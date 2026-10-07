@@ -3,3 +3,5 @@ uvicorn[standard]
 sqlalchemy
 psycopg[binary]
 alembic
+redis
+minio
