@@ -18,12 +18,9 @@ target_metadata = Base.metadata
 
 
 def get_database_url() -> str:
-    database_url = getenv("DATABASE_URL")
+    from app.database import DEFAULT_DATABASE_URL
 
-    if not database_url:
-        raise RuntimeError("DATABASE_URL environment variable is not set")
-
-    return database_url
+    return getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
 
 
 def run_migrations_offline() -> None:

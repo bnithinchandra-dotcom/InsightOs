@@ -19,6 +19,29 @@ services:
       minio:
         condition: service_healthy
 
+  worker:
+    build:
+      context: ./worker
+    container_name: insightos-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./worker:/app
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, sys, redis; r = redis.Redis.from_url(os.getenv('REDIS_URL', f\"redis://{os.getenv('REDIS_HOST', 'redis')}:{os.getenv('REDIS_PORT', '6379')}/0\"), socket_connect_timeout=3, socket_timeout=3); sys.exit(0 if r.ping() else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   postgres:
     image: postgres:16
     container_name: insightos-postgres
