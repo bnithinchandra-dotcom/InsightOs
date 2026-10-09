@@ -7,6 +7,7 @@ from uuid import uuid4
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from minio import Minio
+from minio.deleteobjects import DeleteObject
 from minio.error import MinioException
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import SQLAlchemyError
@@ -464,6 +465,93 @@ def get_dataset_file(dataset_id: int, file_id: int):
             raise HTTPException(status_code=404, detail="Dataset file not found.")
 
         return serialize_dataset_file(dataset_file)
+
+
+@app.delete("/api/v1/datasets/{dataset_id}")
+def delete_dataset(dataset_id: int):
+    with SessionLocal() as session:
+        try:
+            dataset = (
+                session.query(Dataset)
+                .filter(Dataset.id == dataset_id)
+                .with_for_update()
+                .one_or_none()
+            )
+        except SQLAlchemyError as error:
+            logger.error(
+                "Dataset lookup failed for deletion of dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Dataset could not be deleted.",
+            ) from None
+
+        if dataset is None:
+            raise HTTPException(status_code=404, detail="Dataset not found.")
+
+        bucket = getenv("MINIO_RAW_BUCKET", "insightos-raw")
+        try:
+            storage = get_storage_client()
+            if storage.bucket_exists(bucket):
+                delete_errors = list(
+                    storage.remove_objects(
+                        bucket,
+                        (
+                            DeleteObject(obj.object_name)
+                            for obj in storage.list_objects(
+                                bucket,
+                                prefix=f"{dataset_id}/",
+                                recursive=True,
+                            )
+                        ),
+                    )
+                )
+            else:
+                delete_errors = []
+        except (MinioException, HTTPError, OSError) as error:
+            session.rollback()
+            logger.error(
+                "Object storage deletion failed for dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Dataset files could not be removed from storage.",
+            ) from None
+
+        if delete_errors:
+            session.rollback()
+            logger.error(
+                "Object storage reported deletion errors for dataset %s",
+                dataset_id,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Dataset files could not be removed from storage.",
+            )
+
+        try:
+            session.query(DatasetFile).filter(
+                DatasetFile.dataset_id == dataset_id
+            ).delete(synchronize_session=False)
+            session.delete(dataset)
+            session.commit()
+        except SQLAlchemyError as error:
+            session.rollback()
+            logger.error(
+                "Database deletion failed for dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Dataset metadata could not be deleted.",
+            ) from None
+
+    return {"deleted": True, "dataset_id": dataset_id}
 
 
 @app.get("/health")
