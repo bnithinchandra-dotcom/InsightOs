@@ -20,6 +20,11 @@ from urllib3.exceptions import HTTPError
 
 from app.database import SessionLocal
 from app.models import Dataset, DatasetFile, Project
+from app.parsing import (
+    ParserConfigurationError,
+    ParsingError,
+    parse_dataset_file,
+)
 from app.service_health import check_database, check_redis, check_storage
 
 
@@ -39,6 +44,7 @@ UPLOAD_MIME_TYPES = {
     },
     ".json": {"application/json", "text/json"},
     ".parquet": {"application/vnd.apache.parquet", "application/x-parquet"},
+    ".xml": {"application/xml", "text/xml"},
 }
 
 
@@ -229,7 +235,7 @@ def validate_upload_type(filename: str, content_type: str | None) -> None:
     if accepted_types is None:
         raise HTTPException(
             status_code=415,
-            detail="Unsupported file extension. Accepted formats are CSV, TSV, XLSX, JSON, and Parquet.",
+            detail="Unsupported file extension. Accepted formats are CSV, TSV, XLSX, JSON, Parquet, and XML.",
         )
 
     if content_type is None:
@@ -360,6 +366,49 @@ def upload_dataset_file(
                 detail="Upload could not be started.",
             ) from None
 
+        dataset.status = "Processing"
+        try:
+            session.commit()
+        except SQLAlchemyError as error:
+            session.rollback()
+            logger.error(
+                "Could not update dataset %s processing status (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            mark_dataset_failed(dataset_id, session)
+            raise HTTPException(
+                status_code=500,
+                detail="File parsing could not be started.",
+            ) from None
+
+        try:
+            parsing_result = parse_dataset_file(filename, file.file, file_size)
+            file.file.seek(0)
+        except ParsingError as error:
+            mark_dataset_failed(dataset_id, session)
+            raise HTTPException(
+                status_code=422,
+                detail={"code": error.code, "message": error.message},
+            ) from None
+        except ParserConfigurationError as error:
+            mark_dataset_failed(dataset_id, session)
+            logger.error("Dataset parser configuration is invalid (%s)", error)
+            raise HTTPException(
+                status_code=500,
+                detail="File parsing is unavailable due to server configuration.",
+            ) from None
+        except (OSError, ValueError) as error:
+            mark_dataset_failed(dataset_id, session)
+            logger.warning(
+                "Uploaded file could not be parsed (%s)",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded file could not be read for parsing.",
+            ) from None
+
         bucket = getenv("MINIO_RAW_BUCKET", "insightos-raw")
         storage_key = f"{dataset_id}/{uuid4().hex}/{filename}"
         object_upload_started = False
@@ -395,6 +444,8 @@ def upload_dataset_file(
                 file_size_bytes=file_size,
                 checksum=checksum.hexdigest(),
                 mime_type=file.content_type,
+                detected_format=parsing_result.detected_format,
+                parsing_result=parsing_result.as_dict(),
             )
             session.add(dataset_file)
             dataset.status = "Uploaded"
@@ -467,6 +518,8 @@ def upload_dataset_file(
                 "file_size_bytes": dataset_file.file_size_bytes,
                 "mime_type": dataset_file.mime_type,
                 "checksum": dataset_file.checksum,
+                "detected_format": dataset_file.detected_format,
+                "parsing_result": dataset_file.parsing_result,
             },
         }
 
@@ -503,6 +556,8 @@ def serialize_dataset_file(dataset_file: DatasetFile) -> dict:
         "file_size_bytes": dataset_file.file_size_bytes,
         "mime_type": dataset_file.mime_type,
         "checksum": dataset_file.checksum,
+        "detected_format": dataset_file.detected_format,
+        "parsing_result": dataset_file.parsing_result,
         "created_at": dataset_file.created_at,
         "updated_at": dataset_file.updated_at,
     }
