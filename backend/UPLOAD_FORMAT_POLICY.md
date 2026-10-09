@@ -23,9 +23,31 @@ files.
 Parsing is synchronous during upload. On success, the original bytes are stored
 unchanged and the file record contains detected format, column names and
 physical types, row count, and format-specific metadata. The dataset returns to
-the existing `Uploaded` state. On a parse failure no new object/file record is
-created and the dataset is marked `Failed`; the response includes a safe error
-code and message. `MAX_DATASET_SIZE_MB` limits upload size;
+the existing `Uploaded` state only after the parsing metadata has been validated,
+the object size and SHA-256 metadata have been verified, and the file record is
+marked `Ready`. A file record is created in `Processing` before parsing/storage
+so interrupted and failed attempts are visible and recoverable; parse failures
+leave a `Failed` file record with a safe error code and message, without storing
+an object. Successful retries of identical filename/content reuse the same
+record and object key. Clients may also supply an `Idempotency-Key` header; a
+key reused for different filename/content returns a conflict. If a storage or
+database failure leaves object cleanup uncertain, the record remains
+`Processing` and the same upload can be retried to verify or complete it.
+PostgreSQL advisory locks serialize requests for the same dataset/upload key
+across backend workers and remain held through object verification and cleanup.
+A simultaneous retry receives an in-progress conflict; after a worker exits,
+the connection releases its lock and a later retry can recover the persisted
+`Processing` record.
+The connection is pinned outside the SQLAlchemy Session transaction lifecycle
+until lock release has been confirmed. Upload concurrency tests use mocked lock
+helpers and do not establish behavior against a live PostgreSQL server; a
+PostgreSQL integration test remains necessary to verify backend lock and
+connection-termination behavior in deployment. If SQLAlchemy invalidation and
+detachment both fail, the backend attempts to close the underlying DBAPI
+connection directly. If that also fails, the checked-out connection is kept in
+process quarantine and is not returned to the pool; safe server-side lock
+release cannot be guaranteed until the connection or backend process terminates.
+`MAX_DATASET_SIZE_MB` limits upload size;
 `MAX_DATASET_ROWS`, `MAX_DATASET_COLUMNS`, `MAX_XLSX_UNCOMPRESSED_MB`,
 `MAX_XLSX_ENTRIES`, `MAX_PARQUET_ROW_GROUPS`, `MAX_XML_SIZE_MB`,
 `MAX_XML_DEPTH`, `MAX_XML_ELEMENTS`, and `MAX_JSON_DEPTH` configure parser

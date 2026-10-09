@@ -1,18 +1,21 @@
 import hashlib
+import json
 import logging
 import math
 import re
+from threading import Lock
 import unicodedata
+from contextlib import ExitStack, contextmanager
 from email.message import Message
 from os import getenv
-from uuid import uuid4
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from minio import Minio
 from minio.deleteobjects import DeleteObject
 from minio.error import MinioException, S3Error
 from pydantic import BaseModel, Field
+import sqlalchemy as sa
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -29,6 +32,9 @@ from app.service_health import check_database, check_redis, check_storage
 
 
 logger = logging.getLogger(__name__)
+
+_UPLOAD_CONNECTION_QUARANTINE: list[object] = []
+_UPLOAD_CONNECTION_QUARANTINE_LOCK = Lock()
 
 app = FastAPI(
     title="InsightOS API",
@@ -161,6 +167,10 @@ class DatasetCreate(BaseModel):
     description: str | None = None
 
 
+class InvalidParsingResultError(ValueError):
+    pass
+
+
 def get_storage_client() -> Minio:
     return Minio(
         getenv("MINIO_ENDPOINT", "minio:9000"),
@@ -190,19 +200,328 @@ def get_max_dataset_size_bytes() -> int:
     return int(size_mb * 1024 * 1024)
 
 
-def mark_dataset_failed(dataset_id: int, session: Session) -> None:
+def validate_parsing_result(filename: str, result, file_size: int) -> dict:
+    expected_format = filename.rsplit(".", 1)[-1].lower()
     try:
+        parsed = result if isinstance(result, dict) else result.as_dict()
+        if (
+            parsed["detected_format"] != expected_format
+            or not isinstance(parsed["columns"], list)
+            or not isinstance(parsed["row_count"], int)
+            or isinstance(parsed["row_count"], bool)
+            or parsed["row_count"] < 0
+            or not isinstance(parsed["metadata"], dict)
+        ):
+            raise ValueError("Parser returned inconsistent top-level metadata.")
+
+        positions = set()
+        for column in parsed["columns"]:
+            if not isinstance(column, dict):
+                raise ValueError("Parser returned an invalid column descriptor.")
+            name = column.get("name")
+            position = column.get("position")
+            physical_type = column.get("physical_type")
+            physical_types = column.get("physical_types")
+            table = column.get("table")
+            if (
+                not isinstance(name, str)
+                or not isinstance(position, int)
+                or isinstance(position, bool)
+                or position < 0
+                or (table is not None and not isinstance(table, str))
+                or (table, position) in positions
+                or not isinstance(physical_type, str)
+                or not physical_type
+                or not isinstance(physical_types, list)
+                or any(not isinstance(value, str) for value in physical_types)
+            ):
+                raise ValueError("Parser returned invalid column metadata.")
+            positions.add((table, position))
+
+        if file_size <= 0:
+            raise ValueError("An empty upload cannot be successfully parsed.")
+        # Validate that metadata can be safely persisted by the configured JSON column.
+        return json.loads(json.dumps(parsed, allow_nan=False))
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise InvalidParsingResultError(
+            "Parser returned incomplete or invalid metadata."
+        ) from error
+
+
+def _file_response(dataset: Dataset, dataset_file: DatasetFile) -> dict:
+    return {
+        "dataset_id": dataset.id,
+        "dataset_status": dataset.status,
+        "file": {
+            "id": dataset_file.id,
+            "filename": dataset_file.filename,
+            "storage_key": dataset_file.storage_key,
+            "file_size_bytes": dataset_file.file_size_bytes,
+            "mime_type": dataset_file.mime_type,
+            "checksum": dataset_file.checksum,
+            "detected_format": dataset_file.detected_format,
+            "parsing_result": dataset_file.parsing_result,
+            "status": dataset_file.status,
+            "error_code": dataset_file.error_code,
+            "error_message": dataset_file.error_message,
+        },
+    }
+
+
+def _mark_ingestion_failed(
+    dataset_id: int,
+    dataset_file_id: int,
+    idempotency_key: str,
+    session: Session,
+    error_code: str,
+    error_message: str,
+    *,
+    retryable: bool = False,
+) -> None:
+    try:
+        session.rollback()
         dataset = session.get(Dataset, dataset_id)
-        if dataset is not None:
-            dataset.status = "Failed"
-            session.commit()
+        dataset_file = session.get(DatasetFile, dataset_file_id)
+        if dataset is None or dataset_file is None:
+            raise SQLAlchemyError("Ingestion records disappeared during processing.")
+        dataset_file.status = "Processing" if retryable else "Failed"
+        dataset_file.error_code = error_code
+        dataset_file.error_message = error_message
+        dataset.status = "Processing" if retryable else "Failed"
+        dataset.active_upload_key = idempotency_key if retryable else None
+        session.commit()
     except SQLAlchemyError as error:
         session.rollback()
         logger.error(
-            "Could not mark dataset %s as failed (%s)",
+            "Could not persist failure state for dataset %s (%s)",
             dataset_id,
             type(error).__name__,
         )
+
+
+def _upload_lock_id(dataset_id: int, idempotency_key: str) -> int:
+    lock_identity = f"{dataset_id}:{idempotency_key}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(lock_identity).digest()[:8], "big", signed=True)
+
+
+class _UploadConnectionDisposalError(RuntimeError):
+    def __init__(
+        self,
+        connection,
+        cleanup_error: BaseException,
+        invalidate_error: BaseException,
+        detach_error: BaseException,
+        physical_close_error: BaseException,
+    ) -> None:
+        self.connection = connection
+        self.cleanup_error = cleanup_error
+        self.invalidate_error = invalidate_error
+        self.detach_error = detach_error
+        self.physical_close_error = physical_close_error
+        self.session_close_error = None
+        super().__init__(
+            "Could not safely dispose the connection holding an upload "
+            "advisory lock; it remains quarantined and checked out."
+        )
+
+
+def _quarantine_upload_connection(connection) -> None:
+    with _UPLOAD_CONNECTION_QUARANTINE_LOCK:
+        if not any(
+            quarantined is connection
+            for quarantined in _UPLOAD_CONNECTION_QUARANTINE
+        ):
+            _UPLOAD_CONNECTION_QUARANTINE.append(connection)
+
+
+def _upload_connection_was_discarded(connection) -> bool:
+    try:
+        if connection.invalidated:
+            return True
+        proxied_connection = connection.connection
+        return not proxied_connection.is_valid or proxied_connection.is_detached
+    except BaseException:
+        return False
+
+
+def _discard_upload_connection(connection, error: BaseException) -> None:
+    invalidation_error = None
+    detachment_error = None
+    try:
+        connection.invalidate(error)
+        return
+    except BaseException as error_during_invalidation:
+        invalidation_error = error_during_invalidation
+        logger.error(
+            "Could not invalidate connection holding upload lock (%s)",
+            type(invalidation_error).__name__,
+        )
+    try:
+        connection.detach()
+        return
+    except BaseException as error_during_detachment:
+        detachment_error = error_during_detachment
+        logger.error(
+            "Could not detach connection holding upload lock (%s)",
+            type(detachment_error).__name__,
+        )
+
+    if _upload_connection_was_discarded(connection):
+        return
+
+    try:
+        connection.connection.dbapi_connection.close()
+    except BaseException as physical_close_error:
+        _quarantine_upload_connection(connection)
+        logger.critical(
+            "Could not physically close connection with uncertain upload lock "
+            "ownership (%s); connection remains checked out",
+            type(physical_close_error).__name__,
+        )
+        raise _UploadConnectionDisposalError(
+            connection,
+            error,
+            invalidation_error,
+            detachment_error,
+            physical_close_error,
+        ) from error
+    logger.critical(
+        "SQLAlchemy invalidation and detachment failed; closed the underlying "
+        "DBAPI connection to release the upload lock"
+    )
+
+
+@contextmanager
+def _pinned_upload_session():
+    session = SessionLocal()
+    connection = None
+    unsafe_disposal = None
+    try:
+        bind = session.get_bind()
+        connection = bind.connect()
+        session.bind = connection
+        yield session, connection
+    except _UploadConnectionDisposalError as error:
+        unsafe_disposal = error
+        raise
+    finally:
+        try:
+            session.close()
+        except BaseException as error:
+            if unsafe_disposal is None:
+                raise
+            unsafe_disposal.session_close_error = error
+            logger.critical(
+                "Could not close upload session after connection disposal "
+                "failed (%s)",
+                type(error).__name__,
+            )
+        finally:
+            if connection is not None:
+                if unsafe_disposal is None:
+                    connection.close()
+                else:
+                    logger.critical(
+                        "Leaving uncertain upload-lock connection checked out "
+                        "to prevent pool reuse"
+                    )
+
+
+def _try_acquire_upload_lock(
+    session: Session,
+    connection,
+    dataset_id: int,
+    key: str,
+) -> int | None:
+    if session.get_bind() is not connection:
+        raise RuntimeError("Upload session is not bound to its pinned connection.")
+    if session.get_bind().dialect.name != "postgresql":
+        raise HTTPException(
+            status_code=503,
+            detail="Upload concurrency protection requires PostgreSQL.",
+        )
+
+    lock_id = _upload_lock_id(dataset_id, key)
+    try:
+        acquired = session.execute(
+            sa.select(sa.func.pg_try_advisory_lock(lock_id))
+        ).scalar_one()
+    except BaseException as error:
+        _discard_upload_connection(connection, error)
+        raise
+    return lock_id if acquired else None
+
+
+def _release_upload_lock(session: Session, connection, lock_id: int) -> None:
+    try:
+        if session.get_bind() is not connection:
+            raise RuntimeError("Upload session lost its pinned connection.")
+        unlocked = session.scalar(sa.select(sa.func.pg_advisory_unlock(lock_id)))
+        if unlocked is not True:
+            raise RuntimeError("PostgreSQL did not confirm advisory-lock release.")
+        session.commit()
+    except SQLAlchemyError as error:
+        logger.error(
+            "Could not release upload advisory lock (%s)",
+            type(error).__name__,
+        )
+        _discard_upload_connection(connection, error)
+        raise RuntimeError(
+            "Could not release PostgreSQL advisory lock; connection was discarded."
+        ) from error
+    except BaseException as error:
+        logger.error(
+            "Could not confirm upload advisory-lock release (%s)",
+            type(error).__name__,
+        )
+        _discard_upload_connection(connection, error)
+        if not isinstance(error, Exception):
+            raise
+        raise RuntimeError(
+            "Could not confirm PostgreSQL advisory-lock release; connection was discarded."
+        ) from error
+
+
+def _object_is_missing(error: S3Error) -> bool:
+    return error.code in {"NoSuchKey", "NoSuchObject"}
+
+
+def _verify_stored_object(storage, bucket: str, dataset_file: DatasetFile) -> bool:
+    try:
+        stored = storage.stat_object(bucket, dataset_file.storage_key)
+    except S3Error as error:
+        if _object_is_missing(error):
+            return False
+        raise
+
+    metadata = {
+        str(key).lower(): str(value)
+        for key, value in (getattr(stored, "metadata", None) or {}).items()
+    }
+    stored_checksum = metadata.get("x-amz-meta-sha256", metadata.get("sha256"))
+    if (
+        stored.size != dataset_file.file_size_bytes
+        or stored_checksum != dataset_file.checksum
+    ):
+        return False
+
+    response = storage.get_object(bucket, dataset_file.storage_key)
+    checksum = hashlib.sha256()
+    file_size = 0
+    try:
+        while chunk := response.read(UPLOAD_CHUNK_SIZE):
+            file_size += len(chunk)
+            if file_size > dataset_file.file_size_bytes:
+                return False
+            checksum.update(chunk)
+    finally:
+        response.close()
+        release_connection = getattr(response, "release_conn", None)
+        if release_connection is not None:
+            release_connection()
+    return file_size == dataset_file.file_size_bytes and checksum.hexdigest() == (
+        dataset_file.checksum
+    )
 
 
 def get_upload_filename(filename: str | None) -> str:
@@ -300,6 +619,7 @@ def upload_dataset_file(
     dataset_id: int,
     request: Request,
     file: UploadFile = File(...),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
     if getattr(request.state, "unsafe_upload_filename", False):
         raise HTTPException(
@@ -309,12 +629,19 @@ def upload_dataset_file(
 
     filename = get_upload_filename(file.filename)
     validate_upload_type(filename, file.content_type)
+    if idempotency_key is not None and (
+        not idempotency_key.strip() or len(idempotency_key) > 255
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key must contain 1 to 255 characters.",
+        )
 
     max_size_bytes = get_max_dataset_size_bytes()
     checksum = hashlib.sha256()
     file_size = 0
 
-    with SessionLocal() as session:
+    with _pinned_upload_session() as (session, connection), ExitStack() as cleanup:
         try:
             dataset = session.get(Dataset, dataset_id)
         except SQLAlchemyError as error:
@@ -351,13 +678,52 @@ def upload_dataset_file(
                 detail="Uploaded file could not be read.",
             ) from None
 
-        dataset.status = "Uploading"
+        file_checksum = checksum.hexdigest()
+        request_identity = (
+            f"client:{idempotency_key}"
+            if idempotency_key is not None
+            else f"content:{filename}:{file_checksum}"
+        )
+        upload_key = hashlib.sha256(request_identity.encode("utf-8")).hexdigest()
+
         try:
-            session.commit()
+            lock_id = _try_acquire_upload_lock(
+                session,
+                connection,
+                dataset_id,
+                upload_key,
+            )
+        except SQLAlchemyError as error:
+            logger.error(
+                "Could not reserve upload for dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Upload concurrency protection is temporarily unavailable.",
+            ) from None
+        if lock_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "upload_in_progress",
+                    "message": "An upload with this idempotency key is already in progress.",
+                },
+            )
+        cleanup.callback(_release_upload_lock, session, connection, lock_id)
+
+        try:
+            dataset = (
+                session.query(Dataset)
+                .filter(Dataset.id == dataset_id)
+                .with_for_update()
+                .one_or_none()
+            )
         except SQLAlchemyError as error:
             session.rollback()
             logger.error(
-                "Could not update dataset %s upload status (%s)",
+                "Could not lock dataset %s for upload (%s)",
                 dataset_id,
                 type(error).__name__,
             )
@@ -366,40 +732,208 @@ def upload_dataset_file(
                 detail="Upload could not be started.",
             ) from None
 
-        dataset.status = "Processing"
+        if dataset is None:
+            raise HTTPException(status_code=404, detail="Dataset not found.")
+
+        try:
+            dataset_file = (
+                session.query(DatasetFile)
+                .filter(
+                    DatasetFile.dataset_id == dataset_id,
+                    DatasetFile.idempotency_key == upload_key,
+                )
+                .one_or_none()
+            )
+        except SQLAlchemyError as error:
+            logger.error(
+                "Could not check upload retry for dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Upload could not be checked.",
+            ) from None
+
+        if dataset_file is None and idempotency_key is None:
+            try:
+                dataset_file = (
+                    session.query(DatasetFile)
+                    .filter(
+                        DatasetFile.dataset_id == dataset_id,
+                        DatasetFile.idempotency_key.is_(None),
+                        DatasetFile.filename == filename,
+                        DatasetFile.file_size_bytes == file_size,
+                        DatasetFile.checksum == file_checksum,
+                    )
+                    .order_by(DatasetFile.id.asc())
+                    .first()
+                )
+            except SQLAlchemyError as error:
+                logger.error(
+                    "Could not find a legacy upload for dataset %s (%s)",
+                    dataset_id,
+                    type(error).__name__,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail="Upload could not be checked.",
+                ) from None
+
+        if dataset_file is not None and (
+            dataset_file.filename != filename
+            or dataset_file.file_size_bytes != file_size
+            or dataset_file.checksum != file_checksum
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="This idempotency key was already used for different file contents.",
+            )
+
+        if dataset_file is not None and dataset_file.status == "Ready":
+            bucket = getenv("MINIO_RAW_BUCKET", "insightos-raw")
+            try:
+                storage = get_storage_client()
+                object_valid = _verify_stored_object(storage, bucket, dataset_file)
+            except (MinioException, HTTPError, OSError) as error:
+                logger.error(
+                    "Stored object verification failed for dataset %s (%s)",
+                    dataset_id,
+                    type(error).__name__,
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail="The previously uploaded file could not be verified.",
+                ) from None
+            if object_valid:
+                return _file_response(dataset, dataset_file)
+
+        if dataset.active_upload_key not in (None, upload_key):
+            raise HTTPException(
+                status_code=409,
+                detail="Another upload is currently being processed for this dataset.",
+            )
+
+        if dataset_file is None:
+            dataset_file = DatasetFile(
+                dataset_id=dataset_id,
+                filename=filename,
+                storage_key=f"{dataset_id}/{upload_key}/{filename}",
+                file_size_bytes=file_size,
+                checksum=file_checksum,
+                mime_type=file.content_type,
+                status="Processing",
+                idempotency_key=upload_key,
+            )
+            session.add(dataset_file)
+        else:
+            dataset_file.status = "Processing"
+            dataset_file.idempotency_key = upload_key
+            dataset_file.error_code = None
+            dataset_file.error_message = None
+        dataset.active_upload_key = upload_key
+        dataset.status = "Uploading"
         try:
             session.commit()
         except SQLAlchemyError as error:
             session.rollback()
             logger.error(
-                "Could not update dataset %s processing status (%s)",
+                "Could not persist upload state for dataset %s (%s)",
                 dataset_id,
                 type(error).__name__,
             )
-            mark_dataset_failed(dataset_id, session)
             raise HTTPException(
                 status_code=500,
-                detail="File parsing could not be started.",
+                detail="Upload could not be started.",
             ) from None
+        dataset_file_id = dataset_file.id
+
+        if dataset_file.parsing_result is not None:
+            try:
+                parsing_data = validate_parsing_result(
+                    filename,
+                    dataset_file.parsing_result,
+                    file_size,
+                )
+            except ValueError:
+                _mark_ingestion_failed(
+                    dataset_id,
+                    dataset_file_id,
+                    upload_key,
+                    session,
+                    "invalid_persisted_metadata",
+                    "Previously saved parsing metadata failed validation.",
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail="Previously saved parsing metadata is invalid.",
+                ) from None
+        else:
+            parsing_data = None
 
         try:
-            parsing_result = parse_dataset_file(filename, file.file, file_size)
-            file.file.seek(0)
+            if parsing_data is None:
+                parsing_result = parse_dataset_file(filename, file.file, file_size)
+                file.file.seek(0)
+                parsing_data = validate_parsing_result(
+                    filename,
+                    parsing_result,
+                    file_size,
+                )
+        except InvalidParsingResultError as error:
+            _mark_ingestion_failed(
+                dataset_id,
+                dataset_file_id,
+                upload_key,
+                session,
+                "invalid_parsing_metadata",
+                "The parser could not produce valid metadata for this file.",
+            )
+            logger.error(
+                "Parser returned invalid metadata for dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="The parser returned invalid metadata.",
+            ) from None
         except ParsingError as error:
-            mark_dataset_failed(dataset_id, session)
+            _mark_ingestion_failed(
+                dataset_id,
+                dataset_file_id,
+                upload_key,
+                session,
+                error.code,
+                error.message,
+            )
             raise HTTPException(
                 status_code=422,
                 detail={"code": error.code, "message": error.message},
             ) from None
         except ParserConfigurationError as error:
-            mark_dataset_failed(dataset_id, session)
+            _mark_ingestion_failed(
+                dataset_id,
+                dataset_file_id,
+                upload_key,
+                session,
+                "parser_configuration_error",
+                "File parsing is unavailable due to server configuration.",
+            )
             logger.error("Dataset parser configuration is invalid (%s)", error)
             raise HTTPException(
                 status_code=500,
                 detail="File parsing is unavailable due to server configuration.",
             ) from None
         except (OSError, ValueError) as error:
-            mark_dataset_failed(dataset_id, session)
+            _mark_ingestion_failed(
+                dataset_id,
+                dataset_file_id,
+                upload_key,
+                session,
+                "invalid_parsing_metadata",
+                "The parser could not produce valid metadata for this file.",
+            )
             logger.warning(
                 "Uploaded file could not be parsed (%s)",
                 type(error).__name__,
@@ -409,62 +943,98 @@ def upload_dataset_file(
                 detail="Uploaded file could not be read for parsing.",
             ) from None
 
+        dataset_file = session.get(DatasetFile, dataset_file_id)
+        dataset_file.parsing_result = parsing_data
+        dataset_file.detected_format = parsing_data["detected_format"]
+        dataset.status = "Processing"
+        try:
+            session.commit()
+        except SQLAlchemyError as error:
+            logger.error(
+                "Could not persist parsing metadata for dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            _mark_ingestion_failed(
+                dataset_id,
+                dataset_file_id,
+                upload_key,
+                session,
+                "metadata_persistence_failed",
+                "Parsed metadata could not be saved; retry the same upload.",
+                retryable=True,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Parsed metadata could not be saved.",
+            ) from None
+
         bucket = getenv("MINIO_RAW_BUCKET", "insightos-raw")
-        storage_key = f"{dataset_id}/{uuid4().hex}/{filename}"
+        storage = None
         object_upload_started = False
         try:
             storage = get_storage_client()
             if not storage.bucket_exists(bucket):
                 storage.make_bucket(bucket)
 
-            for _ in range(5):
-                storage_key = f"{dataset_id}/{uuid4().hex}/{filename}"
+            if not _verify_stored_object(storage, bucket, dataset_file):
                 try:
-                    storage.stat_object(bucket, storage_key)
-                except S3Error as error:
-                    if error.code in {"NoSuchKey", "NoSuchObject"}:
-                        break
-                    raise
-            else:
-                raise ValueError("Could not generate a unique storage key.")
+                    storage.stat_object(bucket, dataset_file.storage_key)
+                except S3Error as missing_error:
+                    if not _object_is_missing(missing_error):
+                        raise
+                else:
+                    object_upload_started = True
+                    storage.remove_object(bucket, dataset_file.storage_key)
 
-            object_upload_started = True
-            storage.put_object(
-                bucket,
-                storage_key,
-                file.file,
-                file_size,
-                content_type=file.content_type or "application/octet-stream",
-            )
+                file.file.seek(0)
+                object_upload_started = True
+                storage.put_object(
+                    bucket,
+                    dataset_file.storage_key,
+                    file.file,
+                    file_size,
+                    content_type=file.content_type or "application/octet-stream",
+                    metadata={"sha256": file_checksum},
+                )
 
-            dataset_file = DatasetFile(
-                dataset_id=dataset_id,
-                filename=filename,
-                storage_key=storage_key,
-                file_size_bytes=file_size,
-                checksum=checksum.hexdigest(),
-                mime_type=file.content_type,
-                detected_format=parsing_result.detected_format,
-                parsing_result=parsing_result.as_dict(),
-            )
-            session.add(dataset_file)
+            if not _verify_stored_object(storage, bucket, dataset_file):
+                raise ValueError("Stored object integrity verification failed.")
+
+            dataset = session.get(Dataset, dataset_id)
+            dataset_file = session.get(DatasetFile, dataset_file_id)
+            dataset_file.status = "Ready"
+            dataset_file.error_code = None
+            dataset_file.error_message = None
             dataset.status = "Uploaded"
+            dataset.active_upload_key = None
             session.commit()
         except (MinioException, HTTPError, OSError, ValueError) as error:
             session.rollback()
-            cleanup_succeeded = True
-            if object_upload_started:
+            cleanup_succeeded = not object_upload_started
+            if object_upload_started and storage is not None:
                 try:
-                    storage.remove_object(bucket, storage_key)
+                    storage.remove_object(bucket, dataset_file.storage_key)
+                    cleanup_succeeded = True
                 except (MinioException, HTTPError, OSError) as cleanup_error:
-                    cleanup_succeeded = False
                     logger.error(
-                        "Could not clean up failed upload for dataset %s at %s (%s)",
+                        "Could not clean up failed upload for dataset %s (%s)",
                         dataset_id,
-                        storage_key,
                         type(cleanup_error).__name__,
                     )
-            mark_dataset_failed(dataset_id, session)
+            _mark_ingestion_failed(
+                dataset_id,
+                dataset_file_id,
+                upload_key,
+                session,
+                "storage_failure",
+                (
+                    "Object storage failed; retry this upload."
+                    if cleanup_succeeded
+                    else "Object cleanup could not be confirmed; retry this upload."
+                ),
+                retryable=not cleanup_succeeded,
+            )
             logger.error(
                 "Object storage upload failed for dataset %s (%s)",
                 dataset_id,
@@ -473,7 +1043,10 @@ def upload_dataset_file(
             if not cleanup_succeeded:
                 raise HTTPException(
                     status_code=502,
-                    detail="File upload failed and object cleanup could not be confirmed.",
+                    detail={
+                        "code": "storage_cleanup_unconfirmed",
+                        "message": "File upload failed and object cleanup could not be confirmed; retry the same upload.",
+                    },
                 ) from None
             raise HTTPException(
                 status_code=502,
@@ -481,18 +1054,53 @@ def upload_dataset_file(
             ) from None
         except SQLAlchemyError as error:
             session.rollback()
-            cleanup_succeeded = True
-            try:
-                storage.remove_object(bucket, storage_key)
-            except (MinioException, HTTPError, OSError) as cleanup_error:
-                cleanup_succeeded = False
-                logger.error(
-                    "Could not clean up upload for dataset %s at %s (%s)",
-                    dataset_id,
-                    storage_key,
-                    type(cleanup_error).__name__,
-                )
-            mark_dataset_failed(dataset_id, session)
+            if storage is not None:
+                try:
+                    persisted = session.get(DatasetFile, dataset_file_id)
+                    dataset = session.get(Dataset, dataset_id)
+                    if (
+                        persisted is not None
+                        and persisted.status == "Ready"
+                        and dataset is not None
+                    ):
+                        if _verify_stored_object(storage, bucket, persisted):
+                            return _file_response(dataset, persisted)
+                except (
+                    MinioException,
+                    HTTPError,
+                    OSError,
+                    SQLAlchemyError,
+                ) as verification_error:
+                    logger.error(
+                        "Could not reconcile dataset %s after a database error (%s)",
+                        dataset_id,
+                        type(verification_error).__name__,
+                    )
+
+            cleanup_succeeded = not object_upload_started
+            if object_upload_started and storage is not None:
+                try:
+                    storage.remove_object(bucket, dataset_file.storage_key)
+                    cleanup_succeeded = True
+                except (MinioException, HTTPError, OSError) as cleanup_error:
+                    logger.error(
+                        "Could not clean up upload for dataset %s (%s)",
+                        dataset_id,
+                        type(cleanup_error).__name__,
+                    )
+            _mark_ingestion_failed(
+                dataset_id,
+                dataset_file_id,
+                upload_key,
+                session,
+                "metadata_persistence_failed",
+                (
+                    "File metadata could not be saved; retry the same upload."
+                    if cleanup_succeeded
+                    else "File metadata could not be saved and object cleanup is unconfirmed; retry the same upload."
+                ),
+                retryable=True,
+            )
             logger.error(
                 "File metadata save failed for dataset %s (%s)",
                 dataset_id,
@@ -501,27 +1109,14 @@ def upload_dataset_file(
             if not cleanup_succeeded:
                 raise HTTPException(
                     status_code=500,
-                    detail="File metadata could not be saved and object cleanup could not be confirmed.",
+                    detail="File metadata could not be saved and object cleanup could not be confirmed; retry the same upload.",
                 ) from None
             raise HTTPException(
                 status_code=500,
-                detail="File metadata could not be saved.",
+                detail="File metadata could not be saved; retry the same upload.",
             ) from None
 
-        return {
-            "dataset_id": dataset.id,
-            "dataset_status": dataset.status,
-            "file": {
-                "id": dataset_file.id,
-                "filename": dataset_file.filename,
-                "storage_key": dataset_file.storage_key,
-                "file_size_bytes": dataset_file.file_size_bytes,
-                "mime_type": dataset_file.mime_type,
-                "checksum": dataset_file.checksum,
-                "detected_format": dataset_file.detected_format,
-                "parsing_result": dataset_file.parsing_result,
-            },
-        }
+        return _file_response(dataset, dataset_file)
 
 
 def serialize_project(project: Project) -> dict:
@@ -558,6 +1153,9 @@ def serialize_dataset_file(dataset_file: DatasetFile) -> dict:
         "checksum": dataset_file.checksum,
         "detected_format": dataset_file.detected_format,
         "parsing_result": dataset_file.parsing_result,
+        "status": dataset_file.status,
+        "error_code": dataset_file.error_code,
+        "error_message": dataset_file.error_message,
         "created_at": dataset_file.created_at,
         "updated_at": dataset_file.updated_at,
     }

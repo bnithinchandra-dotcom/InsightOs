@@ -39,6 +39,11 @@ class Dataset(Base):
         nullable=False,
     )
 
+    active_upload_key: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
