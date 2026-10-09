@@ -1,17 +1,21 @@
 import hashlib
 import logging
 import math
+import re
+import unicodedata
+from email.message import Message
 from os import getenv
 from uuid import uuid4
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from minio import Minio
 from minio.deleteobjects import DeleteObject
-from minio.error import MinioException
+from minio.error import MinioException, S3Error
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+from starlette.types import ASGIApp, Receive, Scope, Send
 from urllib3.exceptions import HTTPError
 
 from app.database import SessionLocal
@@ -27,6 +31,123 @@ app = FastAPI(
 )
 
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+UPLOAD_MIME_TYPES = {
+    ".csv": {"text/csv", "application/csv", "text/plain"},
+    ".tsv": {"text/tab-separated-values", "text/tsv", "text/plain"},
+    ".xlsx": {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    },
+    ".json": {"application/json", "text/json"},
+    ".parquet": {"application/vnd.apache.parquet", "application/x-parquet"},
+}
+
+
+class UploadFilenameSafetyMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if (
+            scope["type"] != "http"
+            or scope["method"] != "POST"
+            or not re.fullmatch(r"/api/v1/datasets/\d+/files", scope["path"])
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        headers = {name.lower(): value for name, value in scope["headers"]}
+        content_type = headers.get(b"content-type", b"").decode("latin-1")
+        message = Message()
+        message["content-type"] = content_type
+        boundary = message.get_param("boundary", header="content-type")
+        if not boundary:
+            await self.app(scope, receive, send)
+            return
+
+        encoded_boundary = str(boundary).encode("latin-1")
+        initial_boundary = b"--" + encoded_boundary + b"\r\n"
+        part_boundary = b"\r\n--" + encoded_boundary
+        buffer = bytearray()
+        parser_state = "initial"
+        unsafe_filename = False
+
+        async def inspect_receive():
+            nonlocal parser_state, unsafe_filename
+            request_message = await receive()
+            if request_message["type"] != "http.request" or unsafe_filename:
+                return request_message
+
+            buffer.extend(request_message.get("body", b""))
+            while True:
+                if parser_state == "initial":
+                    boundary_index = buffer.find(initial_boundary)
+                    if boundary_index < 0:
+                        if len(buffer) > len(initial_boundary) + 16_384:
+                            unsafe_filename = True
+                        break
+                    del buffer[: boundary_index + len(initial_boundary)]
+                    parser_state = "headers"
+
+                if parser_state == "headers":
+                    header_end = buffer.find(b"\r\n\r\n")
+                    if header_end < 0:
+                        if len(buffer) > 16_384:
+                            unsafe_filename = True
+                        break
+
+                    part_headers = bytes(buffer[:header_end])
+                    del buffer[: header_end + 4]
+                    for line in part_headers.split(b"\r\n"):
+                        if not line.lower().startswith(b"content-disposition:"):
+                            continue
+                        match = re.search(
+                            rb"(?:^|;)\s*filename\s*=\s*(?:\"((?:\\.|[^\"])*)\"|([^;]*))",
+                            line.partition(b":")[2],
+                            flags=re.IGNORECASE,
+                        )
+                        if match is not None:
+                            filename = match.group(1) or match.group(2) or b""
+                            if b"/" in filename or b"\\" in filename:
+                                unsafe_filename = True
+                    parser_state = "body"
+
+                if parser_state == "body":
+                    boundary_index = buffer.find(part_boundary)
+                    if boundary_index < 0:
+                        del buffer[: max(0, len(buffer) - len(part_boundary) - 2)]
+                        break
+                    trailer_start = boundary_index + len(part_boundary)
+                    if len(buffer) < trailer_start + 2:
+                        del buffer[:boundary_index]
+                        break
+
+                    trailer = bytes(buffer[trailer_start : trailer_start + 2])
+                    del buffer[: trailer_start + 2]
+                    if trailer == b"--":
+                        parser_state = "done"
+                        buffer.clear()
+                        break
+                    if trailer != b"\r\n":
+                        unsafe_filename = True
+                        break
+                    parser_state = "headers"
+
+                if parser_state == "done" or unsafe_filename:
+                    break
+
+            if unsafe_filename:
+                scope.setdefault("state", {})["unsafe_upload_filename"] = True
+            return request_message
+
+        await self.app(scope, inspect_receive, send)
+
+
+app.add_middleware(UploadFilenameSafetyMiddleware)
 
 
 class DatasetCreate(BaseModel):
@@ -79,14 +200,53 @@ def mark_dataset_failed(dataset_id: int, session: Session) -> None:
 
 
 def get_upload_filename(filename: str | None) -> str:
-    clean_filename = (filename or "").replace("\\", "/").rsplit("/", maxsplit=1)[-1]
+    if not filename:
+        raise HTTPException(status_code=400, detail="A valid filename is required.")
+
+    clean_filename = unicodedata.normalize("NFC", filename)
     if (
-        not clean_filename
+        clean_filename != clean_filename.strip()
+        or clean_filename in {".", ".."}
         or len(clean_filename) > 255
-        or "\x00" in clean_filename
+        or clean_filename.endswith((".", " "))
+        or any(
+            character in clean_filename
+            for character in '/\\<>:"|?*'
+        )
+        or any(
+            unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"}
+            for character in clean_filename
+        )
     ):
         raise HTTPException(status_code=400, detail="A valid filename is required.")
     return clean_filename
+
+
+def validate_upload_type(filename: str, content_type: str | None) -> None:
+    extension = filename.rpartition(".")[2].lower()
+    extension = f".{extension}" if extension else ""
+    accepted_types = UPLOAD_MIME_TYPES.get(extension)
+    if accepted_types is None:
+        raise HTTPException(
+            status_code=415,
+            detail="Unsupported file extension. Accepted formats are CSV, TSV, XLSX, JSON, and Parquet.",
+        )
+
+    if content_type is None:
+        return
+
+    supplied_type = content_type.partition(";")[0].strip().lower()
+    if (
+        len(content_type) > 255
+        or (
+            supplied_type != "application/octet-stream"
+            and supplied_type not in accepted_types
+        )
+    ):
+        raise HTTPException(
+            status_code=415,
+            detail="The supplied MIME type does not match the filename extension.",
+        )
 
 
 @app.post("/api/v1/projects/{project_id}/datasets", status_code=201)
@@ -130,10 +290,19 @@ def create_dataset(project_id: int, payload: DatasetCreate):
 
 
 @app.post("/api/v1/datasets/{dataset_id}/files", status_code=201)
-def upload_dataset_file(dataset_id: int, file: UploadFile = File(...)):
+def upload_dataset_file(
+    dataset_id: int,
+    request: Request,
+    file: UploadFile = File(...),
+):
+    if getattr(request.state, "unsafe_upload_filename", False):
+        raise HTTPException(
+            status_code=400,
+            detail="Path separators are not allowed in filenames.",
+        )
+
     filename = get_upload_filename(file.filename)
-    if file.content_type is not None and len(file.content_type) > 255:
-        raise HTTPException(status_code=400, detail="A valid MIME type is required.")
+    validate_upload_type(filename, file.content_type)
 
     max_size_bytes = get_max_dataset_size_bytes()
     checksum = hashlib.sha256()
@@ -199,6 +368,17 @@ def upload_dataset_file(dataset_id: int, file: UploadFile = File(...)):
             if not storage.bucket_exists(bucket):
                 storage.make_bucket(bucket)
 
+            for _ in range(5):
+                storage_key = f"{dataset_id}/{uuid4().hex}/{filename}"
+                try:
+                    storage.stat_object(bucket, storage_key)
+                except S3Error as error:
+                    if error.code in {"NoSuchKey", "NoSuchObject"}:
+                        break
+                    raise
+            else:
+                raise ValueError("Could not generate a unique storage key.")
+
             object_upload_started = True
             storage.put_object(
                 bucket,
@@ -221,13 +401,16 @@ def upload_dataset_file(dataset_id: int, file: UploadFile = File(...)):
             session.commit()
         except (MinioException, HTTPError, OSError, ValueError) as error:
             session.rollback()
+            cleanup_succeeded = True
             if object_upload_started:
                 try:
                     storage.remove_object(bucket, storage_key)
                 except (MinioException, HTTPError, OSError) as cleanup_error:
+                    cleanup_succeeded = False
                     logger.error(
-                        "Could not clean up failed upload for dataset %s (%s)",
+                        "Could not clean up failed upload for dataset %s at %s (%s)",
                         dataset_id,
+                        storage_key,
                         type(cleanup_error).__name__,
                     )
             mark_dataset_failed(dataset_id, session)
@@ -236,18 +419,26 @@ def upload_dataset_file(dataset_id: int, file: UploadFile = File(...)):
                 dataset_id,
                 type(error).__name__,
             )
+            if not cleanup_succeeded:
+                raise HTTPException(
+                    status_code=502,
+                    detail="File upload failed and object cleanup could not be confirmed.",
+                ) from None
             raise HTTPException(
                 status_code=502,
                 detail="File could not be stored.",
             ) from None
         except SQLAlchemyError as error:
             session.rollback()
+            cleanup_succeeded = True
             try:
                 storage.remove_object(bucket, storage_key)
             except (MinioException, HTTPError, OSError) as cleanup_error:
+                cleanup_succeeded = False
                 logger.error(
-                    "Could not clean up upload for dataset %s (%s)",
+                    "Could not clean up upload for dataset %s at %s (%s)",
                     dataset_id,
+                    storage_key,
                     type(cleanup_error).__name__,
                 )
             mark_dataset_failed(dataset_id, session)
@@ -256,6 +447,11 @@ def upload_dataset_file(dataset_id: int, file: UploadFile = File(...)):
                 dataset_id,
                 type(error).__name__,
             )
+            if not cleanup_succeeded:
+                raise HTTPException(
+                    status_code=500,
+                    detail="File metadata could not be saved and object cleanup could not be confirmed.",
+                ) from None
             raise HTTPException(
                 status_code=500,
                 detail="File metadata could not be saved.",
