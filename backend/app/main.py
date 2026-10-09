@@ -171,6 +171,10 @@ class InvalidParsingResultError(ValueError):
     pass
 
 
+class InvalidProfileResultError(ValueError):
+    pass
+
+
 def get_storage_client() -> Minio:
     return Minio(
         getenv("MINIO_ENDPOINT", "minio:9000"),
@@ -248,6 +252,240 @@ def validate_parsing_result(filename: str, result, file_size: int) -> dict:
         ) from error
 
 
+def validate_profile_result(result, parsing_result: dict) -> dict:
+    try:
+        if not isinstance(result, dict):
+            raise ValueError("Profile result must be an object.")
+        tables = result["tables"]
+        if (
+            not isinstance(result.get("version"), int)
+            or isinstance(result["version"], bool)
+            or result["version"] != 1
+            or result.get("detected_format") != parsing_result["detected_format"]
+            or not isinstance(result.get("row_count"), int)
+            or isinstance(result["row_count"], bool)
+            or result["row_count"] < 0
+            or result["row_count"] != parsing_result["row_count"]
+            or not isinstance(result.get("column_count"), int)
+            or isinstance(result["column_count"], bool)
+            or result["column_count"] < 0
+            or not isinstance(tables, list)
+            or not tables
+            or not isinstance(result.get("warnings"), list)
+            or any(not isinstance(warning, str) for warning in result["warnings"])
+            or not isinstance(result.get("unsupported_analyses"), list)
+            or any(
+                not isinstance(explanation, str)
+                for explanation in result["unsupported_analyses"]
+            )
+        ):
+            raise ValueError("Profile result metadata is inconsistent.")
+
+        row_count = 0
+        column_count = 0
+        for table in tables:
+            if (
+                not isinstance(table, dict)
+                or not isinstance(table.get("row_count"), int)
+                or isinstance(table["row_count"], bool)
+                or table["row_count"] < 0
+                or not isinstance(table.get("column_count"), int)
+                or isinstance(table["column_count"], bool)
+                or table["column_count"] < 0
+                or not isinstance(table.get("columns"), list)
+                or table["column_count"] != len(table["columns"])
+                or table.get("name") is not None
+                and not isinstance(table["name"], str)
+                or not isinstance(table.get("duplicate_row_count_exact"), bool)
+                or table.get("duplicate_row_count") is not None
+                and (
+                    not isinstance(table["duplicate_row_count"], int)
+                    or isinstance(table["duplicate_row_count"], bool)
+                    or table["duplicate_row_count"] < 0
+                )
+                or table["duplicate_row_count_exact"]
+                != (table.get("duplicate_row_count") is not None)
+            ):
+                raise ValueError("Profile result contains an invalid table.")
+            row_count += table["row_count"]
+            column_count += len(table["columns"])
+            for column in table["columns"]:
+                if (
+                    not isinstance(column, dict)
+                    or not isinstance(column.get("name"), str)
+                    or not isinstance(column.get("position"), int)
+                    or isinstance(column["position"], bool)
+                    or column["position"] < 0
+                    or not isinstance(column.get("physical_types"), list)
+                    or any(
+                        not isinstance(value, str)
+                        for value in column["physical_types"]
+                    )
+                    or any(
+                        not isinstance(column.get(count), int)
+                        or isinstance(column[count], bool)
+                        or column[count] < 0
+                        for count in (
+                            "missing_value_count",
+                            "empty_value_count",
+                        )
+                    )
+                    or column.get("distinct_value_count") is not None
+                    and (
+                        not isinstance(column["distinct_value_count"], int)
+                        or isinstance(column["distinct_value_count"], bool)
+                        or column["distinct_value_count"] < 0
+                    )
+                    or not isinstance(column.get("distinct_count_exact"), bool)
+                    or not isinstance(column.get("categorical_summary_complete"), bool)
+                    or column.get("categorical_summary") is not None
+                    and (
+                        not isinstance(column["categorical_summary"], list)
+                        or len(column["categorical_summary"]) > 10
+                    )
+                    or column["distinct_count_exact"]
+                    != (column.get("distinct_value_count") is not None)
+                    or column["categorical_summary_complete"]
+                    != (column.get("categorical_summary") is not None)
+                    or column.get("numeric_statistics") is not None
+                    and not isinstance(column["numeric_statistics"], dict)
+                ):
+                    raise ValueError("Profile result contains an invalid column.")
+                numeric_statistics = column.get("numeric_statistics")
+                if numeric_statistics is not None and (
+                    not isinstance(numeric_statistics.get("median_exact"), bool)
+                    or any(
+                        numeric_statistics.get(statistic) is not None
+                        and not isinstance(numeric_statistics[statistic], (int, float))
+                        for statistic in ("minimum", "maximum", "mean", "median")
+                    )
+                ):
+                    raise ValueError("Profile result contains invalid numeric statistics.")
+                categorical = column.get("categorical_summary")
+                if categorical is not None and any(
+                    not isinstance(value, dict)
+                    or not isinstance(value.get("value"), str)
+                    or not isinstance(value.get("count"), int)
+                    or isinstance(value["count"], bool)
+                    or value["count"] <= 0
+                    or not isinstance(value.get("value_truncated"), bool)
+                    for value in categorical
+                ):
+                    raise ValueError("Profile result contains an invalid categorical summary.")
+        if (
+            row_count != result["row_count"]
+            or column_count != result.get("column_count")
+            or column_count != len(parsing_result["columns"])
+        ):
+            raise ValueError("Profile counts do not match the parsing result.")
+
+        if parsing_result["detected_format"] == "xlsx":
+            worksheets = parsing_result["metadata"].get("worksheets")
+            if not isinstance(worksheets, list) or len(worksheets) != len(tables):
+                raise ValueError("Profile tables do not match the parsed worksheets.")
+            parsed_columns_by_table = {}
+            for column in parsing_result["columns"]:
+                table_name = column.get("table")
+                if not isinstance(table_name, str):
+                    raise ValueError("Parsed XLSX columns must identify their worksheet.")
+                parsed_columns_by_table.setdefault(table_name, []).append(column)
+
+            expected_tables = []
+            worksheet_names = set()
+            for worksheet in worksheets:
+                if (
+                    not isinstance(worksheet, dict)
+                    or not isinstance(worksheet.get("name"), str)
+                    or not isinstance(worksheet.get("row_count"), int)
+                    or isinstance(worksheet["row_count"], bool)
+                    or worksheet["row_count"] < 0
+                    or not isinstance(worksheet.get("columns"), list)
+                ):
+                    raise ValueError("Parsed worksheet metadata is invalid.")
+                worksheet_name = worksheet["name"]
+                if worksheet_name in worksheet_names:
+                    raise ValueError("Parsed worksheet names must be unique.")
+                worksheet_names.add(worksheet_name)
+                parsed_columns = parsed_columns_by_table.pop(
+                    worksheet_name, []
+                )
+                worksheet_columns = worksheet["columns"]
+                if len(worksheet_columns) != len(parsed_columns):
+                    raise ValueError(
+                        "Worksheet columns do not match the parsing result."
+                    )
+                for worksheet_column, parsed_column in zip(
+                    worksheet_columns, parsed_columns
+                ):
+                    if not isinstance(worksheet_column, dict) or any(
+                        worksheet_column.get(key) != parsed_column.get(key)
+                        for key in (
+                            "name",
+                            "position",
+                            "physical_types",
+                            "missing_values",
+                            "empty_values",
+                        )
+                    ):
+                        raise ValueError(
+                            "Worksheet columns do not match the parsing result."
+                        )
+                expected_tables.append(
+                    (
+                        worksheet_name,
+                        worksheet["row_count"],
+                        parsed_columns,
+                    )
+                )
+            if parsed_columns_by_table:
+                raise ValueError("Parsed columns refer to unknown worksheets.")
+        else:
+            expected_tables = [
+                (None, parsing_result["row_count"], parsing_result["columns"])
+            ]
+
+        if len(tables) != len(expected_tables):
+            raise ValueError("Profile tables do not match the parsing result.")
+        for table, (expected_name, expected_rows, expected_columns) in zip(
+            tables, expected_tables
+        ):
+            if (
+                table["name"] != expected_name
+                or table["row_count"] != expected_rows
+                or len(table["columns"]) != len(expected_columns)
+            ):
+                raise ValueError("Profile tables do not match the parsing result.")
+            for profile_column, parsed_column in zip(
+                table["columns"], expected_columns
+            ):
+                if (
+                    profile_column["name"] != parsed_column["name"]
+                    or profile_column["position"] != parsed_column["position"]
+                    or profile_column["physical_types"]
+                    != parsed_column["physical_types"]
+                ):
+                    raise ValueError(
+                        "Profile columns do not match the parsing result."
+                    )
+                for profile_key, parsing_key in (
+                    ("missing_value_count", "missing_values"),
+                    ("empty_value_count", "empty_values"),
+                ):
+                    parsed_count = parsed_column.get(parsing_key)
+                    if (
+                        parsed_count is not None
+                        and profile_column[profile_key] != parsed_count
+                    ):
+                        raise ValueError(
+                            "Profile value counts do not match the parsing result."
+                        )
+        return json.loads(json.dumps(result, allow_nan=False))
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise InvalidProfileResultError(
+            "Profiler returned incomplete or invalid profile metadata."
+        ) from error
+
+
 def _file_response(dataset: Dataset, dataset_file: DatasetFile) -> dict:
     return {
         "dataset_id": dataset.id,
@@ -261,6 +499,7 @@ def _file_response(dataset: Dataset, dataset_file: DatasetFile) -> dict:
             "checksum": dataset_file.checksum,
             "detected_format": dataset_file.detected_format,
             "parsing_result": dataset_file.parsing_result,
+            "profile_result": dataset_file.profile_result,
             "status": dataset_file.status,
             "error_code": dataset_file.error_code,
             "error_message": dataset_file.error_message,
@@ -871,14 +1110,25 @@ def upload_dataset_file(
         else:
             parsing_data = None
 
+        parsing_result = None
         try:
-            if parsing_data is None:
+            if parsing_data is None or dataset_file.profile_result is None:
                 parsing_result = parse_dataset_file(filename, file.file, file_size)
                 file.file.seek(0)
-                parsing_data = validate_parsing_result(
-                    filename,
-                    parsing_result,
-                    file_size,
+                if parsing_data is None:
+                    parsing_data = validate_parsing_result(
+                        filename,
+                        parsing_result,
+                        file_size,
+                    )
+                profile_data = validate_profile_result(
+                    getattr(parsing_result, "profile_result", None),
+                    parsing_data,
+                )
+            else:
+                profile_data = validate_profile_result(
+                    dataset_file.profile_result,
+                    parsing_data,
                 )
         except InvalidParsingResultError as error:
             _mark_ingestion_failed(
@@ -897,6 +1147,24 @@ def upload_dataset_file(
             raise HTTPException(
                 status_code=500,
                 detail="The parser returned invalid metadata.",
+            ) from None
+        except InvalidProfileResultError as error:
+            _mark_ingestion_failed(
+                dataset_id,
+                dataset_file_id,
+                upload_key,
+                session,
+                "invalid_profile_metadata",
+                "The profiler could not produce valid metadata for this file.",
+            )
+            logger.error(
+                "Profiler returned invalid metadata for dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="The profiler returned invalid metadata.",
             ) from None
         except ParsingError as error:
             _mark_ingestion_failed(
@@ -946,6 +1214,7 @@ def upload_dataset_file(
         dataset_file = session.get(DatasetFile, dataset_file_id)
         dataset_file.parsing_result = parsing_data
         dataset_file.detected_format = parsing_data["detected_format"]
+        dataset_file.profile_result = profile_data
         dataset.status = "Processing"
         try:
             session.commit()
@@ -1153,6 +1422,7 @@ def serialize_dataset_file(dataset_file: DatasetFile) -> dict:
         "checksum": dataset_file.checksum,
         "detected_format": dataset_file.detected_format,
         "parsing_result": dataset_file.parsing_result,
+        "profile_result": dataset_file.profile_result,
         "status": dataset_file.status,
         "error_code": dataset_file.error_code,
         "error_message": dataset_file.error_message,
@@ -1314,6 +1584,63 @@ def get_dataset_file(dataset_id: int, file_id: int):
             raise HTTPException(status_code=404, detail="Dataset file not found.")
 
         return serialize_dataset_file(dataset_file)
+
+
+@app.get("/api/v1/datasets/{dataset_id}/files/{file_id}/profile")
+def get_dataset_file_profile(dataset_id: int, file_id: int):
+    with SessionLocal() as session:
+        try:
+            dataset = session.get(Dataset, dataset_id)
+            if dataset is None:
+                raise HTTPException(status_code=404, detail="Dataset not found.")
+
+            dataset_file = (
+                session.query(DatasetFile)
+                .filter(
+                    DatasetFile.id == file_id,
+                    DatasetFile.dataset_id == dataset_id,
+                )
+                .one_or_none()
+            )
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            logger.error(
+                "File profile lookup failed for dataset %s file %s (%s)",
+                dataset_id,
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Dataset file profile could not be retrieved.",
+            ) from None
+
+        if dataset_file is None:
+            raise HTTPException(status_code=404, detail="Dataset file not found.")
+        if dataset_file.status != "Ready":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "profile_unavailable",
+                    "message": "A profile is available only after file processing succeeds.",
+                    "status": dataset_file.status,
+                },
+            )
+        if dataset_file.profile_result is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "profile_not_available",
+                    "message": "No profiling result is stored for this file.",
+                },
+            )
+
+        return {
+            "dataset_id": dataset_id,
+            "file_id": file_id,
+            "profile_result": dataset_file.profile_result,
+        }
 
 
 @app.delete("/api/v1/datasets/{dataset_id}")

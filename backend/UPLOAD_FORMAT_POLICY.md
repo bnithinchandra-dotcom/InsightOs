@@ -51,7 +51,10 @@ release cannot be guaranteed until the connection or backend process terminates.
 `MAX_DATASET_ROWS`, `MAX_DATASET_COLUMNS`, `MAX_XLSX_UNCOMPRESSED_MB`,
 `MAX_XLSX_ENTRIES`, `MAX_PARQUET_ROW_GROUPS`, `MAX_XML_SIZE_MB`,
 `MAX_XML_DEPTH`, `MAX_XML_ELEMENTS`, and `MAX_JSON_DEPTH` configure parser
-resource limits.
+resource limits. `MAX_PROFILE_DISTINCT_VALUES` (default 100,000),
+`MAX_PROFILE_NUMERIC_VALUES` (default 250,000), and
+`MAX_PROFILE_DUPLICATE_ROWS` (default 250,000) bound additional profiling
+memory use.
 
 CSV and TSV use UTF-8 (an optional UTF-8 BOM is accepted), with the first record
 as the header and strict row widths. Their physical type is text; values are
@@ -77,9 +80,29 @@ forbidden. XML is parsed with a bounded tree builder that enforces depth and
 element-count limits as start elements arrive, before those nodes are added to
 the tree. The configured XML file-size limit is also applied before parsing.
 
-These results describe file structure and physical types only. Parsing does
-not profile distributions, infer semantic meaning, modify source values, or
-perform preprocessing. An uploaded object remains the source of truth.
+Parsing metadata describes file structure and physical types. Neither parsing
+nor profiling infers semantic meaning, modifies source values, or performs
+preprocessing. An uploaded object remains the source of truth.
+
+Successful uploads also store a separate, versioned deterministic profile in
+`dataset_files.profile_result`. The file response and
+`GET /api/v1/datasets/{dataset_id}/files/{file_id}/profile` expose it separately
+from `parsing_result`. Profiles contain row/column counts, per-column physical
+types, missing/empty counts, distinct counts when within the fingerprint budget,
+duplicate rows when within the row-fingerprint budget, numeric min/max/mean and
+an exact median when its tracking budget allows, and up to ten categorical
+values. CSV, TSV, and XML numeric-looking text is parsed as decimal for numeric
+statistics; JSON string values are not coerced. Mixed numeric and non-numeric
+columns omit numeric statistics and include an explanation. XLSX values are
+profiled as stored; formulas are not evaluated.
+
+Distinct and duplicate counts use SHA-256 fingerprints. If configured tracking
+budgets are exceeded, affected exact counts or medians are reported unavailable
+with warnings rather than presented as partial results. Profile output never
+includes source rows; categorical display values are truncated at 256
+characters. Historical `Ready` records created before profiling may not have a
+profile; their profile endpoint returns `profile_not_available`. Profile
+generation is synchronous as part of upload parsing.
 
 Database sources such as PostgreSQL and MySQL, live servers, streaming, polling,
 and cloud object storage require separate connector-based ingestion paths.

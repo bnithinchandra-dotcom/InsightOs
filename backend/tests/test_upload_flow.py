@@ -1,3 +1,4 @@
+import copy
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
@@ -139,6 +140,7 @@ class UploadFlowTests(unittest.TestCase):
         self.assertEqual(payload["dataset_status"], "Uploaded")
         self.assertEqual(payload["file"]["detected_format"], "csv")
         self.assertEqual(payload["file"]["parsing_result"]["row_count"], 2)
+        self.assertEqual(payload["file"]["profile_result"]["row_count"], 2)
         self.assertEqual(payload["file"]["status"], "Ready")
         self.assertEqual(len(self.storage.objects), 1)
         stored = next(iter(self.storage.objects.values()))
@@ -150,6 +152,7 @@ class UploadFlowTests(unittest.TestCase):
         self.assertEqual(dataset.status, "Uploaded")
         self.assertEqual(dataset_file.detected_format, "csv")
         self.assertEqual(dataset_file.parsing_result["columns"][0]["name"], "id")
+        self.assertEqual(dataset_file.profile_result["column_count"], 2)
         self.assertEqual(dataset_file.status, "Ready")
         session.close()
 
@@ -159,6 +162,18 @@ class UploadFlowTests(unittest.TestCase):
         self.assertEqual(files_response.status_code, 200)
         self.assertEqual(
             files_response.json()[0]["parsing_result"]["row_count"],
+            2,
+        )
+        self.assertEqual(
+            files_response.json()[0]["profile_result"]["row_count"],
+            2,
+        )
+        profile_response = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files/{payload['file']['id']}/profile"
+        )
+        self.assertEqual(profile_response.status_code, 200, profile_response.text)
+        self.assertEqual(
+            profile_response.json()["profile_result"]["row_count"],
             2,
         )
 
@@ -175,7 +190,16 @@ class UploadFlowTests(unittest.TestCase):
         dataset_file = session.query(DatasetFile).one()
         self.assertEqual(dataset_file.status, "Failed")
         self.assertEqual(dataset_file.error_code, "content_mismatch")
+        file_id = dataset_file.id
         session.close()
+        profile_response = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/profile"
+        )
+        self.assertEqual(profile_response.status_code, 409)
+        self.assertEqual(
+            profile_response.json()["detail"]["code"],
+            "profile_unavailable",
+        )
 
     def test_successful_ingestion_for_all_six_formats_and_replay(self):
         workbook = Workbook()
@@ -236,6 +260,14 @@ class UploadFlowTests(unittest.TestCase):
                 payload = response.json()
                 self.assertEqual(payload["file"]["detected_format"], expected_format)
                 self.assertEqual(payload["file"]["status"], "Ready")
+                self.assertEqual(
+                    payload["file"]["profile_result"]["detected_format"],
+                    expected_format,
+                )
+                self.assertEqual(
+                    payload["file"]["profile_result"]["row_count"],
+                    payload["file"]["parsing_result"]["row_count"],
+                )
                 self.assertGreaterEqual(
                     payload["file"]["parsing_result"]["row_count"],
                     1,
@@ -261,6 +293,108 @@ class UploadFlowTests(unittest.TestCase):
         session = self.session_factory()
         self.assertEqual(session.query(DatasetFile).count(), 6)
         session.close()
+
+    def test_invalid_profile_metadata_fails_ingestion_without_storing_object(self):
+        class InvalidProfileResult:
+            profile_result = {"version": 2}
+
+            @staticmethod
+            def as_dict():
+                return {
+                    "detected_format": "csv",
+                    "columns": [
+                        {
+                            "name": "value",
+                            "position": 0,
+                            "physical_type": "string",
+                            "physical_types": ["string"],
+                            "missing_values": 0,
+                            "empty_values": 0,
+                        }
+                    ],
+                    "row_count": 1,
+                    "metadata": {},
+                }
+
+        with patch.object(
+            main,
+            "parse_dataset_file",
+            return_value=InvalidProfileResult(),
+        ):
+            response = self.client.post(
+                f"/api/v1/datasets/{self.dataset_id}/files",
+                files={"file": ("invalid-profile.csv", b"value\nx\n", "text/csv")},
+            )
+
+        self.assertEqual(response.status_code, 500, response.text)
+        self.assertEqual(self.storage.objects, {})
+        session = self.session_factory()
+        dataset_file = session.query(DatasetFile).one()
+        self.assertEqual(dataset_file.status, "Failed")
+        self.assertEqual(dataset_file.error_code, "invalid_profile_metadata")
+        self.assertIsNone(dataset_file.profile_result)
+        session.close()
+
+    def test_profile_columns_must_match_parsing_metadata(self):
+        content = b"first,second\n1,2\n"
+        parsed = main.parse_dataset_file(
+            "metadata.csv",
+            BytesIO(content),
+            len(content),
+        )
+        parsing_result = main.validate_parsing_result(
+            "metadata.csv",
+            parsed,
+            len(content),
+        )
+
+        mutations = (
+            lambda profile: profile["tables"][0].update(name="unexpected"),
+            lambda profile: profile["tables"][0]["columns"][0].update(
+                name="different"
+            ),
+            lambda profile: profile["tables"][0]["columns"][0].update(
+                position=1
+            ),
+            lambda profile: profile["tables"][0]["columns"][0].update(
+                physical_types=["integer"]
+            ),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                profile = copy.deepcopy(parsed.profile_result)
+                mutate(profile)
+                with self.assertRaises(main.InvalidProfileResultError):
+                    main.validate_profile_result(profile, parsing_result)
+
+    def test_profile_worksheet_rows_must_match_parsing_metadata(self):
+        workbook = Workbook()
+        workbook.active.title = "First"
+        workbook.active.append(["value"])
+        workbook.active.append([1])
+        second = workbook.create_sheet("Second")
+        second.append(["value"])
+        second.append([2])
+        content_stream = BytesIO()
+        workbook.save(content_stream)
+        content = content_stream.getvalue()
+
+        parsed = main.parse_dataset_file(
+            "worksheets.xlsx",
+            BytesIO(content),
+            len(content),
+        )
+        parsing_result = main.validate_parsing_result(
+            "worksheets.xlsx",
+            parsed,
+            len(content),
+        )
+        profile = copy.deepcopy(parsed.profile_result)
+        profile["tables"][0]["row_count"] = 2
+        profile["tables"][1]["row_count"] = 0
+
+        with self.assertRaises(main.InvalidProfileResultError):
+            main.validate_profile_result(profile, parsing_result)
 
     def test_explicit_idempotency_key_rejects_different_content(self):
         headers = {"Idempotency-Key": "client-request-1"}

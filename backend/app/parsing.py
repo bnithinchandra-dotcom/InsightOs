@@ -15,6 +15,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from xml.etree.ElementTree import ParseError, TreeBuilder
 
+from app.profiling import DatasetProfiler, MISSING
+
 
 FORMAT_BY_EXTENSION = {
     ".csv": "csv",
@@ -48,6 +50,9 @@ class ParseLimits:
     max_xml_depth: int
     max_xml_elements: int
     max_json_depth: int
+    max_profile_distinct_values: int
+    max_profile_numeric_values: int
+    max_profile_duplicate_rows: int
 
 
 @dataclass
@@ -56,6 +61,7 @@ class ParseResult:
     columns: list[dict]
     row_count: int
     metadata: dict
+    profile_result: dict = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
@@ -121,6 +127,24 @@ def get_parse_limits() -> ParseLimits:
         max_xml_depth=_positive_limit("MAX_XML_DEPTH", 64),
         max_xml_elements=_positive_limit("MAX_XML_ELEMENTS", 100_000),
         max_json_depth=_positive_limit("MAX_JSON_DEPTH", 64),
+        max_profile_distinct_values=_positive_limit(
+            "MAX_PROFILE_DISTINCT_VALUES", 100_000
+        ),
+        max_profile_numeric_values=_positive_limit(
+            "MAX_PROFILE_NUMERIC_VALUES", 250_000
+        ),
+        max_profile_duplicate_rows=_positive_limit(
+            "MAX_PROFILE_DUPLICATE_ROWS", 250_000
+        ),
+    )
+
+
+def _profile_for_format(detected_format: str, limits: ParseLimits) -> DatasetProfiler:
+    return DatasetProfiler(
+        detected_format,
+        limits.max_profile_distinct_values,
+        limits.max_profile_numeric_values,
+        limits.max_profile_duplicate_rows,
     )
 
 
@@ -260,6 +284,12 @@ def _read_json(stream: BinaryIO, limits: ParseLimits) -> ParseResult:
                 _merge_json_type(stats, value)
 
     columns = [stats_by_name[name].as_dict() for name in ordered_names]
+    profiler = _profile_for_format("json", limits)
+    profile_table = profiler.add_table(None, columns)
+    for record in records:
+        profile_table.observe(
+            [record[name] if name in record else MISSING for name in ordered_names]
+        )
     return ParseResult(
         detected_format="json",
         columns=columns,
@@ -269,6 +299,7 @@ def _read_json(stream: BinaryIO, limits: ParseLimits) -> ParseResult:
             "record_shape": "object",
             "nested_values": "retained as object or array values",
         },
+        profile_result=profiler.as_dict(),
     )
 
 
@@ -342,6 +373,11 @@ def _read_delimited(
             _ColumnStats(name=name, position=index)
             for index, name in enumerate(headers)
         ]
+        profiler = _profile_for_format(
+            "tsv" if delimiter == "\t" else "csv",
+            limits,
+        )
+        profile_table = profiler.add_table(None, [column.as_dict() for column in stats])
         row_count = 0
         for row in reader:
             if len(row) != len(headers):
@@ -358,6 +394,10 @@ def _read_delimited(
                 )
             for column, value in zip(stats, row):
                 column.observe(value, "string")
+            profile_table.observe(row)
+        profile_table.set_column_descriptors(
+            [column.as_dict() for column in stats]
+        )
     except ParsingError:
         raise
     except UnicodeDecodeError:
@@ -381,6 +421,7 @@ def _read_delimited(
             "header_policy": "first record; names and duplicate names preserved",
             "row_width_policy": "every data record must match the header width",
         },
+        profile_result=profiler.as_dict(),
     )
 
 
@@ -440,6 +481,8 @@ def _read_xlsx(stream: BinaryIO, file_size: int, limits: ParseLimits) -> ParseRe
     all_columns = []
     sheet_metadata = []
     found_data = False
+    profiler = _profile_for_format("xlsx", limits)
+    formula_cells_seen = False
     try:
         for worksheet in workbook.worksheets:
             iterator = worksheet.iter_rows()
@@ -448,6 +491,7 @@ def _read_xlsx(stream: BinaryIO, file_size: int, limits: ParseLimits) -> ParseRe
                 sheet_metadata.append(
                     {"name": worksheet.title, "row_count": 0, "columns": []}
                 )
+                profiler.add_table(worksheet.title, [])
                 continue
 
             found_data = True
@@ -458,6 +502,10 @@ def _read_xlsx(stream: BinaryIO, file_size: int, limits: ParseLimits) -> ParseRe
                 _ColumnStats(name=name, position=index)
                 for index, name in enumerate(headers)
             ]
+            profile_table = profiler.add_table(
+                worksheet.title,
+                [column.as_dict() for column in stats],
+            )
             sheet_rows = 0
             for row in iterator:
                 if len(row) != len(headers):
@@ -468,6 +516,11 @@ def _read_xlsx(stream: BinaryIO, file_size: int, limits: ParseLimits) -> ParseRe
                     _fail("resource_limit", "The XLSX workbook exceeds the configured row limit.")
                 for column, cell in zip(stats, row):
                     column.observe(cell.value, _excel_type(cell))
+                    formula_cells_seen = formula_cells_seen or cell.data_type == "f"
+                profile_table.observe([cell.value for cell in row])
+            profile_table.set_column_descriptors(
+                [column.as_dict() for column in stats]
+            )
             sheet_columns = [column.as_dict() for column in stats]
             if len(all_columns) + len(sheet_columns) > limits.max_columns:
                 _fail(
@@ -497,6 +550,11 @@ def _read_xlsx(stream: BinaryIO, file_size: int, limits: ParseLimits) -> ParseRe
 
     if not found_data:
         _fail("empty_records", "The XLSX workbook contains no non-empty worksheets.")
+    if formula_cells_seen:
+        profiler.budget.warning(
+            "XLSX formula cells are profiled as their stored formula text; formulas are not evaluated.",
+            "Calculated formula results are unavailable because formula evaluation is not performed.",
+        )
     return ParseResult(
         detected_format="xlsx",
         columns=all_columns,
@@ -507,6 +565,7 @@ def _read_xlsx(stream: BinaryIO, file_size: int, limits: ParseLimits) -> ParseRe
             "formula_policy": "formula cells are reported; formulas are not evaluated",
             "archive_size_bytes": file_size,
         },
+        profile_result=profiler.as_dict(),
     )
 
 
@@ -527,10 +586,27 @@ def _read_parquet(stream: BinaryIO, file_size: int, limits: ParseLimits) -> Pars
         if metadata.num_row_groups > limits.max_parquet_row_groups:
             _fail("resource_limit", "The Parquet file exceeds the configured row-group limit.")
         row_count = 0
+        profiler = _profile_for_format("parquet", limits)
+        profile_columns = [
+            {
+                "name": field.name,
+                "position": index,
+                "physical_types": [str(field.type)],
+            }
+            for index, field in enumerate(schema)
+        ]
+        profile_table = profiler.add_table(None, profile_columns)
         for batch in parquet_file.iter_batches(batch_size=8192):
             row_count += batch.num_rows
             if row_count > limits.max_rows:
                 _fail("resource_limit", "The Parquet file exceeds the configured row limit.")
+            for row_index in range(batch.num_rows):
+                profile_table.observe(
+                    [
+                        batch.column(column_index)[row_index].as_py()
+                        for column_index in range(batch.num_columns)
+                    ]
+                )
         if row_count != metadata.num_rows:
             _fail("corrupt_parquet", "The Parquet row count does not match its metadata.")
     except ParsingError:
@@ -559,6 +635,7 @@ def _read_parquet(stream: BinaryIO, file_size: int, limits: ParseLimits) -> Pars
             "schema": str(schema),
             "rows_scanned": row_count,
         },
+        profile_result=profiler.as_dict(),
     )
 
 
@@ -809,9 +886,16 @@ def _read_xml(stream: BinaryIO, file_size: int, limits: ParseLimits) -> ParseRes
             else:
                 stats_by_name[name].observe(values[name], "string")
 
+    columns = [stats_by_name[name].as_dict() for name in ordered_names]
+    profiler = _profile_for_format("xml", limits)
+    profile_table = profiler.add_table(None, columns)
+    for values in record_rows:
+        profile_table.observe(
+            [values[name] if name in values else MISSING for name in ordered_names]
+        )
     return ParseResult(
         detected_format="xml",
-        columns=[stats_by_name[name].as_dict() for name in ordered_names],
+        columns=columns,
         row_count=len(records),
         metadata={
             "record_element": _xml_name(record_tag),
@@ -823,6 +907,7 @@ def _read_xml(stream: BinaryIO, file_size: int, limits: ParseLimits) -> ParseRes
             "elements_scanned": element_count,
             "source_size_bytes": file_size,
         },
+        profile_result=profiler.as_dict(),
     )
 
 

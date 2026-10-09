@@ -73,6 +73,11 @@ class DatasetFile(Base):
         nullable=True,
     )
 
+    profile_result: Mapped[dict | None] = mapped_column(
+        JSON,
+        nullable=True,
+    )
+
     status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,

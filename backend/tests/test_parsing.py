@@ -152,6 +152,156 @@ class ParsingTests(unittest.TestCase):
         )
         self.assertEqual(result.metadata["rows_scanned"], 2)
 
+    def test_profiles_are_bounded_and_deterministic_across_supported_formats(self):
+        csv_result = parse(
+            "profile.csv",
+            b"amount,label,optional\n1,A,\n2,B,x\n2,B,x\n",
+        )
+        csv_profile = csv_result.profile_result
+        csv_table = csv_profile["tables"][0]
+        self.assertEqual(csv_profile["row_count"], 3)
+        self.assertEqual(csv_table["duplicate_row_count"], 1)
+        self.assertEqual(csv_table["columns"][0]["physical_types"], ["string"])
+        self.assertEqual(csv_table["columns"][0]["distinct_value_count"], 2)
+        self.assertTrue(csv_table["columns"][0]["distinct_count_exact"])
+        self.assertEqual(
+            csv_table["columns"][0]["numeric_statistics"],
+            {
+                "minimum": 1,
+                "maximum": 2,
+                "mean": 5 / 3,
+                "median": 2,
+                "median_exact": True,
+            },
+        )
+        self.assertEqual(csv_table["columns"][2]["empty_value_count"], 1)
+        self.assertEqual(
+            csv_table["columns"][1]["categorical_summary"][0]["value"],
+            "B",
+        )
+
+        tsv_result = parse("profile.tsv", b"value\tkind\n4\talpha\n4\talpha\n")
+        self.assertEqual(
+            tsv_result.profile_result["tables"][0]["duplicate_row_count"],
+            1,
+        )
+
+        json_result = parse(
+            "profile.json",
+            b'[{"n":1,"kind":"a"},{"n":null,"kind":""},'
+            b'{"n":2,"kind":"a"},{"n":2,"kind":"a"},{"kind":"a"}]',
+        )
+        json_table = json_result.profile_result["tables"][0]
+        self.assertEqual(json_table["duplicate_row_count"], 1)
+        self.assertEqual(json_table["columns"][0]["missing_value_count"], 2)
+        self.assertEqual(json_table["columns"][0]["numeric_statistics"]["mean"], 5 / 3)
+        self.assertEqual(json_table["columns"][1]["empty_value_count"], 1)
+
+        mixed_numeric = parse(
+            "mixed-numeric.json",
+            b'[{"n":1},{"n":1.5}]',
+        ).profile_result["tables"][0]["columns"][0]
+        self.assertEqual(
+            mixed_numeric["physical_types"],
+            ["integer", "number"],
+        )
+        self.assertEqual(
+            mixed_numeric["numeric_statistics"],
+            {
+                "minimum": 1,
+                "maximum": 1.5,
+                "mean": 1.25,
+                "median": 1.25,
+                "median_exact": True,
+            },
+        )
+
+        mixed = parse(
+            "mixed.json",
+            b'[{"value":1},{"value":"2"},{"value":"not-a-number"}]',
+        )
+        mixed_column = mixed.profile_result["tables"][0]["columns"][0]
+        self.assertIsNone(mixed_column["numeric_statistics"])
+        self.assertIsNotNone(mixed_column["numeric_statistics_note"])
+        self.assertTrue(mixed.profile_result["warnings"])
+
+        nested_profile = parse(
+            "nested-profile.json",
+            b'[{"value":{"items":[1,true]}},{"value":{"items":[1,true]}}]',
+        ).profile_result["tables"][0]
+        self.assertEqual(nested_profile["duplicate_row_count"], 1)
+        self.assertEqual(nested_profile["columns"][0]["distinct_value_count"], 1)
+
+        xlsx_result = parse("profile.xlsx", make_xlsx())
+        xlsx_profile = xlsx_result.profile_result
+        self.assertEqual([table["name"] for table in xlsx_profile["tables"]], ["People", "Empty"])
+        self.assertEqual(xlsx_profile["row_count"], 2)
+        self.assertEqual(
+            xlsx_profile["tables"][0]["columns"][1]["physical_types"],
+            ["integer"],
+        )
+        self.assertTrue(
+            any("formula cells" in warning for warning in xlsx_profile["warnings"])
+        )
+
+        parquet_result = parse("profile.parquet", make_parquet())
+        parquet_profile_column = parquet_result.profile_result["tables"][0]["columns"][0]
+        self.assertEqual(
+            parquet_profile_column["numeric_statistics"]["minimum"],
+            1,
+        )
+
+        xml_result = parse(
+            "profile.xml",
+            b"<root><record><value>3</value></record>"
+            b"<record><value>5</value></record><record/></root>",
+        )
+        self.assertEqual(
+            xml_result.profile_result["tables"][0]["columns"][0][
+                "missing_value_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            xml_result.profile_result["tables"][0]["columns"][0][
+                "numeric_statistics"
+            ]["median"],
+            4,
+        )
+
+    def test_profiles_empty_files_with_headers_and_report_bounded_analysis(self):
+        empty_rows = parse("empty-rows.csv", b"value,label\n")
+        empty_table = empty_rows.profile_result["tables"][0]
+        self.assertEqual(empty_table["row_count"], 0)
+        self.assertEqual(empty_table["column_count"], 2)
+        self.assertEqual(empty_table["duplicate_row_count"], 0)
+
+        with patch.dict(
+            os.environ,
+            {
+                "MAX_PROFILE_DISTINCT_VALUES": "1",
+                "MAX_PROFILE_NUMERIC_VALUES": "1",
+                "MAX_PROFILE_DUPLICATE_ROWS": "1",
+            },
+        ):
+            bounded = parse(
+                "bounded.csv",
+                b"value,label\n1,alpha\n2,beta\n2,beta\n",
+            ).profile_result
+        bounded_table = bounded["tables"][0]
+        self.assertIsNone(bounded_table["duplicate_row_count"])
+        self.assertIsNone(bounded_table["columns"][0]["distinct_value_count"])
+        self.assertIsNone(bounded_table["columns"][0]["numeric_statistics"]["median"])
+        self.assertEqual(bounded_table["columns"][0]["numeric_statistics"]["minimum"], 1)
+        self.assertTrue(bounded["warnings"])
+        self.assertTrue(bounded["unsupported_analyses"])
+
+        categorical = parse(
+            "categories.csv",
+            ("category\n" + "".join(f"value-{index}\n" for index in range(20))).encode(),
+        ).profile_result["tables"][0]["columns"][0]["categorical_summary"]
+        self.assertLessEqual(len(categorical), 10)
+
     def test_xml_namespaces_attributes_nested_and_missing_values(self):
         content = (
             b'<d:root xmlns:d="urn:records">'
