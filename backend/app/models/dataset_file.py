@@ -23,6 +23,10 @@ class DatasetFile(Base):
             "status IN ('Processing', 'Ready', 'Failed')",
             name="ck_dataset_files_status",
         ),
+        CheckConstraint(
+            "normalization_status IN ('NotStarted', 'Processing', 'Ready', 'Failed')",
+            name="ck_dataset_files_normalization_status",
+        ),
         UniqueConstraint(
             "dataset_id",
             "idempotency_key",
@@ -75,6 +79,27 @@ class DatasetFile(Base):
 
     profile_result: Mapped[dict | None] = mapped_column(
         JSON,
+        nullable=True,
+    )
+
+    normalization_status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="NotStarted",
+    )
+
+    normalization_result: Mapped[dict | None] = mapped_column(
+        JSON,
+        nullable=True,
+    )
+
+    normalization_error_code: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+
+    normalization_error_message: Mapped[str | None] = mapped_column(
+        Text,
         nullable=True,
     )
 

@@ -2,7 +2,9 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
+import tempfile
 from threading import Lock
 import unicodedata
 from contextlib import ExitStack, contextmanager
@@ -23,6 +25,13 @@ from urllib3.exceptions import HTTPError
 
 from app.database import SessionLocal
 from app.models import Dataset, DatasetFile, Project
+from app.normalization import (
+    NormalizationError,
+    get_normalization_configuration,
+    normalize_file,
+    validate_normalization_result,
+    verify_normalization_result,
+)
 from app.parsing import (
     ParserConfigurationError,
     ParsingError,
@@ -500,6 +509,10 @@ def _file_response(dataset: Dataset, dataset_file: DatasetFile) -> dict:
             "detected_format": dataset_file.detected_format,
             "parsing_result": dataset_file.parsing_result,
             "profile_result": dataset_file.profile_result,
+            "normalization_status": dataset_file.normalization_status,
+            "normalization_result": dataset_file.normalization_result,
+            "normalization_error_code": dataset_file.normalization_error_code,
+            "normalization_error_message": dataset_file.normalization_error_message,
             "status": dataset_file.status,
             "error_code": dataset_file.error_code,
             "error_message": dataset_file.error_message,
@@ -1423,6 +1436,10 @@ def serialize_dataset_file(dataset_file: DatasetFile) -> dict:
         "detected_format": dataset_file.detected_format,
         "parsing_result": dataset_file.parsing_result,
         "profile_result": dataset_file.profile_result,
+        "normalization_status": dataset_file.normalization_status,
+        "normalization_result": dataset_file.normalization_result,
+        "normalization_error_code": dataset_file.normalization_error_code,
+        "normalization_error_message": dataset_file.normalization_error_message,
         "status": dataset_file.status,
         "error_code": dataset_file.error_code,
         "error_message": dataset_file.error_message,
@@ -1643,9 +1660,370 @@ def get_dataset_file_profile(dataset_id: int, file_id: int):
         }
 
 
+def _download_normalization_source(storage, dataset_file: DatasetFile, destination) -> None:
+    bucket = getenv("MINIO_RAW_BUCKET", "insightos-raw")
+    response = storage.get_object(bucket, dataset_file.storage_key)
+    checksum = hashlib.sha256()
+    file_size = 0
+    try:
+        while chunk := response.read(UPLOAD_CHUNK_SIZE):
+            file_size += len(chunk)
+            if file_size > dataset_file.file_size_bytes:
+                raise NormalizationError(
+                    "source_integrity_failed",
+                    "Stored source size does not match its ingestion metadata.",
+                )
+            checksum.update(chunk)
+            destination.write(chunk)
+    finally:
+        response.close()
+        release_connection = getattr(response, "release_conn", None)
+        if release_connection is not None:
+            release_connection()
+    if (
+        file_size != dataset_file.file_size_bytes
+        or checksum.hexdigest() != dataset_file.checksum
+    ):
+        raise NormalizationError(
+            "source_integrity_failed",
+            "Stored source checksum does not match its ingestion metadata.",
+        )
+
+
+def _normalization_response(dataset_id: int, file_id: int, dataset_file: DatasetFile) -> dict:
+    return {
+        "dataset_id": dataset_id,
+        "file_id": file_id,
+        "status": dataset_file.normalization_status,
+        "normalization_result": dataset_file.normalization_result,
+        "error": (
+            {
+                "code": dataset_file.normalization_error_code,
+                "message": dataset_file.normalization_error_message,
+            }
+            if dataset_file.normalization_error_code is not None
+            else None
+        ),
+    }
+
+
+def _mark_normalization_failed(
+    session: Session,
+    dataset_id: int,
+    file_id: int,
+    code: str,
+    message: str,
+) -> None:
+    session.rollback()
+    try:
+        dataset_file = (
+            session.query(DatasetFile)
+            .filter(
+                DatasetFile.id == file_id,
+                DatasetFile.dataset_id == dataset_id,
+            )
+            .one_or_none()
+        )
+        if dataset_file is None or dataset_file.normalization_status == "Ready":
+            return
+        dataset_file.normalization_status = "Failed"
+        dataset_file.normalization_error_code = code
+        dataset_file.normalization_error_message = message
+        session.commit()
+    except SQLAlchemyError as error:
+        session.rollback()
+        logger.error(
+            "Could not persist normalization failure for file %s (%s)",
+            file_id,
+            type(error).__name__,
+        )
+
+
+@app.post("/api/v1/datasets/{dataset_id}/files/{file_id}/normalize")
+def normalize_dataset_file(dataset_id: int, file_id: int):
+    try:
+        configuration = get_normalization_configuration()
+    except NormalizationError as error:
+        raise HTTPException(
+            status_code=500,
+            detail={"code": error.code, "message": error.message},
+        ) from None
+
+    with _pinned_upload_session() as (session, connection), ExitStack() as cleanup:
+        try:
+            dataset_file = (
+                session.query(DatasetFile)
+                .filter(
+                    DatasetFile.id == file_id,
+                    DatasetFile.dataset_id == dataset_id,
+                )
+                .one_or_none()
+            )
+        except SQLAlchemyError as error:
+            logger.error(
+                "Normalization file lookup failed for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Dataset file could not be checked for normalization.",
+            ) from None
+
+        if dataset_file is None:
+            raise HTTPException(status_code=404, detail="Dataset file not found.")
+        if dataset_file.status != "Ready":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "file_not_ready",
+                    "message": "A file can be normalized only after ingestion succeeds.",
+                    "status": dataset_file.status,
+                },
+            )
+        if not dataset_file.checksum or not dataset_file.parsing_result:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "source_metadata_unavailable",
+                    "message": "The source file is missing validated parsing metadata.",
+                },
+            )
+
+        try:
+            lock_id = _try_acquire_upload_lock(
+                session,
+                connection,
+                dataset_id,
+                f"normalization:{file_id}",
+            )
+        except SQLAlchemyError as error:
+            logger.error(
+                "Could not reserve normalization for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Normalization concurrency protection is temporarily unavailable.",
+            ) from None
+        if lock_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalization_in_progress",
+                    "message": "Normalization is already in progress for this file.",
+                },
+            )
+        cleanup.callback(_release_upload_lock, session, connection, lock_id)
+
+        try:
+            dataset_file = (
+                session.query(DatasetFile)
+                .filter(
+                    DatasetFile.id == file_id,
+                    DatasetFile.dataset_id == dataset_id,
+                )
+                .one_or_none()
+            )
+            if dataset_file is None or dataset_file.status != "Ready":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "file_not_ready",
+                        "message": "A file can be normalized only after ingestion succeeds.",
+                    },
+                )
+            existing = dataset_file.normalization_result
+            storage = get_storage_client()
+            processed_bucket = getenv(
+                "MINIO_PROCESSED_BUCKET",
+                "insightos-processed",
+            )
+            if isinstance(existing, dict):
+                try:
+                    existing = validate_normalization_result(
+                        existing,
+                        dataset_file.parsing_result,
+                        dataset_file.filename,
+                        dataset_file.file_size_bytes,
+                        dataset_file.checksum,
+                        dataset_id,
+                        file_id,
+                    )
+                except NormalizationError:
+                    existing = None
+            if (
+                dataset_file.normalization_status == "Ready"
+                and isinstance(existing, dict)
+                and isinstance(existing.get("configuration"), dict)
+                and existing["configuration"].get("configuration_sha256")
+                == configuration["configuration_sha256"]
+                and verify_normalization_result(storage, processed_bucket, existing)
+            ):
+                return _normalization_response(dataset_id, file_id, dataset_file)
+
+            dataset_file.normalization_status = "Processing"
+            dataset_file.normalization_result = None
+            dataset_file.normalization_error_code = None
+            dataset_file.normalization_error_message = None
+            session.commit()
+
+            suffix = "." + dataset_file.filename.rpartition(".")[2]
+            with tempfile.TemporaryDirectory(
+                prefix="insightos-normalization-"
+            ) as temporary_directory:
+                source_path = os.path.join(
+                    temporary_directory,
+                    "source" + suffix,
+                )
+                with open(source_path, "wb") as source:
+                    _download_normalization_source(storage, dataset_file, source)
+                normalized = normalize_file(
+                    source_path,
+                    dataset_file.filename,
+                    dataset_file.parsing_result,
+                    dataset_id,
+                    file_id,
+                    dataset_file.checksum,
+                    storage,
+                    processed_bucket,
+                )
+
+            normalized = validate_normalization_result(
+                normalized,
+                dataset_file.parsing_result,
+                dataset_file.filename,
+                dataset_file.file_size_bytes,
+                dataset_file.checksum,
+                dataset_id,
+                file_id,
+            )
+            dataset_file = session.get(DatasetFile, file_id)
+            if dataset_file is None:
+                raise SQLAlchemyError("Dataset file disappeared during normalization.")
+            dataset_file.normalization_result = normalized
+            dataset_file.normalization_status = "Ready"
+            dataset_file.normalization_error_code = None
+            dataset_file.normalization_error_message = None
+            session.commit()
+            return _normalization_response(dataset_id, file_id, dataset_file)
+        except HTTPException:
+            raise
+        except NormalizationError as error:
+            _mark_normalization_failed(
+                session,
+                dataset_id,
+                file_id,
+                error.code,
+                error.message,
+            )
+            status_code = (
+                502
+                if error.code
+                in {"source_integrity_failed", "storage_verification_failed"}
+                else 422
+            )
+            raise HTTPException(
+                status_code=status_code,
+                detail={"code": error.code, "message": error.message},
+            ) from None
+        except (MinioException, HTTPError, OSError) as error:
+            logger.error(
+                "Normalization storage operation failed for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            _mark_normalization_failed(
+                session,
+                dataset_id,
+                file_id,
+                "storage_failure",
+                "Object storage failed during normalization; retry the operation.",
+            )
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "storage_failure",
+                    "message": "Object storage failed during normalization; retry the operation.",
+                },
+            ) from None
+        except SQLAlchemyError as error:
+            session.rollback()
+            logger.error(
+                "Normalization metadata operation failed for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            _mark_normalization_failed(
+                session,
+                dataset_id,
+                file_id,
+                "metadata_persistence_failed",
+                "Normalization metadata could not be saved; retry the operation.",
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "metadata_persistence_failed",
+                    "message": "Normalization metadata could not be saved; retry the operation.",
+                },
+            ) from None
+
+
+@app.get("/api/v1/datasets/{dataset_id}/files/{file_id}/normalization")
+def get_dataset_file_normalization(dataset_id: int, file_id: int):
+    with SessionLocal() as session:
+        try:
+            dataset = session.get(Dataset, dataset_id)
+            if dataset is None:
+                raise HTTPException(status_code=404, detail="Dataset not found.")
+            dataset_file = (
+                session.query(DatasetFile)
+                .filter(
+                    DatasetFile.id == file_id,
+                    DatasetFile.dataset_id == dataset_id,
+                )
+                .one_or_none()
+            )
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            logger.error(
+                "Normalization status lookup failed for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Normalization status could not be retrieved.",
+            ) from None
+        if dataset_file is None:
+            raise HTTPException(status_code=404, detail="Dataset file not found.")
+        return _normalization_response(dataset_id, file_id, dataset_file)
+
+
+def _remove_dataset_objects(storage, bucket: str, dataset_id: int) -> list:
+    if not storage.bucket_exists(bucket):
+        return []
+    return list(
+        storage.remove_objects(
+            bucket,
+            (
+                DeleteObject(obj.object_name)
+                for obj in storage.list_objects(
+                    bucket,
+                    prefix=f"{dataset_id}/",
+                    recursive=True,
+                )
+            ),
+        )
+    )
+
+
 @app.delete("/api/v1/datasets/{dataset_id}")
 def delete_dataset(dataset_id: int):
-    with SessionLocal() as session:
+    with _pinned_upload_session() as (session, connection), ExitStack() as cleanup:
         try:
             dataset = (
                 session.query(Dataset)
@@ -1667,35 +2045,78 @@ def delete_dataset(dataset_id: int):
         if dataset is None:
             raise HTTPException(status_code=404, detail="Dataset not found.")
 
-        bucket = getenv("MINIO_RAW_BUCKET", "insightos-raw")
+        try:
+            file_ids = [
+                row[0]
+                for row in (
+                    session.query(DatasetFile.id)
+                    .filter(DatasetFile.dataset_id == dataset_id)
+                    .order_by(DatasetFile.id.asc())
+                    .all()
+                )
+            ]
+            for file_id in file_ids:
+                lock_id = _try_acquire_upload_lock(
+                    session,
+                    connection,
+                    dataset_id,
+                    f"normalization:{file_id}",
+                )
+                if lock_id is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "normalization_in_progress",
+                            "message": (
+                                "A dataset file is being normalized; retry "
+                                "dataset deletion after it finishes."
+                            ),
+                        },
+                    )
+                cleanup.callback(
+                    _release_upload_lock,
+                    session,
+                    connection,
+                    lock_id,
+                )
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            logger.error(
+                "Could not reserve dataset deletion for %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Dataset deletion concurrency protection is unavailable.",
+            ) from None
+
+        buckets = list(
+            dict.fromkeys(
+                (
+                    getenv("MINIO_PROCESSED_BUCKET", "insightos-processed"),
+                    getenv("MINIO_RAW_BUCKET", "insightos-raw"),
+                )
+            )
+        )
         try:
             storage = get_storage_client()
-            if storage.bucket_exists(bucket):
-                delete_errors = list(
-                    storage.remove_objects(
-                        bucket,
-                        (
-                            DeleteObject(obj.object_name)
-                            for obj in storage.list_objects(
-                                bucket,
-                                prefix=f"{dataset_id}/",
-                                recursive=True,
-                            )
-                        ),
-                    )
+            delete_errors = []
+            for bucket in buckets:
+                delete_errors.extend(
+                    _remove_dataset_objects(storage, bucket, dataset_id)
                 )
-            else:
-                delete_errors = []
         except (MinioException, HTTPError, OSError) as error:
             session.rollback()
             logger.error(
-                "Object storage deletion failed for dataset %s (%s)",
+                "Dataset object deletion failed for dataset %s (%s)",
                 dataset_id,
                 type(error).__name__,
             )
             raise HTTPException(
                 status_code=502,
-                detail="Dataset files could not be removed from storage.",
+                detail="Dataset objects could not be removed from storage.",
             ) from None
 
         if delete_errors:
@@ -1706,7 +2127,7 @@ def delete_dataset(dataset_id: int):
             )
             raise HTTPException(
                 status_code=502,
-                detail="Dataset files could not be removed from storage.",
+                detail="Dataset objects could not be removed from storage.",
             )
 
         try:

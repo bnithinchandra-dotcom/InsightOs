@@ -17,7 +17,7 @@ import pyarrow.parquet as pq
 
 from app.database import Base
 from app.models import Dataset, DatasetFile, Project, User
-from app import main
+from app import main, normalization
 
 
 class MissingObject(Exception):
@@ -30,7 +30,7 @@ class FakeStorage:
         self.objects = {}
 
     def bucket_exists(self, _bucket):
-        return False
+        return any(bucket == _bucket for bucket, _key in self.objects)
 
     def make_bucket(self, _bucket):
         return None
@@ -69,6 +69,19 @@ class FakeStorage:
 
     def remove_object(self, bucket, key):
         self.objects.pop((bucket, key), None)
+
+    def list_objects(self, bucket, prefix, recursive):
+        del recursive
+        return [
+            SimpleNamespace(object_name=key)
+            for object_bucket, key in self.objects
+            if object_bucket == bucket and key.startswith(prefix)
+        ]
+
+    def remove_objects(self, bucket, objects):
+        for obj in objects:
+            self.remove_object(bucket, obj.name)
+        return []
 
 
 class UploadFlowTests(unittest.TestCase):
@@ -118,6 +131,7 @@ class UploadFlowTests(unittest.TestCase):
             ),
             patch.object(main, "get_storage_client", return_value=self.storage),
             patch.object(main, "S3Error", MissingObject),
+            patch.object(normalization, "S3Error", MissingObject),
         ]
         for active_patch in self.patches:
             active_patch.start()
@@ -334,6 +348,212 @@ class UploadFlowTests(unittest.TestCase):
         self.assertEqual(dataset_file.error_code, "invalid_profile_metadata")
         self.assertIsNone(dataset_file.profile_result)
         session.close()
+
+    def test_normalization_api_is_idempotent_and_keeps_ingestion_state_separate(self):
+        content = b"code,value\n001,1.25\n002,2.50\n"
+        upload = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files",
+            files={"file": ("numbers.csv", content, "text/csv")},
+        )
+        self.assertEqual(upload.status_code, 201, upload.text)
+        file_id = upload.json()["file"]["id"]
+
+        first = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        first_payload = first.json()
+        self.assertEqual(first_payload["status"], "Ready")
+        self.assertEqual(first_payload["normalization_result"]["row_count"], 2)
+        self.assertEqual(
+            first_payload["normalization_result"]["tables"][0]["schema"][0],
+            {"name": "code", "type": "string"},
+        )
+
+        stored_original = self.storage.objects[
+            ("insightos-raw", upload.json()["file"]["storage_key"])
+        ]["content"]
+        self.assertEqual(stored_original, content)
+        normalized_count = len(
+            [
+                key
+                for key in self.storage.objects
+                if key[0] == "insightos-processed"
+            ]
+        )
+        second = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+        )
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(
+            second.json()["normalization_result"]["tables"][0]["object_key"],
+            first_payload["normalization_result"]["tables"][0]["object_key"],
+        )
+        self.assertEqual(
+            len(
+                [
+                    key
+                    for key in self.storage.objects
+                    if key[0] == "insightos-processed"
+                ]
+            ),
+            normalized_count,
+        )
+
+        status = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalization"
+        )
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertEqual(status.json()["status"], "Ready")
+        session = self.session_factory()
+        dataset_file = session.get(DatasetFile, file_id)
+        self.assertEqual(dataset_file.status, "Ready")
+        self.assertEqual(dataset_file.normalization_status, "Ready")
+        session.close()
+
+    def test_normalization_storage_failure_does_not_fail_ingestion_and_can_retry(self):
+        content = b"value\n1\n"
+        upload = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files",
+            files={"file": ("retry.csv", content, "text/csv")},
+        )
+        self.assertEqual(upload.status_code, 201, upload.text)
+        file_id = upload.json()["file"]["id"]
+        original_put = self.storage.put_object
+
+        def fail_processed(bucket, *args, **kwargs):
+            if bucket == "insightos-processed":
+                raise OSError("injected normalization storage failure")
+            return original_put(bucket, *args, **kwargs)
+
+        with patch.object(self.storage, "put_object", side_effect=fail_processed):
+            failed = self.client.post(
+                f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+            )
+        self.assertEqual(failed.status_code, 502, failed.text)
+        session = self.session_factory()
+        dataset_file = session.get(DatasetFile, file_id)
+        self.assertEqual(dataset_file.status, "Ready")
+        self.assertEqual(dataset_file.normalization_status, "Failed")
+        self.assertEqual(dataset_file.normalization_error_code, "storage_failure")
+        session.close()
+
+        retried = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+        )
+        self.assertEqual(retried.status_code, 200, retried.text)
+        self.assertEqual(retried.json()["status"], "Ready")
+
+    def test_failed_normalization_retry_does_not_return_stale_success_result(self):
+        upload = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files",
+            files={"file": ("retry-state.csv", b"value\n1\n", "text/csv")},
+        )
+        self.assertEqual(upload.status_code, 201, upload.text)
+        file_id = upload.json()["file"]["id"]
+        successful = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+        )
+        self.assertEqual(successful.status_code, 200, successful.text)
+        self.assertIsNotNone(successful.json()["normalization_result"])
+        output_key = successful.json()["normalization_result"]["tables"][0]["object_key"]
+        self.storage.remove_object("insightos-processed", output_key)
+
+        original_put = self.storage.put_object
+
+        def fail_processed(bucket, *args, **kwargs):
+            if bucket == "insightos-processed":
+                raise OSError("injected retry failure")
+            return original_put(bucket, *args, **kwargs)
+
+        with patch.object(self.storage, "put_object", side_effect=fail_processed):
+            failed = self.client.post(
+                f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+            )
+        self.assertEqual(failed.status_code, 502, failed.text)
+        self.assertEqual(failed.json()["detail"]["code"], "storage_failure")
+        status = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalization"
+        )
+        self.assertEqual(status.json()["status"], "Failed")
+        self.assertIsNone(status.json()["normalization_result"])
+
+    def test_concurrent_normalization_returns_in_progress_without_removing_output(self):
+        upload = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files",
+            files={"file": ("concurrent.csv", b"value\n1\n", "text/csv")},
+        )
+        self.assertEqual(upload.status_code, 201, upload.text)
+        file_id = upload.json()["file"]["id"]
+        lock_guard = Lock()
+        held = False
+        output_written = Event()
+        allow_first_to_finish = Event()
+        original_put = self.storage.put_object
+
+        def try_lock(session, connection, _dataset_id, key):
+            self.assertIs(session.get_bind(), connection)
+            self.assertEqual(key, f"normalization:{file_id}")
+            nonlocal held
+            with lock_guard:
+                if held:
+                    return None
+                held = True
+                return 303
+
+        def release_lock(session, connection, lock_id):
+            self.assertIs(session.get_bind(), connection)
+            self.assertEqual(lock_id, 303)
+            nonlocal held
+            with lock_guard:
+                held = False
+
+        def put_and_pause(bucket, *args, **kwargs):
+            original_put(bucket, *args, **kwargs)
+            if bucket == "insightos-processed":
+                output_written.set()
+                if not allow_first_to_finish.wait(timeout=10):
+                    raise TimeoutError("test did not release normalization")
+
+        with (
+            patch.object(main, "_try_acquire_upload_lock", side_effect=try_lock),
+            patch.object(main, "_release_upload_lock", side_effect=release_lock),
+            patch.object(self.storage, "put_object", side_effect=put_and_pause),
+            ThreadPoolExecutor(max_workers=1) as executor,
+        ):
+            first_future = executor.submit(
+                self.client.post,
+                f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize",
+            )
+            try:
+                self.assertTrue(output_written.wait(timeout=5))
+                second = self.client.post(
+                    f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+                )
+                self.assertEqual(second.status_code, 409, second.text)
+                self.assertEqual(
+                    second.json()["detail"]["code"],
+                    "normalization_in_progress",
+                )
+                processed_objects = {
+                    key: value
+                    for key, value in self.storage.objects.items()
+                    if key[0] == "insightos-processed"
+                }
+                self.assertEqual(len(processed_objects), 1)
+            finally:
+                allow_first_to_finish.set()
+            first = first_future.result(timeout=10)
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(
+            {
+                key: value
+                for key, value in self.storage.objects.items()
+                if key[0] == "insightos-processed"
+            },
+            processed_objects,
+        )
 
     def test_profile_columns_must_match_parsing_metadata(self):
         content = b"first,second\n1,2\n"
@@ -892,6 +1112,138 @@ class UploadFlowTests(unittest.TestCase):
         self.assertEqual(
             self.client.get(f"/api/v1/datasets/{dataset_id}").status_code,
             404,
+        )
+
+    def test_dataset_deletion_removes_its_raw_and_processed_objects_only(self):
+        upload = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files",
+            files={"file": ("delete-me.csv", b"value\n1\n", "text/csv")},
+        )
+        self.assertEqual(upload.status_code, 201, upload.text)
+        file_id = upload.json()["file"]["id"]
+        normalized = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+        )
+        self.assertEqual(normalized.status_code, 200, normalized.text)
+
+        other_dataset_id = self.dataset_id + 1000
+        self.storage.objects[
+            ("insightos-raw", f"{other_dataset_id}/other.csv")
+        ] = {"content": b"untouched", "metadata": {}}
+        self.storage.objects[
+            ("insightos-processed", f"{other_dataset_id}/other.parquet")
+        ] = {"content": b"untouched", "metadata": {}}
+
+        response = self.client.delete(f"/api/v1/datasets/{self.dataset_id}")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(
+            any(
+                key.startswith(f"{self.dataset_id}/")
+                for bucket, key in self.storage.objects
+                if bucket in {"insightos-raw", "insightos-processed"}
+            )
+        )
+        self.assertIn(
+            ("insightos-raw", f"{other_dataset_id}/other.csv"),
+            self.storage.objects,
+        )
+        self.assertIn(
+            ("insightos-processed", f"{other_dataset_id}/other.parquet"),
+            self.storage.objects,
+        )
+
+    def test_dataset_deletion_storage_failure_keeps_database_records(self):
+        upload = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files",
+            files={"file": ("keep-on-failure.csv", b"value\n1\n", "text/csv")},
+        )
+        self.assertEqual(upload.status_code, 201, upload.text)
+        file_id = upload.json()["file"]["id"]
+        normalized = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+        )
+        self.assertEqual(normalized.status_code, 200, normalized.text)
+        objects_before = dict(self.storage.objects)
+        original_remove = main._remove_dataset_objects
+
+        def fail_processed(storage, bucket, dataset_id):
+            if bucket == "insightos-processed":
+                raise OSError("injected deletion failure")
+            return original_remove(storage, bucket, dataset_id)
+
+        with patch.object(main, "_remove_dataset_objects", side_effect=fail_processed):
+            response = self.client.delete(
+                f"/api/v1/datasets/{self.dataset_id}"
+            )
+
+        self.assertEqual(response.status_code, 502, response.text)
+        session = self.session_factory()
+        self.assertIsNotNone(session.get(Dataset, self.dataset_id))
+        self.assertIsNotNone(session.get(DatasetFile, file_id))
+        session.close()
+        self.assertEqual(self.storage.objects, objects_before)
+
+    def test_dataset_deletion_conflicts_with_active_normalization(self):
+        upload = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files",
+            files={"file": ("busy.csv", b"value\n1\n", "text/csv")},
+        )
+        self.assertEqual(upload.status_code, 201, upload.text)
+        file_id = upload.json()["file"]["id"]
+        lock_key = f"normalization:{file_id}"
+        acquired = set()
+        output_removal_started = Event()
+        allow_deletion_to_continue = Event()
+        original_remove = main._remove_dataset_objects
+
+        def acquire(session, connection, _dataset_id, key):
+            self.assertIs(session.get_bind(), connection)
+            if key in acquired:
+                return None
+            acquired.add(key)
+            return 999
+
+        def release(_session, _connection, _lock_id):
+            acquired.discard(lock_key)
+
+        def pause_removal(storage, bucket, dataset_id):
+            if bucket == "insightos-processed":
+                output_removal_started.set()
+                if not allow_deletion_to_continue.wait(timeout=10):
+                    raise TimeoutError("test did not release dataset deletion")
+            return original_remove(storage, bucket, dataset_id)
+
+        with (
+            patch.object(main, "_try_acquire_upload_lock", side_effect=acquire),
+            patch.object(main, "_release_upload_lock", side_effect=release),
+            patch.object(main, "_remove_dataset_objects", side_effect=pause_removal),
+            ThreadPoolExecutor(max_workers=1) as executor,
+        ):
+            deletion_future = executor.submit(
+                self.client.delete,
+                f"/api/v1/datasets/{self.dataset_id}",
+            )
+            try:
+                self.assertTrue(output_removal_started.wait(timeout=5))
+                normalization = self.client.post(
+                    f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+                )
+                self.assertEqual(normalization.status_code, 409, normalization.text)
+                self.assertEqual(
+                    normalization.json()["detail"]["code"],
+                    "normalization_in_progress",
+                )
+            finally:
+                allow_deletion_to_continue.set()
+            deleted = deletion_future.result(timeout=10)
+
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertFalse(
+            any(
+                key.startswith(f"{self.dataset_id}/")
+                for bucket, key in self.storage.objects
+                if bucket in {"insightos-raw", "insightos-processed"}
+            )
         )
 
 

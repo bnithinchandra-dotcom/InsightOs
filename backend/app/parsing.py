@@ -10,6 +10,7 @@ from typing import BinaryIO
 from defusedxml import ElementTree as SafeElementTree
 from defusedxml.common import DefusedXmlException
 from openpyxl import load_workbook
+from openpyxl.styles.numbers import is_datetime
 from openpyxl.utils.exceptions import InvalidFileException
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -435,8 +436,14 @@ def _excel_type(cell) -> str:
         return "null"
     if isinstance(value, bool):
         return "boolean"
-    if isinstance(value, (datetime, date, time)):
-        return "date" if not isinstance(value, time) else "time"
+    if isinstance(value, datetime):
+        if value.time() == time.min and is_datetime(cell.number_format) == "date":
+            return "date"
+        return "datetime"
+    if isinstance(value, date):
+        return "date"
+    if isinstance(value, time):
+        return "time"
     if isinstance(value, int):
         return "integer"
     if isinstance(value, float):

@@ -62,19 +62,23 @@ not coerced. A well-formed XML document or recognized binary signature is
 rejected as mismatched delimited content; ordinary single-column text remains
 valid. JSON supports an array of objects, a flat object with scalar values, or
 a wrapper object whose only property is an array of record objects. Sibling
-fields in wrapper objects are rejected rather than discarded. Nested JSON
-values inside records remain object/array values. XLSX parses each worksheet
-using its first non-empty row as the header; formulas are identified but not
-evaluated. Parquet schema types come from its Arrow schema, and the full data
-stream is scanned to verify rows.
+fields in wrapper objects and duplicate object keys are rejected rather than
+discarded. Nested JSON values inside records remain object/array values.
+XLSX uses each worksheet's first row as its header; normalization rejects
+values after an empty first row rather than silently omitting them. Formulas
+are identified but not evaluated. Parquet schema types come from its Arrow
+schema, and the full data stream is scanned to verify rows.
 
 XML support is intentionally limited to a well-formed document with exactly
 one unambiguous group of repeated same-name sibling record elements. The record
 container cannot mix unrelated element siblings. Namespace names use expanded
 Clark notation (`{uri}local`); nested leaf names are joined with `/`, and
-attributes use `/@name`. Attributes are preserved, missing elements and empty
-values are counted separately, and mixed text/element content or repeated
-nested fields are rejected as unsupported rather than silently flattened.
+attributes use `/@name`. Record attributes and root/container attributes are
+preserved; root/container attribute columns use
+`@container:<JSON-encoded ancestor path>/@<attribute>` and repeat their
+constant source value on each record row. Missing elements and empty values
+are counted separately, and mixed text/element content or repeated nested
+fields are rejected as unsupported rather than silently flattened.
 All DTD declarations, including internal subsets, and external entities are
 forbidden. XML is parsed with a bounded tree builder that enforces depth and
 element-count limits as start elements arrive, before those nodes are added to
@@ -103,6 +107,75 @@ includes source rows; categorical display values are truncated at 256
 characters. Historical `Ready` records created before profiling may not have a
 profile; their profile endpoint returns `profile_not_available`. Profile
 generation is synchronous as part of upload parsing.
+
+## Parquet normalization
+
+Normalization is a distinct synchronous operation on an ingested `Ready` file:
+
+- `POST /api/v1/datasets/{dataset_id}/files/{file_id}/normalize` requests
+  normalization and returns its current state and result.
+- `GET /api/v1/datasets/{dataset_id}/files/{file_id}/normalization` retrieves
+  normalization state, result, or safe failure details.
+
+Normalization state (`NotStarted`, `Processing`, `Ready`, or `Failed`) is stored
+separately from ingestion state. Normalization requires PostgreSQL advisory-lock
+support. Concurrent requests for the same file receive an
+`normalization_in_progress` conflict. Requests for a completed result with the
+same source checksum and configuration verify the stored objects and reuse the
+result. Failures do not change the uploaded file's `Ready` ingestion state.
+When a retry starts, its prior result is cleared so a later failure cannot
+present stale output as the current result. Previously written content-addressed
+objects are retained and can be verified and reused on a subsequent retry.
+
+Outputs are written as Parquet objects to `MINIO_PROCESSED_BUCKET` (default
+`insightos-processed`). Each XLSX worksheet remains a separate logical table and
+output. A wholly empty worksheet is retained in result metadata without
+creating a zero-column Parquet object. Keys include the dataset/file identity,
+source checksum, normalization configuration hash, table position, and output
+checksum. Original objects are never overwritten or deleted. Outputs are
+validated locally and after upload using Parquet schema, row count, null/empty
+counts, content fingerprints, object size, and SHA-256 before normalization is
+marked `Ready`. If metadata persistence fails after an output is written, that
+content-addressed object is retained; a retry verifies and reuses it rather
+than risking deletion of a valid output.
+Deleting a dataset removes only objects under that dataset's prefix from both
+the raw and processed buckets. Deletion acquires the same per-file advisory
+locks as normalization and returns a conflict while any file is being
+normalized. Object-store deletion is not transactional across buckets; a
+storage failure returns an error and leaves the database records for a retry,
+although objects successfully removed before the failure are not restored.
+
+CSV and TSV columns remain strings, including numeric-looking identifiers and
+leading zeros. XML columns remain strings, with the parser's expanded namespace
+names and nested paths preserved; missing values remain null and empty values
+remain empty strings. Parquet inputs retain their Arrow logical schema and
+values. JSON integers that fit `int64` remain integers; JSON integer/decimal
+columns use Parquet Decimal when precision permits. Nested JSON values,
+high-precision numeric values that exceed Parquet Decimal limits, mixed JSON
+types, and incompatible mixed XLSX cell types use a reversible tagged JSON text
+encoding, accompanied by warnings. XLSX formulas are preserved as formula text
+and never evaluated. XLSX formula columns mixed with other values and XLSX error
+cells fail normalization explicitly. Date-formatted XLSX cells with midnight
+values remain dates; non-midnight or time-formatted datetime cells remain
+timestamps. A column mixing dates and datetimes uses timestamps, promoting
+date-only values to midnight without truncating datetime values. No values are
+imputed, removed, or deduplicated. JSON missing fields and explicit nulls are
+distinguishable in the tagged representation, including columns whose only
+present values are null.
+
+`NORMALIZATION_COMPRESSION` selects an installed Parquet codec (default `zstd`;
+`none` disables compression). `NORMALIZATION_BATCH_SIZE` bounds row batches
+(default 8,192; maximum 65,536), and `MAX_NORMALIZED_OUTPUT_MB` caps total generated output
+(default 600 MiB). CSV/TSV, XLSX, and Parquet values are processed in batches.
+The existing JSON parser materializes a JSON document, and XML normalization
+uses the parser's bounded XML tree; those formats are therefore bounded by the
+configured upload, row, nesting, and XML limits but are not fully streaming.
+Normalization is synchronous; the current worker does not run background jobs.
+The output can be larger than its source. The API does not implement
+application-level authentication or project ownership checks; deployments must
+place it behind a trusted network boundary or an authenticating gateway.
+Automated tests use mocked object storage and isolated SQLite databases; live
+PostgreSQL advisory-lock and MinIO behavior has not been exercised.
 
 Database sources such as PostgreSQL and MySQL, live servers, streaming, polling,
 and cloud object storage require separate connector-based ingestion paths.
