@@ -274,6 +274,198 @@ def upload_dataset_file(dataset_id: int, file: UploadFile = File(...)):
         }
 
 
+def serialize_project(project: Project) -> dict:
+    return {
+        "id": project.id,
+        "name": project.name,
+        "description": project.description,
+        "user_id": project.user_id,
+        "created_at": project.created_at,
+        "updated_at": project.updated_at,
+    }
+
+
+def serialize_dataset(dataset: Dataset) -> dict:
+    return {
+        "id": dataset.id,
+        "project_id": dataset.project_id,
+        "name": dataset.name,
+        "description": dataset.description,
+        "status": dataset.status,
+        "created_at": dataset.created_at,
+        "updated_at": dataset.updated_at,
+    }
+
+
+def serialize_dataset_file(dataset_file: DatasetFile) -> dict:
+    return {
+        "id": dataset_file.id,
+        "dataset_id": dataset_file.dataset_id,
+        "filename": dataset_file.filename,
+        "storage_key": dataset_file.storage_key,
+        "file_size_bytes": dataset_file.file_size_bytes,
+        "mime_type": dataset_file.mime_type,
+        "checksum": dataset_file.checksum,
+        "created_at": dataset_file.created_at,
+        "updated_at": dataset_file.updated_at,
+    }
+
+
+@app.get("/api/v1/projects")
+def list_projects():
+    with SessionLocal() as session:
+        try:
+            projects = session.query(Project).order_by(Project.id.asc()).all()
+        except SQLAlchemyError as error:
+            logger.error("Project listing failed (%s)", type(error).__name__)
+            raise HTTPException(
+                status_code=500,
+                detail="Projects could not be retrieved.",
+            ) from None
+
+        return [serialize_project(project) for project in projects]
+
+
+@app.get("/api/v1/projects/{project_id}")
+def get_project(project_id: int):
+    with SessionLocal() as session:
+        try:
+            project = session.get(Project, project_id)
+        except SQLAlchemyError as error:
+            logger.error(
+                "Project lookup failed for project %s (%s)",
+                project_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Project could not be retrieved.",
+            ) from None
+
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found.")
+
+        return serialize_project(project)
+
+
+@app.get("/api/v1/projects/{project_id}/datasets")
+def list_project_datasets(project_id: int):
+    with SessionLocal() as session:
+        try:
+            project = session.get(Project, project_id)
+            if project is None:
+                raise HTTPException(status_code=404, detail="Project not found.")
+
+            datasets = (
+                session.query(Dataset)
+                .filter(Dataset.project_id == project_id)
+                .order_by(Dataset.id.asc())
+                .all()
+            )
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            logger.error(
+                "Dataset listing failed for project %s (%s)",
+                project_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Project datasets could not be retrieved.",
+            ) from None
+
+        return [serialize_dataset(dataset) for dataset in datasets]
+
+
+@app.get("/api/v1/datasets/{dataset_id}")
+def get_dataset(dataset_id: int):
+    with SessionLocal() as session:
+        try:
+            dataset = session.get(Dataset, dataset_id)
+        except SQLAlchemyError as error:
+            logger.error(
+                "Dataset lookup failed for dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Dataset could not be retrieved.",
+            ) from None
+
+        if dataset is None:
+            raise HTTPException(status_code=404, detail="Dataset not found.")
+
+        return serialize_dataset(dataset)
+
+
+@app.get("/api/v1/datasets/{dataset_id}/files")
+def list_dataset_files(dataset_id: int):
+    with SessionLocal() as session:
+        try:
+            dataset = session.get(Dataset, dataset_id)
+            if dataset is None:
+                raise HTTPException(status_code=404, detail="Dataset not found.")
+
+            dataset_files = (
+                session.query(DatasetFile)
+                .filter(DatasetFile.dataset_id == dataset_id)
+                .order_by(DatasetFile.id.asc())
+                .all()
+            )
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            logger.error(
+                "File listing failed for dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Dataset files could not be retrieved.",
+            ) from None
+
+        return [serialize_dataset_file(dataset_file) for dataset_file in dataset_files]
+
+
+@app.get("/api/v1/datasets/{dataset_id}/files/{file_id}")
+def get_dataset_file(dataset_id: int, file_id: int):
+    with SessionLocal() as session:
+        try:
+            dataset = session.get(Dataset, dataset_id)
+            if dataset is None:
+                raise HTTPException(status_code=404, detail="Dataset not found.")
+
+            dataset_file = (
+                session.query(DatasetFile)
+                .filter(
+                    DatasetFile.id == file_id,
+                    DatasetFile.dataset_id == dataset_id,
+                )
+                .one_or_none()
+            )
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            logger.error(
+                "File lookup failed for dataset %s file %s (%s)",
+                dataset_id,
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Dataset file could not be retrieved.",
+            ) from None
+
+        if dataset_file is None:
+            raise HTTPException(status_code=404, detail="Dataset file not found.")
+
+        return serialize_dataset_file(dataset_file)
+
+
 @app.get("/health")
 def health_check():
     return {
