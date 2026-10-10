@@ -27,6 +27,12 @@ class DatasetFile(Base):
             "normalization_status IN ('NotStarted', 'Processing', 'Ready', 'Failed')",
             name="ck_dataset_files_normalization_status",
         ),
+        CheckConstraint(
+            "quality_analysis_status IN "
+            "('NotStarted', 'Requested', 'Running', 'Completed', "
+            "'PartiallyCompleted', 'Failed')",
+            name="ck_dataset_files_quality_analysis_status",
+        ),
         UniqueConstraint(
             "dataset_id",
             "idempotency_key",
@@ -100,6 +106,42 @@ class DatasetFile(Base):
 
     normalization_error_message: Mapped[str | None] = mapped_column(
         Text,
+        nullable=True,
+    )
+
+    quality_analysis_status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="NotStarted",
+    )
+
+    quality_analysis_key: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+
+    quality_report: Mapped[dict | None] = mapped_column(
+        JSON,
+        nullable=True,
+    )
+
+    quality_analysis_error_code: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+
+    quality_analysis_error_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    quality_analysis_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+
+    quality_analysis_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
         nullable=True,
     )
 

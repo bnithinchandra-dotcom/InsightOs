@@ -411,6 +411,468 @@ class UploadFlowTests(unittest.TestCase):
         self.assertEqual(dataset_file.normalization_status, "Ready")
         session.close()
 
+    def test_quality_analysis_persists_contract_without_changing_existing_apis_or_data(self):
+        content = b"code,value\n001,1.25\n002,2.50\n"
+        upload = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files",
+            files={"file": ("quality.csv", content, "text/csv")},
+        )
+        self.assertEqual(upload.status_code, 201, upload.text)
+        file_id = upload.json()["file"]["id"]
+        normalized = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+        )
+        self.assertEqual(normalized.status_code, 200, normalized.text)
+        normalized_body = normalized.json()
+        self.assertEqual(
+            set(normalized_body),
+            {
+                "dataset_id",
+                "file_id",
+                "status",
+                "normalization_result",
+                "error",
+            },
+        )
+
+        profile = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/profile"
+        )
+        self.assertEqual(profile.status_code, 200, profile.text)
+        self.assertEqual(
+            set(profile.json()),
+            {"dataset_id", "file_id", "profile_result"},
+        )
+        profile_before = profile.json()
+        storage_before = copy.deepcopy(self.storage.objects)
+
+        first = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        first_body = first.json()
+        self.assertEqual(first_body["status"], "PartiallyCompleted")
+        self.assertTrue(first_body["report_is_current"])
+        self.assertEqual(first_body["quality_report"]["schema_version"], 1)
+        self.assertEqual(first_body["quality_report"]["findings"], [])
+        self.assertEqual(
+            first_body["quality_report"]["coverage"]["checks"][0]["status"],
+            "Skipped",
+        )
+
+        repeated = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
+        )
+        self.assertEqual(repeated.status_code, 200, repeated.text)
+        self.assertEqual(
+            repeated.json()["quality_report"],
+            first_body["quality_report"],
+        )
+        status = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
+        )
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertEqual(status.json(), repeated.json())
+        self.assertEqual(self.storage.objects, storage_before)
+        self.assertEqual(
+            self.client.get(
+                f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/profile"
+            ).json(),
+            profile_before,
+        )
+        normalization_status = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalization"
+        )
+        self.assertEqual(
+            normalization_status.json()["normalization_result"],
+            normalized_body["normalization_result"],
+        )
+
+        session = self.session_factory()
+        dataset_file = session.get(DatasetFile, file_id)
+        self.assertEqual(dataset_file.status, "Ready")
+        self.assertEqual(dataset_file.normalization_status, "Ready")
+        self.assertEqual(
+            dataset_file.quality_analysis_status,
+            "PartiallyCompleted",
+        )
+        self.assertEqual(
+            dataset_file.quality_analysis_key,
+            first_body["analysis_key"],
+        )
+        session.close()
+
+    def test_quality_analysis_failure_keeps_previous_report_and_safe_error(self):
+        upload = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files",
+            files={"file": ("quality-failure.csv", b"value\n1\n", "text/csv")},
+        )
+        self.assertEqual(upload.status_code, 201, upload.text)
+        file_id = upload.json()["file"]["id"]
+        normalized = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+        )
+        self.assertEqual(normalized.status_code, 200, normalized.text)
+        successful = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
+        )
+        self.assertEqual(successful.status_code, 200, successful.text)
+        previous_report = successful.json()["quality_report"]
+
+        with patch.object(
+            main,
+            "verify_normalization_result",
+            side_effect=OSError("private source value"),
+        ):
+            failed = self.client.post(
+                f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis",
+                json={"recompute": True},
+            )
+        self.assertEqual(failed.status_code, 502, failed.text)
+        self.assertNotIn("private source value", failed.text)
+
+        status = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
+        )
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertEqual(status.json()["status"], "Failed")
+        self.assertTrue(status.json()["report_is_current"])
+        self.assertEqual(status.json()["quality_report"], previous_report)
+        self.assertEqual(status.json()["error"]["code"], "storage_failure")
+        self.assertNotIn("private source value", status.text)
+
+    def test_unexpected_quality_analysis_failure_keeps_previous_report(self):
+        upload = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files",
+            files={
+                "file": (
+                    "quality-unexpected-failure.csv",
+                    b"value\n1\n",
+                    "text/csv",
+                )
+            },
+        )
+        self.assertEqual(upload.status_code, 201, upload.text)
+        file_id = upload.json()["file"]["id"]
+        normalized = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+        )
+        self.assertEqual(normalized.status_code, 200, normalized.text)
+        successful = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
+        )
+        self.assertEqual(successful.status_code, 200, successful.text)
+        previous_report = successful.json()["quality_report"]
+
+        with patch.object(
+            main,
+            "build_contract_report",
+            side_effect=RuntimeError("private cell value"),
+        ):
+            failed = self.client.post(
+                f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis",
+                json={"recompute": True},
+            )
+        self.assertEqual(failed.status_code, 500, failed.text)
+        self.assertEqual(
+            failed.json()["detail"]["code"],
+            "quality_analysis_failed",
+        )
+        self.assertNotIn("private cell value", failed.text)
+
+        state = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
+        )
+        self.assertEqual(state.status_code, 200, state.text)
+        self.assertEqual(state.json()["status"], "Failed")
+        self.assertTrue(state.json()["report_is_current"])
+        self.assertEqual(state.json()["quality_report"], previous_report)
+        self.assertEqual(
+            state.json()["quality_report"]["analysis"]["analysis_key"],
+            successful.json()["analysis_key"],
+        )
+        self.assertNotIn("private cell value", state.text)
+
+    def test_quality_report_remains_available_and_stale_after_renormalization(self):
+        upload = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files",
+            files={
+                "file": (
+                    "quality-renormalize.csv",
+                    b"value\n1\n2\n3\n",
+                    "text/csv",
+                )
+            },
+        )
+        self.assertEqual(upload.status_code, 201, upload.text)
+        file_id = upload.json()["file"]["id"]
+        first_normalization = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+        )
+        self.assertEqual(first_normalization.status_code, 200)
+        first_analysis = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
+        )
+        self.assertEqual(first_analysis.status_code, 200, first_analysis.text)
+        previous_report = first_analysis.json()["quality_report"]
+        previous_key = previous_report["analysis"]["analysis_key"]
+
+        with patch.dict("os.environ", {"NORMALIZATION_COMPRESSION": "snappy"}):
+            normalized_again = self.client.post(
+                f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+            )
+        self.assertEqual(normalized_again.status_code, 200, normalized_again.text)
+        self.assertNotEqual(
+            normalized_again.json()["normalization_result"]["configuration"][
+                "configuration_sha256"
+            ],
+            first_normalization.json()["normalization_result"]["configuration"][
+                "configuration_sha256"
+            ],
+        )
+
+        stale = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
+        )
+        self.assertEqual(stale.status_code, 200, stale.text)
+        self.assertFalse(stale.json()["report_is_current"])
+        self.assertEqual(stale.json()["quality_report"], previous_report)
+        self.assertEqual(
+            stale.json()["quality_report"]["analysis"]["analysis_key"],
+            previous_key,
+        )
+
+        new_analysis = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
+        )
+        self.assertEqual(new_analysis.status_code, 200, new_analysis.text)
+        self.assertTrue(new_analysis.json()["report_is_current"])
+        self.assertNotEqual(
+            new_analysis.json()["quality_report"]["analysis"]["analysis_key"],
+            previous_key,
+        )
+
+    def test_quality_report_survives_failed_normalization_retry(self):
+        upload = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files",
+            files={
+                "file": (
+                    "quality-failed-normalize-retry.csv",
+                    b"value\n1\n",
+                    "text/csv",
+                )
+            },
+        )
+        self.assertEqual(upload.status_code, 201, upload.text)
+        file_id = upload.json()["file"]["id"]
+        normalized = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+        )
+        self.assertEqual(normalized.status_code, 200, normalized.text)
+        analysis = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
+        )
+        self.assertEqual(analysis.status_code, 200, analysis.text)
+        previous_report = analysis.json()["quality_report"]
+        output_key = normalized.json()["normalization_result"]["tables"][0][
+            "object_key"
+        ]
+        self.storage.remove_object("insightos-processed", output_key)
+
+        original_put = self.storage.put_object
+
+        def fail_processed(bucket, *args, **kwargs):
+            if bucket == "insightos-processed":
+                raise OSError("injected retry failure")
+            return original_put(bucket, *args, **kwargs)
+
+        with patch.object(self.storage, "put_object", side_effect=fail_processed):
+            failed = self.client.post(
+                f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+            )
+        self.assertEqual(failed.status_code, 502, failed.text)
+
+        stale = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
+        )
+        self.assertEqual(stale.status_code, 200, stale.text)
+        self.assertFalse(stale.json()["report_is_current"])
+        self.assertEqual(stale.json()["quality_report"], previous_report)
+
+        retried = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+        )
+        self.assertEqual(retried.status_code, 200, retried.text)
+        current = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
+        )
+        self.assertEqual(current.status_code, 200, current.text)
+        self.assertTrue(current.json()["report_is_current"])
+        self.assertEqual(current.json()["quality_report"], previous_report)
+
+    def test_quality_analysis_persists_running_and_rejects_duplicate_request(self):
+        upload = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files",
+            files={"file": ("quality-concurrent.csv", b"value\n1\n", "text/csv")},
+        )
+        self.assertEqual(upload.status_code, 201, upload.text)
+        file_id = upload.json()["file"]["id"]
+        normalized = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+        )
+        self.assertEqual(normalized.status_code, 200, normalized.text)
+
+        held = set()
+        lock_ids = {}
+        next_lock_id = 800
+        lock_guard = Lock()
+        running = Event()
+        allow_analysis_to_finish = Event()
+        original_build = main.build_contract_report
+
+        def acquire(session, connection, dataset_id, key):
+            nonlocal next_lock_id
+            self.assertIs(session.get_bind(), connection)
+            self.assertEqual(dataset_id, self.dataset_id)
+            self.assertEqual(key, f"quality-analysis:{file_id}")
+            with lock_guard:
+                if key in held:
+                    return None
+                held.add(key)
+                next_lock_id += 1
+                lock_ids[next_lock_id] = key
+                return next_lock_id
+
+        def release(session, connection, lock_id):
+            self.assertIs(session.get_bind(), connection)
+            with lock_guard:
+                held.discard(lock_ids.pop(lock_id))
+
+        def pause_report(*args, **kwargs):
+            running.set()
+            if not allow_analysis_to_finish.wait(timeout=10):
+                raise TimeoutError("test did not release quality analysis")
+            return original_build(*args, **kwargs)
+
+        with (
+            patch.object(main, "_try_acquire_upload_lock", side_effect=acquire),
+            patch.object(main, "_release_upload_lock", side_effect=release),
+            patch.object(main, "build_contract_report", side_effect=pause_report),
+            ThreadPoolExecutor(max_workers=1) as executor,
+        ):
+            future = executor.submit(
+                self.client.post,
+                f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis",
+            )
+            try:
+                self.assertTrue(running.wait(timeout=5))
+                state = self.client.get(
+                    f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
+                )
+                self.assertEqual(state.status_code, 200, state.text)
+                self.assertEqual(state.json()["status"], "Running")
+                duplicate = self.client.post(
+                    f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
+                )
+                self.assertEqual(duplicate.status_code, 409, duplicate.text)
+                self.assertEqual(
+                    duplicate.json()["detail"]["code"],
+                    "quality_analysis_in_progress",
+                )
+            finally:
+                allow_analysis_to_finish.set()
+            result = future.result(timeout=10)
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json()["status"], "PartiallyCompleted")
+
+    def test_quality_analysis_rejects_unready_normalization_without_mutation(self):
+        upload = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files",
+            files={"file": ("not-normalized.csv", b"value\n1\n", "text/csv")},
+        )
+        self.assertEqual(upload.status_code, 201, upload.text)
+        file_id = upload.json()["file"]["id"]
+        response = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
+        )
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(
+            response.json()["detail"]["code"],
+            "normalization_unavailable",
+        )
+        session = self.session_factory()
+        dataset_file = session.get(DatasetFile, file_id)
+        self.assertEqual(dataset_file.quality_analysis_status, "NotStarted")
+        self.assertIsNone(dataset_file.quality_report)
+        session.close()
+
+    def test_quality_analysis_conflicts_with_dataset_deletion_while_running(self):
+        upload = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files",
+            files={"file": ("quality-delete.csv", b"value\n1\n", "text/csv")},
+        )
+        self.assertEqual(upload.status_code, 201, upload.text)
+        file_id = upload.json()["file"]["id"]
+        normalized = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+        )
+        self.assertEqual(normalized.status_code, 200, normalized.text)
+
+        held = set()
+        lock_ids = {}
+        analyzed = Event()
+        allow_analysis_to_finish = Event()
+        original_verify = main.verify_normalization_result
+
+        def acquire(session, connection, _dataset_id, key):
+            self.assertIs(session.get_bind(), connection)
+            self.assertEqual(_dataset_id, self.dataset_id)
+            if key in held:
+                return None
+            held.add(key)
+            lock_id = len(held) + 700
+            lock_ids[lock_id] = key
+            return lock_id
+
+        def release(session, connection, lock_id):
+            self.assertIs(session.get_bind(), connection)
+            held.discard(lock_ids.pop(lock_id))
+
+        def pause_verification(storage, bucket, result):
+            analyzed.set()
+            if not allow_analysis_to_finish.wait(timeout=10):
+                raise TimeoutError("test did not release quality analysis")
+            return original_verify(storage, bucket, result)
+
+        with (
+            patch.object(main, "_try_acquire_upload_lock", side_effect=acquire),
+            patch.object(main, "_release_upload_lock", side_effect=release),
+            patch.object(
+                main,
+                "verify_normalization_result",
+                side_effect=pause_verification,
+            ),
+            ThreadPoolExecutor(max_workers=1) as executor,
+        ):
+            analysis_future = executor.submit(
+                self.client.post,
+                f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis",
+            )
+            try:
+                self.assertTrue(analyzed.wait(timeout=5))
+                deleted = self.client.delete(
+                    f"/api/v1/datasets/{self.dataset_id}"
+                )
+                self.assertEqual(deleted.status_code, 409, deleted.text)
+                self.assertEqual(
+                    deleted.json()["detail"]["code"],
+                    "quality_analysis_in_progress",
+                )
+            finally:
+                allow_analysis_to_finish.set()
+            analysis = analysis_future.result(timeout=10)
+        self.assertEqual(analysis.status_code, 200, analysis.text)
+
     def test_normalization_storage_failure_does_not_fail_ingestion_and_can_retry(self):
         content = b"value\n1\n"
         upload = self.client.post(
@@ -486,27 +948,34 @@ class UploadFlowTests(unittest.TestCase):
         self.assertEqual(upload.status_code, 201, upload.text)
         file_id = upload.json()["file"]["id"]
         lock_guard = Lock()
-        held = False
+        held = set()
+        lock_keys = {}
         output_written = Event()
         allow_first_to_finish = Event()
         original_put = self.storage.put_object
 
         def try_lock(session, connection, _dataset_id, key):
             self.assertIs(session.get_bind(), connection)
-            self.assertEqual(key, f"normalization:{file_id}")
-            nonlocal held
+            self.assertIn(
+                key,
+                {
+                    f"normalization:{file_id}",
+                    f"quality-analysis:{file_id}",
+                },
+            )
             with lock_guard:
-                if held:
+                if key in held:
                     return None
-                held = True
-                return 303
+                held.add(key)
+                lock_id = 303 if key.startswith("normalization:") else 304
+                lock_keys[lock_id] = key
+                return lock_id
 
         def release_lock(session, connection, lock_id):
             self.assertIs(session.get_bind(), connection)
-            self.assertEqual(lock_id, 303)
-            nonlocal held
+            self.assertIn(lock_id, {303, 304})
             with lock_guard:
-                held = False
+                held.discard(lock_keys.pop(lock_id))
 
         def put_and_pause(bucket, *args, **kwargs):
             original_put(bucket, *args, **kwargs)
@@ -1190,8 +1659,8 @@ class UploadFlowTests(unittest.TestCase):
         )
         self.assertEqual(upload.status_code, 201, upload.text)
         file_id = upload.json()["file"]["id"]
-        lock_key = f"normalization:{file_id}"
         acquired = set()
+        lock_ids = {}
         output_removal_started = Event()
         allow_deletion_to_continue = Event()
         original_remove = main._remove_dataset_objects
@@ -1201,10 +1670,12 @@ class UploadFlowTests(unittest.TestCase):
             if key in acquired:
                 return None
             acquired.add(key)
-            return 999
+            lock_id = 999 + len(lock_ids)
+            lock_ids[lock_id] = key
+            return lock_id
 
-        def release(_session, _connection, _lock_id):
-            acquired.discard(lock_key)
+        def release(_session, _connection, lock_id):
+            acquired.discard(lock_ids.pop(lock_id))
 
         def pause_removal(storage, bucket, dataset_id):
             if bucket == "insightos-processed":

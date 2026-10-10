@@ -8,10 +8,11 @@ import tempfile
 from threading import Lock
 import unicodedata
 from contextlib import ExitStack, contextmanager
+from datetime import datetime, timezone
 from email.message import Message
 from os import getenv
 
-from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import Body, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from minio import Minio
 from minio.deleteobjects import DeleteObject
@@ -36,6 +37,15 @@ from app.parsing import (
     ParserConfigurationError,
     ParsingError,
     parse_dataset_file,
+)
+from app.quality_analysis import (
+    QUALITY_ANALYSIS_CONFIGURATION,
+    QualityAnalysisError,
+    build_contract_report,
+    normalized_output_provenance,
+    normalized_summary_totals,
+    quality_analysis_key,
+    validate_quality_report,
 )
 from app.service_health import check_database, check_redis, check_storage
 
@@ -174,6 +184,10 @@ app.add_middleware(UploadFilenameSafetyMiddleware)
 class DatasetCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     description: str | None = None
+
+
+class QualityAnalysisRequest(BaseModel):
+    recompute: bool = False
 
 
 class InvalidParsingResultError(ValueError):
@@ -1707,6 +1721,84 @@ def _normalization_response(dataset_id: int, file_id: int, dataset_file: Dataset
     }
 
 
+def _quality_analysis_response(
+    dataset_id: int,
+    file_id: int,
+    dataset_file: DatasetFile,
+    current_analysis_key: str | None = None,
+) -> dict:
+    report = dataset_file.quality_report
+    status = dataset_file.quality_analysis_status
+    report_key = (
+        report.get("analysis", {}).get("analysis_key")
+        if isinstance(report, dict)
+        else None
+    )
+    return {
+        "dataset_id": dataset_id,
+        "file_id": file_id,
+        "status": status,
+        "analysis_key": dataset_file.quality_analysis_key,
+        "report_is_current": (
+            report_key is not None and report_key == current_analysis_key
+        ),
+        "quality_report": report,
+        "error": (
+            {
+                "code": dataset_file.quality_analysis_error_code,
+                "message": dataset_file.quality_analysis_error_message,
+            }
+            if dataset_file.quality_analysis_error_code is not None
+            else None
+        ),
+    }
+
+
+def _mark_quality_analysis_failed(
+    session: Session,
+    dataset_id: int,
+    file_id: int,
+    analysis_key: str | None,
+    code: str,
+    message: str,
+) -> bool:
+    try:
+        session.rollback()
+        dataset_file = (
+            session.query(DatasetFile)
+            .filter(
+                DatasetFile.id == file_id,
+                DatasetFile.dataset_id == dataset_id,
+            )
+            .one_or_none()
+        )
+        if dataset_file is None:
+            return False
+        dataset_file.quality_analysis_status = "Failed"
+        dataset_file.quality_analysis_key = analysis_key
+        dataset_file.quality_analysis_error_code = code
+        dataset_file.quality_analysis_error_message = message
+        if dataset_file.quality_analysis_started_at is None:
+            dataset_file.quality_analysis_started_at = datetime.now(timezone.utc)
+        session.commit()
+        return True
+    except Exception as error:
+        try:
+            session.rollback()
+        except Exception as rollback_error:
+            logger.error(
+                "Could not roll back failed quality-analysis state for file %s (%s)",
+                file_id,
+                type(rollback_error).__name__,
+            )
+        logger.error(
+            "Could not persist quality-analysis failure for file %s (%s)",
+            file_id,
+            type(error).__name__,
+        )
+        return False
+
+
 def _mark_normalization_failed(
     session: Session,
     dataset_id: int,
@@ -1816,6 +1908,38 @@ def normalize_dataset_file(dataset_id: int, file_id: int):
                 },
             )
         cleanup.callback(_release_upload_lock, session, connection, lock_id)
+
+        try:
+            quality_lock_id = _try_acquire_upload_lock(
+                session,
+                connection,
+                dataset_id,
+                f"quality-analysis:{file_id}",
+            )
+        except SQLAlchemyError as error:
+            logger.error(
+                "Could not reserve quality analysis during normalization of file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Quality-analysis concurrency protection is unavailable.",
+            ) from None
+        if quality_lock_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "quality_analysis_in_progress",
+                    "message": "Quality analysis is using this file; retry normalization later.",
+                },
+            )
+        cleanup.callback(
+            _release_upload_lock,
+            session,
+            connection,
+            quality_lock_id,
+        )
 
         try:
             dataset_file = (
@@ -2003,6 +2127,425 @@ def get_dataset_file_normalization(dataset_id: int, file_id: int):
         return _normalization_response(dataset_id, file_id, dataset_file)
 
 
+@app.post("/api/v1/datasets/{dataset_id}/files/{file_id}/quality-analysis")
+def analyze_dataset_file_quality(
+    dataset_id: int,
+    file_id: int,
+    request: QualityAnalysisRequest = Body(default=QualityAnalysisRequest()),
+):
+    with _pinned_upload_session() as (session, connection), ExitStack() as cleanup:
+        try:
+            dataset = session.get(Dataset, dataset_id)
+            if dataset is None:
+                raise HTTPException(status_code=404, detail="Dataset not found.")
+            dataset_file = (
+                session.query(DatasetFile)
+                .filter(
+                    DatasetFile.id == file_id,
+                    DatasetFile.dataset_id == dataset_id,
+                )
+                .one_or_none()
+            )
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            logger.error(
+                "Quality-analysis file lookup failed for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Dataset file could not be checked for quality analysis.",
+            ) from None
+
+        if dataset_file is None:
+            raise HTTPException(status_code=404, detail="Dataset file not found.")
+        if dataset_file.status != "Ready":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "file_not_ready",
+                    "message": "Quality analysis requires successful file ingestion.",
+                    "status": dataset_file.status,
+                },
+            )
+        if dataset_file.normalization_status != "Ready":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalization_unavailable",
+                    "message": "Quality analysis requires ready normalized output.",
+                    "status": dataset_file.normalization_status,
+                },
+            )
+        if (
+            not dataset_file.checksum
+            or not dataset_file.parsing_result
+            or not isinstance(dataset_file.normalization_result, dict)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "analysis_provenance_unavailable",
+                    "message": "Validated source and normalized metadata are required.",
+                },
+            )
+
+        try:
+            lock_id = _try_acquire_upload_lock(
+                session,
+                connection,
+                dataset_id,
+                f"quality-analysis:{file_id}",
+            )
+        except SQLAlchemyError as error:
+            logger.error(
+                "Could not reserve quality analysis for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Quality-analysis concurrency protection is unavailable.",
+            ) from None
+        if lock_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "quality_analysis_in_progress",
+                    "message": "Quality analysis is already in progress for this file.",
+                },
+            )
+        cleanup.callback(_release_upload_lock, session, connection, lock_id)
+
+        analysis_key = None
+        started_at = datetime.now(timezone.utc)
+        try:
+            dataset_file = (
+                session.query(DatasetFile)
+                .filter(
+                    DatasetFile.id == file_id,
+                    DatasetFile.dataset_id == dataset_id,
+                )
+                .one_or_none()
+            )
+            if (
+                dataset_file is None
+                or dataset_file.status != "Ready"
+                or dataset_file.normalization_status != "Ready"
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "analysis_input_changed",
+                        "message": "File readiness changed before analysis could start.",
+                    },
+                )
+            try:
+                normalized = validate_normalization_result(
+                    dataset_file.normalization_result,
+                    dataset_file.parsing_result,
+                    dataset_file.filename,
+                    dataset_file.file_size_bytes,
+                    dataset_file.checksum,
+                    dataset_id,
+                    file_id,
+                )
+            except NormalizationError as error:
+                raise QualityAnalysisError(
+                    "normalized_output_invalid",
+                    "Stored normalized output metadata failed validation.",
+                ) from error
+
+            storage = get_storage_client()
+            raw_bucket = getenv("MINIO_RAW_BUCKET", "insightos-raw")
+            processed_bucket = getenv(
+                "MINIO_PROCESSED_BUCKET",
+                "insightos-processed",
+            )
+            if not _verify_stored_object(storage, raw_bucket, dataset_file):
+                raise QualityAnalysisError(
+                    "source_integrity_failed",
+                    "Stored source data failed integrity verification.",
+                )
+            if not verify_normalization_result(
+                storage,
+                processed_bucket,
+                normalized,
+            ):
+                raise QualityAnalysisError(
+                    "normalized_output_integrity_failed",
+                    "Stored normalized output failed integrity verification.",
+                )
+
+            analysis_key, configuration_sha256 = quality_analysis_key(
+                dataset_file.checksum,
+                normalized,
+                QUALITY_ANALYSIS_CONFIGURATION,
+            )
+            if (
+                not request.recompute
+                and dataset_file.quality_analysis_status
+                in {"Completed", "PartiallyCompleted"}
+                and dataset_file.quality_analysis_key == analysis_key
+                and isinstance(dataset_file.quality_report, dict)
+            ):
+                try:
+                    dataset_file.quality_report = validate_quality_report(
+                        dataset_file.quality_report,
+                        expected_summary_totals=normalized_summary_totals(
+                            normalized
+                        ),
+                        expected_source_sha256=dataset_file.checksum,
+                        expected_analysis_key=analysis_key,
+                        expected_normalized_outputs=normalized_output_provenance(
+                            normalized
+                        ),
+                    )
+                except QualityAnalysisError:
+                    pass
+                else:
+                    return _quality_analysis_response(
+                        dataset_id,
+                        file_id,
+                        dataset_file,
+                        current_analysis_key=analysis_key,
+                    )
+
+            dataset_file.quality_analysis_status = "Requested"
+            dataset_file.quality_analysis_key = analysis_key
+            dataset_file.quality_analysis_started_at = started_at
+            dataset_file.quality_analysis_error_code = None
+            dataset_file.quality_analysis_error_message = None
+            session.commit()
+
+            dataset_file = session.get(DatasetFile, file_id)
+            if dataset_file is None:
+                raise SQLAlchemyError("Dataset file disappeared during quality analysis.")
+            dataset_file.quality_analysis_status = "Running"
+            session.commit()
+
+            report_started_at = datetime.now(timezone.utc)
+            report = build_contract_report(
+                dataset_file.checksum,
+                normalized,
+                analysis_key,
+                configuration_sha256,
+                report_started_at,
+                datetime.now(timezone.utc),
+            )
+            report = validate_quality_report(
+                report,
+                expected_summary_totals=normalized_summary_totals(normalized),
+                expected_source_sha256=dataset_file.checksum,
+                expected_analysis_key=analysis_key,
+                expected_normalized_outputs=normalized_output_provenance(
+                    normalized
+                ),
+            )
+
+            dataset_file = session.get(DatasetFile, file_id)
+            if dataset_file is None:
+                raise SQLAlchemyError("Dataset file disappeared during quality analysis.")
+            dataset_file.quality_report = report
+            dataset_file.quality_analysis_status = report["completion_status"]
+            dataset_file.quality_analysis_error_code = None
+            dataset_file.quality_analysis_error_message = None
+            dataset_file.quality_analysis_completed_at = datetime.now(timezone.utc)
+            session.commit()
+            return _quality_analysis_response(
+                dataset_id,
+                file_id,
+                dataset_file,
+                current_analysis_key=analysis_key,
+            )
+        except HTTPException:
+            raise
+        except QualityAnalysisError as error:
+            if not _mark_quality_analysis_failed(
+                session,
+                dataset_id,
+                file_id,
+                analysis_key,
+                error.code,
+                error.message,
+            ):
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "code": "quality_analysis_failure_persistence_failed",
+                        "message": "Quality-analysis failure details could not be saved.",
+                    },
+                ) from None
+            raise HTTPException(
+                status_code=422,
+                detail={"code": error.code, "message": error.message},
+            ) from None
+        except (MinioException, HTTPError, OSError) as error:
+            logger.error(
+                "Quality-analysis storage operation failed for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            if not _mark_quality_analysis_failed(
+                session,
+                dataset_id,
+                file_id,
+                analysis_key,
+                "storage_failure",
+                "Object storage failed during quality analysis; retry the operation.",
+            ):
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "code": "quality_analysis_failure_persistence_failed",
+                        "message": "Quality-analysis failure details could not be saved.",
+                    },
+                ) from None
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "storage_failure",
+                    "message": "Object storage failed during quality analysis; retry the operation.",
+                },
+            ) from None
+        except SQLAlchemyError as error:
+            logger.error(
+                "Quality-analysis metadata operation failed for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            if not _mark_quality_analysis_failed(
+                session,
+                dataset_id,
+                file_id,
+                analysis_key,
+                "metadata_persistence_failed",
+                "Quality-analysis metadata could not be saved; retry the operation.",
+            ):
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "code": "quality_analysis_failure_persistence_failed",
+                        "message": "Quality-analysis failure details could not be saved.",
+                    },
+                ) from None
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "metadata_persistence_failed",
+                    "message": "Quality-analysis metadata could not be saved; retry the operation.",
+                },
+            ) from None
+        except Exception as error:
+            logger.error(
+                "Unexpected quality-analysis failure for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            if not _mark_quality_analysis_failed(
+                session,
+                dataset_id,
+                file_id,
+                analysis_key,
+                "quality_analysis_failed",
+                "Quality analysis failed unexpectedly; retry the operation.",
+            ):
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "code": "quality_analysis_failure_persistence_unconfirmed",
+                        "message": (
+                            "The analysis failure state could not be confirmed; "
+                            "check the current status before retrying."
+                        ),
+                    },
+                ) from None
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "quality_analysis_failed",
+                    "message": "Quality analysis failed unexpectedly; retry the operation.",
+                },
+            ) from None
+
+
+@app.get("/api/v1/datasets/{dataset_id}/files/{file_id}/quality-analysis")
+def get_dataset_file_quality_analysis(dataset_id: int, file_id: int):
+    with SessionLocal() as session:
+        try:
+            dataset = session.get(Dataset, dataset_id)
+            if dataset is None:
+                raise HTTPException(status_code=404, detail="Dataset not found.")
+            dataset_file = (
+                session.query(DatasetFile)
+                .filter(
+                    DatasetFile.id == file_id,
+                    DatasetFile.dataset_id == dataset_id,
+                )
+                .one_or_none()
+            )
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            logger.error(
+                "Quality-analysis status lookup failed for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Quality-analysis status could not be retrieved.",
+            ) from None
+        if dataset_file is None:
+            raise HTTPException(status_code=404, detail="Dataset file not found.")
+        if dataset_file.quality_report is not None:
+            try:
+                dataset_file.quality_report = validate_quality_report(
+                    dataset_file.quality_report,
+                )
+            except QualityAnalysisError:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "code": "quality_report_invalid",
+                        "message": "The stored quality report failed validation.",
+                    },
+                ) from None
+
+        current_analysis_key = None
+        if (
+            dataset_file.normalization_status == "Ready"
+            and isinstance(dataset_file.normalization_result, dict)
+            and isinstance(dataset_file.parsing_result, dict)
+            and dataset_file.checksum
+        ):
+            try:
+                normalized = validate_normalization_result(
+                    dataset_file.normalization_result,
+                    dataset_file.parsing_result,
+                    dataset_file.filename,
+                    dataset_file.file_size_bytes,
+                    dataset_file.checksum,
+                    dataset_id,
+                    file_id,
+                )
+                current_analysis_key, _configuration_sha256 = quality_analysis_key(
+                    dataset_file.checksum,
+                    normalized,
+                    QUALITY_ANALYSIS_CONFIGURATION,
+                )
+            except (NormalizationError, QualityAnalysisError):
+                current_analysis_key = None
+        return _quality_analysis_response(
+            dataset_id,
+            file_id,
+            dataset_file,
+            current_analysis_key=current_analysis_key,
+        )
+
+
 def _remove_dataset_objects(storage, bucket: str, dataset_id: int) -> list:
     if not storage.bucket_exists(bucket):
         return []
@@ -2056,29 +2599,41 @@ def delete_dataset(dataset_id: int):
                 )
             ]
             for file_id in file_ids:
-                lock_id = _try_acquire_upload_lock(
-                    session,
-                    connection,
-                    dataset_id,
-                    f"normalization:{file_id}",
-                )
-                if lock_id is None:
-                    raise HTTPException(
-                        status_code=409,
-                        detail={
-                            "code": "normalization_in_progress",
-                            "message": (
-                                "A dataset file is being normalized; retry "
-                                "dataset deletion after it finishes."
-                            ),
-                        },
+                for operation in ("normalization", "quality-analysis"):
+                    lock_id = _try_acquire_upload_lock(
+                        session,
+                        connection,
+                        dataset_id,
+                        f"{operation}:{file_id}",
                     )
-                cleanup.callback(
-                    _release_upload_lock,
-                    session,
-                    connection,
-                    lock_id,
-                )
+                    if lock_id is None:
+                        if operation == "quality-analysis":
+                            raise HTTPException(
+                                status_code=409,
+                                detail={
+                                    "code": "quality_analysis_in_progress",
+                                    "message": (
+                                        "A dataset file is being analyzed; retry "
+                                        "dataset deletion after it finishes."
+                                    ),
+                                },
+                            )
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "normalization_in_progress",
+                                "message": (
+                                    "A dataset file is being normalized; retry "
+                                    "dataset deletion after it finishes."
+                                ),
+                            },
+                        )
+                    cleanup.callback(
+                        _release_upload_lock,
+                        session,
+                        connection,
+                        lock_id,
+                    )
         except HTTPException:
             raise
         except SQLAlchemyError as error:
