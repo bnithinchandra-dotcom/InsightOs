@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import math
@@ -8,6 +9,7 @@ from app.quality_rules import (
     QUALITY_RULE_ENGINE_CONFIGURATION,
     QUALITY_RULESET_VERSION,
     MISSING_VALUE_CANDIDATE_RULE,
+    NUMERIC_OUTLIER_CANDIDATE_RULE,
     RuleExecutionResult,
 )
 
@@ -25,6 +27,18 @@ QUALITY_ANALYSIS_CONFIGURATION = {
     "batch_size": 8192,
     **QUALITY_RULE_ENGINE_CONFIGURATION,
 }
+RULESET_2_QUALITY_ANALYSIS_CONFIGURATION = copy.deepcopy(
+    QUALITY_ANALYSIS_CONFIGURATION
+)
+RULESET_2_QUALITY_ANALYSIS_CONFIGURATION["enabled_rules"].remove(
+    NUMERIC_OUTLIER_CANDIDATE_RULE.rule_id
+)
+RULESET_2_QUALITY_ANALYSIS_CONFIGURATION["rule_versions"].pop(
+    NUMERIC_OUTLIER_CANDIDATE_RULE.rule_id
+)
+RULESET_2_QUALITY_ANALYSIS_CONFIGURATION["rules"].pop(
+    NUMERIC_OUTLIER_CANDIDATE_RULE.rule_id
+)
 LEGACY_QUALITY_ANALYSIS_CONFIGURATION = {
     "batch_size": 8192,
     "candidate_comparisons": 10_000,
@@ -51,7 +65,7 @@ LEGACY_QUALITY_ANALYSIS_CONFIGURATIONS = (
     LEGACY_QUALITY_ANALYSIS_CONFIGURATION,
     STAGE_3_3_1_QUALITY_ANALYSIS_CONFIGURATION,
 )
-SUPPORTED_QUALITY_RULESET_VERSIONS = {"1", QUALITY_RULESET_VERSION}
+SUPPORTED_QUALITY_RULESET_VERSIONS = {"1", "2", QUALITY_RULESET_VERSION}
 
 _CLASSIFICATIONS = {
     "confirmed_violation",
@@ -277,13 +291,19 @@ def quality_analysis_key(
         if configuration is None
         else configuration
     )
-    if ruleset_version not in SUPPORTED_QUALITY_RULESET_VERSIONS or not (
-        config == QUALITY_ANALYSIS_CONFIGURATION
-        if ruleset_version == QUALITY_RULESET_VERSION
-        else any(
-            config == candidate
-            for candidate in LEGACY_QUALITY_ANALYSIS_CONFIGURATIONS
+    if ruleset_version == QUALITY_RULESET_VERSION:
+        supported_configuration = config == QUALITY_ANALYSIS_CONFIGURATION
+    elif ruleset_version == "2":
+        supported_configuration = (
+            config == RULESET_2_QUALITY_ANALYSIS_CONFIGURATION
         )
+    else:
+        supported_configuration = any(
+            config == candidate for candidate in LEGACY_QUALITY_ANALYSIS_CONFIGURATIONS
+        )
+    if (
+        ruleset_version not in SUPPORTED_QUALITY_RULESET_VERSIONS
+        or not supported_configuration
     ):
         raise QualityAnalysisError(
             "invalid_configuration",
@@ -570,11 +590,11 @@ def validate_quality_report(
             if output["sha256"] is not None:
                 _require_sha256(output["sha256"])
 
-        candidate_configurations = (
-            LEGACY_QUALITY_ANALYSIS_CONFIGURATIONS
-            if analysis["ruleset_version"] == "1"
-            else (QUALITY_ANALYSIS_CONFIGURATION,)
-        )
+        candidate_configurations = {
+            "1": LEGACY_QUALITY_ANALYSIS_CONFIGURATIONS,
+            "2": (RULESET_2_QUALITY_ANALYSIS_CONFIGURATION,),
+            QUALITY_RULESET_VERSION: (QUALITY_ANALYSIS_CONFIGURATION,),
+        }[analysis["ruleset_version"]]
         expected_identity_matches = False
         for candidate_configuration in candidate_configurations:
             expected_key, expected_configuration_sha256 = quality_analysis_key(

@@ -11,6 +11,7 @@ from app.quality_rules import (
     BUSINESS_KEY_DUPLICATE_RULE,
     DEFAULT_QUALITY_RULES,
     MISSING_VALUE_CANDIDATE_RULE,
+    NUMERIC_OUTLIER_CANDIDATE_RULE,
     NUMERIC_VALIDITY_RULE,
     QUALITY_RULE_ENGINE_CONFIGURATION,
     STRING_CONSISTENCY_RULE,
@@ -261,6 +262,112 @@ class QualityRuleEngineTests(unittest.TestCase):
         self.assertEqual(results[STRING_CONSISTENCY_RULE.rule_id].findings, ())
         self.assertEqual(results[NUMERIC_VALIDITY_RULE.rule_id].findings, ())
         self.assertEqual(results[TYPE_CONSISTENCY_RULE.rule_id].findings, ())
+
+    def test_iqr_outlier_candidates_are_deterministic_and_advisory(self):
+        data, path = parquet_rule_data(
+            {"amount": pa.array([1, 2, 3, 4, 100], type=pa.int64())},
+            physical_types={"amount": ["integer"]},
+            row_count=5,
+        )
+        self.addCleanup(os.unlink, path)
+        first = run_quality_rules(data)
+        second = run_quality_rules(data)
+        self.assertEqual(first, second)
+        result = next(
+            item
+            for item in first
+            if item.rule_id == NUMERIC_OUTLIER_CANDIDATE_RULE.rule_id
+        )
+        self.assertEqual(result.status, "Completed")
+        finding = result.findings[0]
+        self.assertEqual(finding.classification, "unusual_candidate")
+        self.assertEqual(result.severity, "info")
+        self.assertEqual(finding.affected_count, 1)
+        self.assertEqual(finding.denominator_count, 5)
+        self.assertEqual(finding.evidence["method"], "iqr")
+        self.assertEqual(finding.evidence["example_refs"], [{"row_index": 4}])
+
+    def test_z_score_is_explicit_and_small_or_constant_samples_are_not_flagged(self):
+        data, path = parquet_rule_data(
+            {"amount": pa.array([0, 0, 0, 0, 20], type=pa.int64())},
+            physical_types={"amount": ["integer"]},
+            row_count=5,
+        )
+        self.addCleanup(os.unlink, path)
+        rule_id = NUMERIC_OUTLIER_CANDIDATE_RULE.rule_id
+        z_score_config = {
+            "method": "z_score",
+            "threshold": 1.5,
+            "min_samples": 4,
+        }
+        result = run_quality_rules(
+            data,
+            configuration=configuration({rule_id: z_score_config}),
+        )[0]
+        self.assertEqual(result.findings[0].evidence["method"], "z_score")
+        self.assertEqual(result.findings[0].affected_count, 1)
+
+        small_data, small_path = parquet_rule_data(
+            {"amount": pa.array([0, 20], type=pa.int64())},
+            physical_types={"amount": ["integer"]},
+            row_count=2,
+        )
+        self.addCleanup(os.unlink, small_path)
+        small = run_quality_rules(
+            small_data,
+            configuration=configuration({rule_id: z_score_config}),
+        )[0]
+        self.assertEqual(small.findings, ())
+
+        constant_data, constant_path = parquet_rule_data(
+            {"amount": pa.array([7, 7, 7, 7], type=pa.int64())},
+            physical_types={"amount": ["integer"]},
+            row_count=4,
+        )
+        self.addCleanup(os.unlink, constant_path)
+        constant = run_quality_rules(
+            constant_data,
+            configuration=configuration({rule_id: z_score_config}),
+        )[0]
+        self.assertEqual(constant.findings, ())
+
+    def test_numeric_outlier_configuration_is_validated(self):
+        rule_id = NUMERIC_OUTLIER_CANDIDATE_RULE.rule_id
+        for invalid in (
+            {"method": "iqr", "threshold": 0, "min_samples": 4},
+            {"method": "z_score", "threshold": float("nan"), "min_samples": 4},
+            {"method": "mad", "threshold": 3, "min_samples": 4},
+            {"method": "iqr", "threshold": 1.5, "min_samples": True},
+            {"method": "iqr", "threshold": 1.5, "min_samples": 4, "extra": 1},
+        ):
+            with self.subTest(configuration=invalid), self.assertRaises(
+                QualityRuleConfigurationError
+            ):
+                run_quality_rules(
+                    normalization_result(),
+                    configuration=configuration({rule_id: invalid}),
+                )
+
+    def test_iqr_storage_obeys_shared_memory_budget(self):
+        data, path = parquet_rule_data(
+            {"amount": pa.array([1, 2, 3, 4, 100], type=pa.int64())},
+            physical_types={"amount": ["integer"]},
+            row_count=5,
+        )
+        self.addCleanup(os.unlink, path)
+        with patch("app.quality_rules.MAX_RULE_MEMORY_BYTES", 1):
+            result = run_quality_rules(
+                data,
+                configuration=configuration(
+                    {
+                        NUMERIC_OUTLIER_CANDIDATE_RULE.rule_id: (
+                            NUMERIC_OUTLIER_CANDIDATE_RULE.configuration_defaults
+                        )
+                    }
+                ),
+            )[0]
+        self.assertEqual(result.status, "BudgetExhausted")
+        self.assertEqual(result.findings, ())
 
     def test_type_conflicts_are_reported_against_normalized_string_types(self):
         data, path = parquet_rule_data(

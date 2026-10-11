@@ -478,6 +478,10 @@ class UploadFlowTests(unittest.TestCase):
                     "Completed",
                 ),
                 (
+                    "quality_rules.rule.generic.numeric_outlier_candidates",
+                    "NotApplicable",
+                ),
+                (
                     "quality_rules.rule.generic.numeric_validity_candidates",
                     "NotApplicable",
                 ),

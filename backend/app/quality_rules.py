@@ -5,7 +5,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Callable, Iterable
 
 import pyarrow.parquet as pq
@@ -23,8 +23,9 @@ MAX_RULE_INPUT_BYTES = 600 * 1024 * 1024
 MAX_RULE_MEMORY_BYTES = 4 * 1024 * 1024
 MAX_BUSINESS_KEY_VALUE_BYTES = 64 * 1024
 MAX_EXACT_ROW_VALUE_BYTES = 128 * 1024
+MAX_OUTLIER_VALUE_BYTES = 128 * 1024
 MAX_SOURCE_PHYSICAL_TYPES = 32
-QUALITY_RULESET_VERSION = "2"
+QUALITY_RULESET_VERSION = "3"
 _RULE_ID = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
 _RULE_VERSION = re.compile(r"^\d+(?:\.\d+){0,2}$")
 _CLASSIFICATIONS = {
@@ -618,6 +619,226 @@ def _numeric_unsupported(data: dict, configuration: dict) -> str | None:
     return None
 
 
+def _validate_numeric_outlier_configuration(configuration: dict) -> dict:
+    if not isinstance(configuration, dict) or set(configuration) != {
+        "method",
+        "threshold",
+        "min_samples",
+    }:
+        raise QualityRuleConfigurationError(
+            "Numeric outlier configuration has unsupported fields."
+        )
+    method = configuration["method"]
+    threshold = configuration["threshold"]
+    min_samples = configuration["min_samples"]
+    if (
+        not isinstance(method, str)
+        or method not in {"iqr", "z_score"}
+        or isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or not math.isfinite(threshold)
+        or threshold <= 0
+        or threshold > 100
+        or isinstance(min_samples, bool)
+        or not isinstance(min_samples, int)
+        or not 2 <= min_samples <= 1_000_000
+    ):
+        raise QualityRuleConfigurationError(
+            "Numeric outlier method, threshold, or minimum sample count is invalid."
+        )
+    return {
+        "method": method,
+        "threshold": float(threshold),
+        "min_samples": min_samples,
+    }
+
+
+def _finite_decimal(value) -> Decimal | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value if value.is_finite() else None
+    if isinstance(value, int):
+        return Decimal(value)
+    if isinstance(value, float) and math.isfinite(value):
+        return Decimal(str(value))
+    return None
+
+
+def _quartile(sorted_values: list[Decimal], fraction: Decimal) -> Decimal:
+    position = Decimal(len(sorted_values) - 1) * fraction
+    lower_index = int(position)
+    upper_index = min(lower_index + 1, len(sorted_values) - 1)
+    weight = position - lower_index
+    return (
+        sorted_values[lower_index]
+        + (sorted_values[upper_index] - sorted_values[lower_index]) * weight
+    )
+
+
+def _z_score_statistics(
+    data: dict,
+    table: dict,
+    position: int,
+    budget: RuleBudget,
+) -> tuple[int, Decimal, Decimal]:
+    count = 0
+    mean = Decimal(0)
+    sum_squared_deviations = Decimal(0)
+    with localcontext() as context:
+        context.prec = 100
+        for _row_index, values in _iter_parquet_rows(
+            data,
+            table,
+            [position],
+            budget,
+        ):
+            value = _finite_decimal(values[0])
+            if value is None:
+                continue
+            count += 1
+            delta = value - mean
+            mean += delta / count
+            sum_squared_deviations += delta * (value - mean)
+        if count < 2:
+            return count, mean, Decimal(0)
+        variance = sum_squared_deviations / count
+        return count, mean, max(variance, Decimal(0)).sqrt()
+
+
+def _evaluate_numeric_outliers(
+    data: dict,
+    configuration: dict,
+    budget: RuleBudget,
+) -> Iterable[RuleFinding]:
+    threshold = Decimal(str(configuration["threshold"]))
+    for table in data["tables"]:
+        for position in _numeric_column_positions(table):
+            if configuration["method"] == "iqr":
+                values = []
+                for row_index, row in _iter_parquet_rows(
+                    data,
+                    table,
+                    [position],
+                    budget,
+                ):
+                    numeric = _finite_decimal(row[0])
+                    if numeric is None:
+                        continue
+                    numeric_size = len(str(numeric).encode("utf-8"))
+                    if numeric_size > MAX_OUTLIER_VALUE_BYTES:
+                        raise RuleBudgetExhausted
+                    budget.consume_memory(numeric_size + 384)
+                    values.append((numeric, row_index))
+                if len(values) < configuration["min_samples"]:
+                    continue
+                with localcontext() as context:
+                    context.prec = 100
+                    ordered = sorted(value for value, _row_index in values)
+                    first_quartile = _quartile(ordered, Decimal("0.25"))
+                    third_quartile = _quartile(ordered, Decimal("0.75"))
+                    spread = third_quartile - first_quartile
+                    lower_bound = first_quartile - threshold * spread
+                    upper_bound = third_quartile + threshold * spread
+                    candidate_count = 0
+                    example_refs = []
+                    for value, row_index in values:
+                        if value < lower_bound or value > upper_bound:
+                            candidate_count += 1
+                            if len(example_refs) < MAX_RULE_EXAMPLES:
+                                example_refs.append({"row_index": row_index})
+            else:
+                count, mean, standard_deviation = _z_score_statistics(
+                    data,
+                    table,
+                    position,
+                    budget,
+                )
+                if (
+                    count < configuration["min_samples"]
+                    or standard_deviation == 0
+                ):
+                    continue
+                lower_bound = mean - threshold * standard_deviation
+                upper_bound = mean + threshold * standard_deviation
+                candidate_count = 0
+                example_refs = []
+                for row_index, row in _iter_parquet_rows(
+                    data,
+                    table,
+                    [position],
+                    budget,
+                ):
+                    numeric = _finite_decimal(row[0])
+                    if numeric is not None and (
+                        numeric < lower_bound or numeric > upper_bound
+                    ):
+                        candidate_count += 1
+                        if len(example_refs) < MAX_RULE_EXAMPLES:
+                            example_refs.append({"row_index": row_index})
+            if not candidate_count:
+                continue
+            field = table["schema"][position]
+            yield RuleFinding(
+                classification="unusual_candidate",
+                title="Statistical numeric outlier candidates",
+                description=(
+                    f"{candidate_count} finite values fall beyond the "
+                    f"configured {configuration['method']} candidate bounds. "
+                    "This statistical signal does not establish an error."
+                ),
+                scope={
+                    "table_index": table["table_index"],
+                    "table_name": table.get("table_name"),
+                    "column_position": position,
+                    "column_name": field["name"],
+                },
+                affected_count=candidate_count,
+                denominator_basis="finite_numeric_values",
+                denominator_count=(
+                    len(values)
+                    if configuration["method"] == "iqr"
+                    else count
+                ),
+                denominator_reason=None,
+                evidence={
+                    "method": configuration["method"],
+                    "threshold": configuration["threshold"],
+                    "lower_bound": str(lower_bound)[:_TEXT_LIMIT],
+                    "upper_bound": str(upper_bound)[:_TEXT_LIMIT],
+                    "minimum_sample_count": configuration["min_samples"],
+                    "example_refs": example_refs,
+                },
+                confidence=1.0,
+                confidence_basis=(
+                    "The rule applies only the configured deterministic "
+                    "statistical method to finite normalized numeric values; "
+                    "it does not infer business validity."
+                ),
+                recommended_investigation=(
+                    "Review candidate values in their business context; "
+                    "do not remove or alter them based on this statistical signal."
+                ),
+            )
+
+
+NUMERIC_OUTLIER_CANDIDATE_RULE = QualityRule(
+    rule_id="generic.numeric_outlier_candidates",
+    version="1",
+    scope="column",
+    severity="info",
+    prerequisites=("verified_normalized_parquet", "normalized_numeric_columns"),
+    configuration_defaults={
+        "method": "iqr",
+        "threshold": 1.5,
+        "min_samples": 4,
+    },
+    validate_configuration=_validate_numeric_outlier_configuration,
+    unsupported_reason=_numeric_unsupported,
+    evaluate=_evaluate_numeric_outliers,
+)
+
+
 def _evaluate_numeric_validity(
     data: dict,
     _configuration: dict,
@@ -1056,6 +1277,7 @@ DEFAULT_QUALITY_RULES = QualityRuleRegistry(
         BUSINESS_KEY_DUPLICATE_RULE,
         EXACT_DUPLICATE_RULE,
         MISSING_VALUE_CANDIDATE_RULE,
+        NUMERIC_OUTLIER_CANDIDATE_RULE,
         NUMERIC_VALIDITY_RULE,
         STRING_CONSISTENCY_RULE,
         TYPE_CONSISTENCY_RULE,
