@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 from threading import Lock
+from typing import Literal
 import unicodedata
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
@@ -51,6 +52,11 @@ from app.quality_catalog import (
     QUALITY_RULE_CATALOG_VERSION,
     get_quality_rule_catalog_entry,
     list_quality_rule_catalog,
+)
+from app.quality_planning import (
+    QualityPlanningContext,
+    QualityRulePlanResponse,
+    plan_quality_rules,
 )
 from app.quality_rules import MAX_RULE_INPUT_BYTES, run_quality_rules
 from app.service_health import check_database, check_redis, check_storage
@@ -1757,6 +1763,189 @@ def get_dataset_file_profile(dataset_id: int, file_id: int):
             "file_id": file_id,
             "profile_result": dataset_file.profile_result,
         }
+
+
+@app.get(
+    "/api/v1/datasets/{dataset_id}/files/{file_id}/quality-rule-plan",
+    response_model=QualityRulePlanResponse,
+)
+def get_dataset_file_quality_rule_plan(
+    dataset_id: int,
+    file_id: int,
+    category: Literal[
+        "BA",
+        "DA",
+        "statistical",
+        "temporal",
+        "relational",
+        "governance",
+    ]
+    | None = None,
+    status: Literal[
+        "implemented",
+        "partial",
+        "planned",
+        "unsupported",
+    ]
+    | None = None,
+):
+    with SessionLocal() as session:
+        try:
+            dataset = session.get(Dataset, dataset_id)
+            if dataset is None:
+                raise HTTPException(status_code=404, detail="Dataset not found.")
+            dataset_file = (
+                session.query(DatasetFile)
+                .filter(
+                    DatasetFile.id == file_id,
+                    DatasetFile.dataset_id == dataset_id,
+                )
+                .one_or_none()
+            )
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            logger.error(
+                "Quality-rule planning lookup failed for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Quality-rule planning context could not be retrieved.",
+            ) from None
+
+        if dataset_file is None:
+            raise HTTPException(status_code=404, detail="Dataset file not found.")
+
+        parsed_result = None
+        if dataset_file.parsing_result is not None:
+            try:
+                parsed_result = validate_parsing_result(
+                    dataset_file.filename,
+                    dataset_file.parsing_result,
+                    dataset_file.file_size_bytes,
+                )
+            except InvalidParsingResultError:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "code": "parsing_result_invalid",
+                        "message": "Stored parsing metadata failed validation.",
+                    },
+                ) from None
+
+        profile_result = None
+        if dataset_file.profile_result is not None:
+            if parsed_result is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "code": "profile_context_invalid",
+                        "message": "Stored profile metadata has no valid parsing context.",
+                    },
+                )
+            try:
+                profile_result = validate_profile_result(
+                    dataset_file.profile_result,
+                    parsed_result,
+                )
+            except InvalidProfileResultError:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "code": "profile_result_invalid",
+                        "message": "Stored profile metadata failed validation.",
+                    },
+                ) from None
+
+        normalized_result = None
+        if dataset_file.normalization_status == "Ready":
+            if (
+                parsed_result is None
+                or not dataset_file.checksum
+                or not isinstance(dataset_file.normalization_result, dict)
+            ):
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "code": "normalization_context_invalid",
+                        "message": "Ready normalization metadata is incomplete.",
+                    },
+                )
+            try:
+                normalized_result = validate_normalization_result(
+                    dataset_file.normalization_result,
+                    parsed_result,
+                    dataset_file.filename,
+                    dataset_file.file_size_bytes,
+                    dataset_file.checksum,
+                    dataset_id,
+                    file_id,
+                )
+            except NormalizationError:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "code": "normalization_result_invalid",
+                        "message": "Stored normalization metadata failed validation.",
+                    },
+                ) from None
+
+        quality_report = None
+        quality_report_current = False
+        if dataset_file.quality_report is not None:
+            try:
+                quality_report = validate_quality_report(
+                    dataset_file.quality_report,
+                )
+            except QualityAnalysisError:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "code": "quality_report_invalid",
+                        "message": "The stored quality report failed validation.",
+                    },
+                ) from None
+
+            if (
+                normalized_result is not None
+                and dataset_file.checksum
+                and dataset_file.quality_analysis_status
+                in {"Completed", "PartiallyCompleted"}
+            ):
+                try:
+                    current_key, _configuration_sha256 = quality_analysis_key(
+                        dataset_file.checksum,
+                        normalized_result,
+                        QUALITY_ANALYSIS_CONFIGURATION,
+                    )
+                    quality_report_current = (
+                        quality_report["analysis"]["analysis_key"] == current_key
+                    )
+                except QualityAnalysisError:
+                    quality_report_current = False
+            if not quality_report_current:
+                quality_report = None
+
+        try:
+            return plan_quality_rules(
+                QualityPlanningContext(
+                    dataset_id=dataset.id,
+                    file_id=dataset_file.id,
+                    dataset_status=dataset.status,
+                    file_status=dataset_file.status,
+                    detected_format=dataset_file.detected_format,
+                    profile_result=profile_result,
+                    normalization_result=normalized_result,
+                    quality_report=quality_report,
+                    quality_report_current=quality_report_current,
+                ),
+                category=category,
+                status=status,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
 
 
 def _download_normalization_source(storage, dataset_file: DatasetFile, destination) -> None:

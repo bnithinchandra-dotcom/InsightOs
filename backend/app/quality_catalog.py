@@ -3,7 +3,7 @@ import math
 import re
 
 
-QUALITY_RULE_CATALOG_VERSION = "1"
+QUALITY_RULE_CATALOG_VERSION = "2"
 QUALITY_RULE_CATEGORIES = frozenset(
     {
         "BA",
@@ -267,7 +267,7 @@ _RULE_CATALOG = (
         "Identify exact duplicate candidates for investigation.",
         ["Reviewing repeated complete records"],
         ["validated exact duplicate profile"],
-        ["validated_exact_duplicate_profile"],
+        ["validated_exact_duplicate_profile", "verified_normalized_parquet"],
         "Scans normalized rows and compares deterministic typed row fingerprints.",
         ["detection"],
         ["Repeated complete rows may represent legitimate repeated events."],

@@ -1027,7 +1027,10 @@ EXACT_DUPLICATE_RULE = QualityRule(
     version="1",
     scope="table",
     severity="info",
-    prerequisites=("validated_exact_duplicate_profile",),
+    prerequisites=(
+        "validated_exact_duplicate_profile",
+        "verified_normalized_parquet",
+    ),
     configuration_defaults={},
     validate_configuration=_empty_rule_configuration,
     unsupported_reason=_exact_duplicates_unsupported,

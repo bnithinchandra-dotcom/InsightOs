@@ -4,7 +4,26 @@ The versioned catalog is the read-only discovery surface for preprocessing
 rules. It is available at `GET /api/v1/quality-rules` and
 `GET /api/v1/quality-rules/{rule_id}`. List results are sorted by stable rule
 ID; optional `category` and `status` filters are exact matches. The response
-includes `catalog_version` (`1`) separately from each rule's semantic `version`.
+includes `catalog_version` (`2`) separately from each rule's semantic `version`.
+
+The context-aware planning endpoint is
+`GET /api/v1/datasets/{dataset_id}/files/{file_id}/quality-rule-plan`. It reads
+the existing dataset-file status, validated profile metadata, validated
+normalization metadata, and only a current validated quality report. Optional
+category/status filters use the same exact catalog values. Each recommendation
+reports the catalog status, planning status, rationale, prerequisites, missing
+context, execution support, required user decisions, and any prior current
+quality-check status. A `ready` planning status means an implemented executor's
+catalog prerequisites appear available; the endpoint does not run the rule.
+Execution rechecks normalized object integrity and rule-specific prerequisites
+through the existing quality-analysis flow.
+
+When no valid normalized context exists, implemented rules appear as
+`needs_context`. Partial and planned entries remain visible as `partial` and
+`planned`, with execution explicitly unsupported. The planner does not infer
+business semantics from column names or values, accept guessed definitions,
+or execute transformations. Business-key checks still require an explicit
+key configuration, which this planning endpoint does not collect.
 
 Catalog metadata is deterministic and independent of LLM output. Entries
 describe purpose, use cases, inputs, prerequisites, configuration schema and
@@ -67,6 +86,10 @@ executor; then mark it `implemented` and bind it into the engine registry.
 Never mark a planned capability executable merely because it has a catalog
 entry. Preserve the separate detection and transformation boundaries and the
 existing report contract and ruleset compatibility.
+
+Catalog version 2 declares verified normalized Parquet as a prerequisite for
+exact-duplicate detection, matching the existing executor's actual input
+requirements; the rule algorithm and semantic version are unchanged.
 
 ## Current category coverage
 

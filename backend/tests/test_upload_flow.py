@@ -535,6 +535,52 @@ class UploadFlowTests(unittest.TestCase):
         )
         session.close()
 
+    def test_quality_rule_plan_is_read_only_and_validates_catalog_filters(self):
+        content = b"region,amount\nnorth,1\nsouth,2\n"
+        upload = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files",
+            files={"file": ("plan.csv", content, "text/csv")},
+        )
+        self.assertEqual(upload.status_code, 201, upload.text)
+        file_id = upload.json()["file"]["id"]
+        storage_before = copy.deepcopy(self.storage.objects)
+
+        response = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-rule-plan"
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["context"]["dataset_id"], self.dataset_id)
+        self.assertEqual(body["context"]["file_id"], file_id)
+        self.assertTrue(body["context"]["profile_available"])
+        self.assertFalse(body["context"]["normalized_metadata_available"])
+        self.assertFalse(body["context"]["current_quality_report_available"])
+        self.assertTrue(
+            all(
+                not item["execution_supported"]
+                for item in body["recommendations"]
+                if item["status"] != "implemented"
+            )
+        )
+        self.assertTrue(
+            all(
+                item["planning_status"] == "needs_context"
+                for item in body["recommendations"]
+                if item["status"] == "implemented"
+            )
+        )
+        self.assertEqual(self.storage.objects, storage_before)
+
+        invalid_filter = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-rule-plan",
+            params={"category": "business"},
+        )
+        self.assertEqual(invalid_filter.status_code, 422)
+        missing_file = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files/999999/quality-rule-plan"
+        )
+        self.assertEqual(missing_file.status_code, 404)
+
     def test_quality_analysis_failure_keeps_previous_report_and_safe_error(self):
         upload = self.client.post(
             f"/api/v1/datasets/{self.dataset_id}/files",
