@@ -47,6 +47,7 @@ from app.quality_analysis import (
     quality_analysis_key,
     validate_quality_report,
 )
+from app.quality_rules import MAX_RULE_INPUT_BYTES, run_quality_rules
 from app.service_health import check_database, check_redis, check_storage
 
 
@@ -788,6 +789,62 @@ def _verify_stored_object(storage, bucket: str, dataset_file: DatasetFile) -> bo
     return file_size == dataset_file.file_size_bytes and checksum.hexdigest() == (
         dataset_file.checksum
     )
+
+
+def _materialize_quality_parquet_inputs(storage, bucket: str, normalized: dict, cleanup):
+    tables = normalized["tables"]
+    total_size = sum(
+        table["file_size_bytes"]
+        for table in tables
+        if table["object_key"] is not None
+    )
+    if total_size > MAX_RULE_INPUT_BYTES:
+        return {}, (
+            "Normalized Parquet exceeds the configured quality-analysis input "
+            "limit; value-scanning rules were not run."
+        )
+
+    paths = {}
+    for table in tables:
+        table_index = table["table_index"]
+        object_key = table["object_key"]
+        if object_key is None:
+            paths[table_index] = None
+            continue
+
+        output = tempfile.NamedTemporaryFile(
+            prefix="insightos-quality-",
+            suffix=".parquet",
+            delete=False,
+        )
+        path = output.name
+        cleanup.callback(os.unlink, path)
+        response = storage.get_object(bucket, object_key)
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            while chunk := response.read(UPLOAD_CHUNK_SIZE):
+                size += len(chunk)
+                if size > table["file_size_bytes"] or size > MAX_RULE_INPUT_BYTES:
+                    raise OSError("Normalized quality input exceeded its verified size.")
+                digest.update(chunk)
+                output.write(chunk)
+            output.flush()
+        finally:
+            output.close()
+            try:
+                response.close()
+            finally:
+                release_connection = getattr(response, "release_conn", None)
+                if release_connection is not None:
+                    release_connection()
+        if size != table["file_size_bytes"] or digest.hexdigest() != table["sha256"]:
+            raise QualityAnalysisError(
+                "normalized_output_integrity_failed",
+                "Stored normalized output changed while preparing quality analysis.",
+            )
+        paths[table_index] = path
+    return paths, None
 
 
 def get_upload_filename(filename: str | None) -> str:
@@ -2327,6 +2384,39 @@ def analyze_dataset_file_quality(
             session.commit()
 
             report_started_at = datetime.now(timezone.utc)
+            rule_inputs = dict(normalized)
+            rule_inputs["_parsing_result"] = dataset_file.parsing_result
+            if dataset_file.profile_result is not None:
+                try:
+                    rule_inputs["_profile_result"] = validate_profile_result(
+                        dataset_file.profile_result,
+                        dataset_file.parsing_result,
+                    )
+                except InvalidProfileResultError as error:
+                    logger.warning(
+                        "Ignoring invalid profile metadata for quality analysis of file %s (%s)",
+                        file_id,
+                        type(error).__name__,
+                    )
+            parquet_paths, parquet_input_reason = (
+                _materialize_quality_parquet_inputs(
+                    storage,
+                    processed_bucket,
+                    normalized,
+                    cleanup,
+                )
+            )
+            rule_inputs["_parquet_paths"] = parquet_paths
+            if parquet_input_reason is not None:
+                rule_inputs["_parquet_input_reason"] = parquet_input_reason
+            rule_results = run_quality_rules(
+                rule_inputs,
+                configuration={
+                    key: value
+                    for key, value in QUALITY_ANALYSIS_CONFIGURATION.items()
+                    if key != "batch_size"
+                },
+            )
             report = build_contract_report(
                 dataset_file.checksum,
                 normalized,
@@ -2334,6 +2424,7 @@ def analyze_dataset_file_quality(
                 configuration_sha256,
                 report_started_at,
                 datetime.now(timezone.utc),
+                rule_results=rule_results,
             )
             report = validate_quality_report(
                 report,

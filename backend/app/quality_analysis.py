@@ -4,10 +4,16 @@ import math
 import re
 from datetime import datetime, timezone
 
+from app.quality_rules import (
+    QUALITY_RULE_ENGINE_CONFIGURATION,
+    QUALITY_RULESET_VERSION,
+    MISSING_VALUE_CANDIDATE_RULE,
+    RuleExecutionResult,
+)
+
 
 QUALITY_REPORT_SCHEMA_VERSION = 1
 QUALITY_ANALYZER_VERSION = "1"
-QUALITY_RULESET_VERSION = "1"
 MAX_QUALITY_REPORT_BYTES = 1024 * 1024
 MAX_QUALITY_FINDINGS = 500
 MAX_QUALITY_CHECKS = 256
@@ -17,11 +23,35 @@ REQUIRED_QUALITY_CHECK_IDS = {"quality_rules.enabled"}
 
 QUALITY_ANALYSIS_CONFIGURATION = {
     "batch_size": 8192,
-    "candidate_comparisons": 10000,
-    "max_examples_per_finding": MAX_QUALITY_EXAMPLES_PER_FINDING,
-    "max_findings": MAX_QUALITY_FINDINGS,
-    "max_report_bytes": MAX_QUALITY_REPORT_BYTES,
+    **QUALITY_RULE_ENGINE_CONFIGURATION,
 }
+LEGACY_QUALITY_ANALYSIS_CONFIGURATION = {
+    "batch_size": 8192,
+    "candidate_comparisons": 10_000,
+    "enabled_rules": [MISSING_VALUE_CANDIDATE_RULE.rule_id],
+    "max_examples_per_finding": 5,
+    "max_findings": 500,
+    "max_report_bytes": 1024 * 1024,
+    "rule_versions": {MISSING_VALUE_CANDIDATE_RULE.rule_id: "1"},
+    "rules": {
+        MISSING_VALUE_CANDIDATE_RULE.rule_id: {
+            "include_empty_strings": True,
+            "include_null_values": True,
+        }
+    },
+}
+STAGE_3_3_1_QUALITY_ANALYSIS_CONFIGURATION = {
+    "batch_size": 8192,
+    "candidate_comparisons": 10_000,
+    "max_examples_per_finding": 5,
+    "max_findings": 500,
+    "max_report_bytes": 1024 * 1024,
+}
+LEGACY_QUALITY_ANALYSIS_CONFIGURATIONS = (
+    LEGACY_QUALITY_ANALYSIS_CONFIGURATION,
+    STAGE_3_3_1_QUALITY_ANALYSIS_CONFIGURATION,
+)
+SUPPORTED_QUALITY_RULESET_VERSIONS = {"1", QUALITY_RULESET_VERSION}
 
 _CLASSIFICATIONS = {
     "confirmed_violation",
@@ -232,6 +262,8 @@ def quality_analysis_key(
     source_sha256: str,
     normalization_result: dict,
     configuration: dict | None = None,
+    *,
+    ruleset_version: str = QUALITY_RULESET_VERSION,
 ) -> tuple[str, str]:
     try:
         _require_sha256(source_sha256)
@@ -245,7 +277,14 @@ def quality_analysis_key(
         if configuration is None
         else configuration
     )
-    if config != QUALITY_ANALYSIS_CONFIGURATION:
+    if ruleset_version not in SUPPORTED_QUALITY_RULESET_VERSIONS or not (
+        config == QUALITY_ANALYSIS_CONFIGURATION
+        if ruleset_version == QUALITY_RULESET_VERSION
+        else any(
+            config == candidate
+            for candidate in LEGACY_QUALITY_ANALYSIS_CONFIGURATIONS
+        )
+    ):
         raise QualityAnalysisError(
             "invalid_configuration",
             "Quality analysis configuration is unsupported.",
@@ -256,7 +295,7 @@ def quality_analysis_key(
         "analyzer_version": QUALITY_ANALYZER_VERSION,
         "configuration_sha256": configuration_sha256,
         "normalized_outputs": outputs,
-        "ruleset_version": QUALITY_RULESET_VERSION,
+        "ruleset_version": ruleset_version,
         "schema_version": QUALITY_REPORT_SCHEMA_VERSION,
         "source_sha256": source_sha256,
     }
@@ -281,8 +320,128 @@ def build_contract_report(
     configuration_sha256: str,
     started_at: datetime,
     completed_at: datetime,
+    rule_results: list[RuleExecutionResult] | None = None,
 ) -> dict:
     outputs = normalized_output_provenance(normalization_result)
+    checks = []
+    findings = []
+    if rule_results is None:
+        checks.append(
+            {
+                "check_id": "quality_rules.enabled",
+                "status": "Skipped",
+                "required": True,
+                "scope": None,
+                "rows_considered": 0,
+                "budget": None,
+                "reason": (
+                    "No quality-detection rules are available in this "
+                    "contract-only report."
+                ),
+            }
+        )
+    else:
+        statuses = {result.status for result in rule_results}
+        if not rule_results:
+            engine_status = "Skipped"
+        elif "Failed" in statuses:
+            engine_status = "Failed"
+        elif "BudgetExhausted" in statuses:
+            engine_status = "BudgetExhausted"
+        elif statuses == {"NotApplicable"}:
+            engine_status = "NotApplicable"
+        else:
+            engine_status = "Completed"
+        checks.append(
+            {
+                "check_id": "quality_rules.enabled",
+                "status": engine_status,
+                "required": True,
+                "scope": None,
+                "rows_considered": sum(
+                    result.rows_considered for result in rule_results
+                ),
+                "budget": None,
+                "reason": (
+                    None
+                    if engine_status == "Completed"
+                    else (
+                        "No quality rules were selected."
+                        if not rule_results
+                        else "One or more configured rules did not complete."
+                    )
+                ),
+            }
+        )
+        for result in rule_results:
+            checks.append(
+                {
+                    "check_id": f"quality_rules.rule.{result.rule_id}",
+                    "status": result.status,
+                    "required": False,
+                    "scope": None,
+                    "rows_considered": result.rows_considered,
+                    "budget": {
+                        "limit": result.budget_limit,
+                        "used": result.budget_used,
+                    },
+                    "reason": result.reason,
+                }
+            )
+            for rule_finding in result.findings:
+                observed = {
+                    key: value
+                    for key, value in rule_finding.evidence.items()
+                    if key != "example_refs"
+                }
+                observed["affected_count"] = rule_finding.affected_count
+                denominator = {
+                    "basis": rule_finding.denominator_basis,
+                    "count": rule_finding.denominator_count,
+                }
+                if rule_finding.denominator_count is None:
+                    denominator["reason"] = (
+                        rule_finding.denominator_reason
+                        or "The rule could not establish a denominator."
+                    )
+                findings.append(
+                    {
+                        "finding_id": finding_id_for(
+                            analysis_key,
+                            result.rule_id,
+                            result.rule_version,
+                            rule_finding.scope,
+                        ),
+                        "rule_id": result.rule_id,
+                        "rule_version": result.rule_version,
+                        "classification": rule_finding.classification,
+                        "title": rule_finding.title,
+                        "description": rule_finding.description,
+                        "scope": rule_finding.scope,
+                        "evidence": {
+                            "observed": observed,
+                            "example_refs": rule_finding.evidence.get(
+                                "example_refs",
+                                [],
+                            ),
+                        },
+                        "denominator": denominator,
+                        "severity": result.severity,
+                        "confidence": rule_finding.confidence,
+                        "confidence_basis": rule_finding.confidence_basis,
+                        "recommended_investigation": (
+                            rule_finding.recommended_investigation
+                        ),
+                    }
+                )
+    classification_counts = {
+        classification: 0 for classification in sorted(_CLASSIFICATIONS)
+    }
+    severity_counts = {severity: 0 for severity in sorted(_SEVERITIES)}
+    for finding in findings:
+        classification_counts[finding["classification"]] += 1
+        severity_counts[finding["severity"]] += 1
+    coverage_status = _expected_completion_status(checks)
     report = {
         "schema_version": QUALITY_REPORT_SCHEMA_VERSION,
         "analysis": {
@@ -295,35 +454,18 @@ def build_contract_report(
             "started_at": started_at.astimezone(timezone.utc).isoformat(),
             "completed_at": completed_at.astimezone(timezone.utc).isoformat(),
         },
-        "completion_status": "PartiallyCompleted",
+        "completion_status": coverage_status,
         "summary": {
             **normalized_summary_totals(normalization_result),
-            "findings_total": 0,
-            "findings_by_classification": {
-                classification: 0 for classification in sorted(_CLASSIFICATIONS)
-            },
-            "findings_by_severity": {
-                severity: 0 for severity in sorted(_SEVERITIES)
-            },
+            "findings_total": len(findings),
+            "findings_by_classification": classification_counts,
+            "findings_by_severity": severity_counts,
         },
         "coverage": {
-            "status": "PartiallyCompleted",
-            "checks": [
-                {
-                    "check_id": "quality_rules.enabled",
-                    "status": "Skipped",
-                    "required": True,
-                    "scope": None,
-                    "rows_considered": 0,
-                    "budget": None,
-                    "reason": (
-                        "No quality-detection rules are implemented in this "
-                        "contract-only release."
-                    ),
-                }
-            ],
+            "status": coverage_status,
+            "checks": checks,
         },
-        "findings": [],
+        "findings": findings,
         "scores": [],
     }
     return validate_quality_report(
@@ -404,7 +546,7 @@ def validate_quality_report(
             _require_text(analysis[key])
         if (
             analysis["analyzer_version"] != QUALITY_ANALYZER_VERSION
-            or analysis["ruleset_version"] != QUALITY_RULESET_VERSION
+            or analysis["ruleset_version"] not in SUPPORTED_QUALITY_RULESET_VERSIONS
         ):
             raise ValueError("Unsupported analyzer or ruleset version.")
         started = _require_timestamp(analysis["started_at"])
@@ -428,22 +570,35 @@ def validate_quality_report(
             if output["sha256"] is not None:
                 _require_sha256(output["sha256"])
 
-        expected_key, expected_configuration_sha256 = quality_analysis_key(
-            analysis["source_sha256"],
-            {
-                "tables": [
-                    {
-                        "table_index": output["table_index"],
-                        "sha256": output["sha256"],
-                    }
-                    for output in outputs
-                ]
-            },
+        candidate_configurations = (
+            LEGACY_QUALITY_ANALYSIS_CONFIGURATIONS
+            if analysis["ruleset_version"] == "1"
+            else (QUALITY_ANALYSIS_CONFIGURATION,)
         )
-        if (
-            analysis["analysis_key"] != expected_key
-            or analysis["configuration_sha256"] != expected_configuration_sha256
-        ):
+        expected_identity_matches = False
+        for candidate_configuration in candidate_configurations:
+            expected_key, expected_configuration_sha256 = quality_analysis_key(
+                analysis["source_sha256"],
+                {
+                    "tables": [
+                        {
+                            "table_index": output["table_index"],
+                            "sha256": output["sha256"],
+                        }
+                        for output in outputs
+                    ]
+                },
+                candidate_configuration,
+                ruleset_version=analysis["ruleset_version"],
+            )
+            if (
+                analysis["analysis_key"] == expected_key
+                and analysis["configuration_sha256"]
+                == expected_configuration_sha256
+            ):
+                expected_identity_matches = True
+                break
+        if not expected_identity_matches:
             raise ValueError("Analysis identity does not match its provenance.")
 
         if expected_source_sha256 is not None:

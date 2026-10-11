@@ -412,7 +412,7 @@ class UploadFlowTests(unittest.TestCase):
         session.close()
 
     def test_quality_analysis_persists_contract_without_changing_existing_apis_or_data(self):
-        content = b"code,value\n001,1.25\n002,2.50\n"
+        content = b"code,value\n001,1.25\n002,2.50\n003,\n"
         upload = self.client.post(
             f"/api/v1/datasets/{self.dataset_id}/files",
             files={"file": ("quality.csv", content, "text/csv")},
@@ -451,13 +451,42 @@ class UploadFlowTests(unittest.TestCase):
         )
         self.assertEqual(first.status_code, 200, first.text)
         first_body = first.json()
-        self.assertEqual(first_body["status"], "PartiallyCompleted")
+        self.assertEqual(
+            first_body["status"],
+            "Completed",
+            first_body["quality_report"]["coverage"]["checks"],
+        )
         self.assertTrue(first_body["report_is_current"])
         self.assertEqual(first_body["quality_report"]["schema_version"], 1)
-        self.assertEqual(first_body["quality_report"]["findings"], [])
+        self.assertEqual(len(first_body["quality_report"]["findings"]), 1)
+        finding = first_body["quality_report"]["findings"][0]
+        self.assertEqual(finding["rule_id"], "generic.missing_value_candidates")
+        self.assertEqual(finding["rule_version"], "1")
+        self.assertEqual(finding["classification"], "unusual_candidate")
+        self.assertEqual(finding["evidence"]["observed"]["empty_string_count"], 1)
+        self.assertEqual(finding["denominator"], {"basis": "rows", "count": 3})
         self.assertEqual(
-            first_body["quality_report"]["coverage"]["checks"][0]["status"],
-            "Skipped",
+            [
+                (check["check_id"], check["status"])
+                for check in first_body["quality_report"]["coverage"]["checks"]
+            ],
+            [
+                ("quality_rules.enabled", "Completed"),
+                ("quality_rules.rule.generic.exact_duplicate_rows", "Completed"),
+                (
+                    "quality_rules.rule.generic.missing_value_candidates",
+                    "Completed",
+                ),
+                (
+                    "quality_rules.rule.generic.numeric_validity_candidates",
+                    "NotApplicable",
+                ),
+                (
+                    "quality_rules.rule.generic.string_whitespace_candidates",
+                    "Completed",
+                ),
+                ("quality_rules.rule.generic.type_consistency", "Completed"),
+            ],
         )
 
         repeated = self.client.post(
@@ -494,7 +523,7 @@ class UploadFlowTests(unittest.TestCase):
         self.assertEqual(dataset_file.normalization_status, "Ready")
         self.assertEqual(
             dataset_file.quality_analysis_status,
-            "PartiallyCompleted",
+            "Completed",
         )
         self.assertEqual(
             dataset_file.quality_analysis_key,
@@ -783,7 +812,11 @@ class UploadFlowTests(unittest.TestCase):
                 allow_analysis_to_finish.set()
             result = future.result(timeout=10)
         self.assertEqual(result.status_code, 200, result.text)
-        self.assertEqual(result.json()["status"], "PartiallyCompleted")
+        self.assertEqual(
+            result.json()["status"],
+            "Completed",
+            result.json()["quality_report"]["coverage"]["checks"],
+        )
 
     def test_quality_analysis_rejects_unready_normalization_without_mutation(self):
         upload = self.client.post(

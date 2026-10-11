@@ -3,6 +3,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from app.quality_analysis import (
+    LEGACY_QUALITY_ANALYSIS_CONFIGURATIONS,
     MAX_QUALITY_REPORT_BYTES,
     MAX_QUALITY_FINDINGS,
     QualityAnalysisError,
@@ -12,6 +13,7 @@ from app.quality_analysis import (
     normalized_summary_totals,
     validate_quality_report,
 )
+from app.quality_rules import RuleExecutionResult
 
 
 class QualityAnalysisContractTests(unittest.TestCase):
@@ -58,6 +60,35 @@ class QualityAnalysisContractTests(unittest.TestCase):
         self.assertEqual(report["coverage"]["checks"][0]["status"], "Skipped")
         self.assertEqual(report["findings"], [])
         self.assertEqual(report["scores"], [])
+
+    def test_failed_rule_is_visible_and_keeps_report_partial(self):
+        now = datetime(2026, 10, 10, tzinfo=timezone.utc)
+        failed_rule = RuleExecutionResult(
+            rule_id="fixture.failure",
+            rule_version="1",
+            status="Failed",
+            severity="low",
+            findings=(),
+            affected_count=0,
+            denominator_count=None,
+            rows_considered=0,
+            budget_limit=100,
+            budget_used=0,
+            reason="The fixture rule failed safely.",
+        )
+        report = build_contract_report(
+            self.source_sha256,
+            self.normalization_result,
+            self.analysis_key,
+            self.configuration_sha256,
+            now,
+            now + timedelta(seconds=1),
+            rule_results=[failed_rule],
+        )
+        self.assertEqual(report["completion_status"], "PartiallyCompleted")
+        self.assertEqual(report["coverage"]["checks"][0]["status"], "Failed")
+        self.assertEqual(report["coverage"]["checks"][1]["status"], "Failed")
+        self.assertEqual(self.validate(report), report)
 
     def test_optional_prefilter_skip_does_not_make_report_partial(self):
         report = self.report()
@@ -131,6 +162,23 @@ class QualityAnalysisContractTests(unittest.TestCase):
             first["analysis"]["started_at"],
             second["analysis"]["started_at"],
         )
+
+    def test_previous_ruleset_reports_remain_validatable(self):
+        for configuration in LEGACY_QUALITY_ANALYSIS_CONFIGURATIONS:
+            report = self.report()
+            legacy_key, legacy_configuration_sha256 = quality_analysis_key(
+                self.source_sha256,
+                self.normalization_result,
+                configuration,
+                ruleset_version="1",
+            )
+            report["analysis"].update(
+                analysis_key=legacy_key,
+                configuration_sha256=legacy_configuration_sha256,
+                ruleset_version="1",
+            )
+            with self.subTest(configuration=configuration):
+                self.assertEqual(self.validate(report), report)
 
     def test_summary_totals_are_checked_against_normalized_metadata(self):
         report = self.report()
