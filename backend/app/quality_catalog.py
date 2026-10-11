@@ -760,6 +760,97 @@ def _validate_catalog():
         raise ValueError("Quality-rule catalog entries must be sorted by identifier.")
 
 
+def matches_configuration_schema(value, schema):
+    try:
+        if not _configuration_schema_is_valid(schema):
+            return False
+        return _matches_configuration_schema(value, schema)
+    except (KeyError, TypeError, ValueError, OverflowError, RecursionError):
+        return False
+
+
+def _configuration_schema_is_valid(schema):
+    if not isinstance(schema, dict):
+        return False
+    value_type = schema.get("type")
+    if value_type == "object":
+        if set(schema) - {
+            "type",
+            "properties",
+            "required",
+            "additionalProperties",
+        }:
+            return False
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        additional_properties = schema.get("additionalProperties", True)
+        return (
+            isinstance(properties, dict)
+            and isinstance(required, list)
+            and all(isinstance(item, str) for item in required)
+            and set(required) <= set(properties)
+            and isinstance(additional_properties, bool)
+            and all(
+                isinstance(name, str)
+                and _configuration_schema_is_valid(property_schema)
+                for name, property_schema in properties.items()
+            )
+        )
+    if value_type == "array":
+        if set(schema) - {
+            "type",
+            "items",
+            "minItems",
+            "maxItems",
+            "uniqueItems",
+        }:
+            return False
+        return (
+            _configuration_schema_is_valid(schema.get("items"))
+            and _is_nonnegative_int(schema.get("minItems", 0))
+            and _is_nonnegative_int(schema.get("maxItems", 2**63 - 1))
+            and schema.get("minItems", 0) <= schema.get("maxItems", 2**63 - 1)
+            and isinstance(schema.get("uniqueItems", False), bool)
+        )
+    if value_type == "string":
+        if set(schema) - {"type", "minLength", "enum"}:
+            return False
+        return (
+            _is_nonnegative_int(schema.get("minLength", 0))
+            and (
+                "enum" not in schema
+                or isinstance(schema["enum"], list)
+                and all(isinstance(item, str) for item in schema["enum"])
+            )
+        )
+    if value_type in {"integer", "number"}:
+        if set(schema) - {
+            "type",
+            "minimum",
+            "exclusiveMinimum",
+            "maximum",
+        }:
+            return False
+        return all(
+            key not in schema
+            or _is_finite_number(schema[key])
+            for key in ("minimum", "exclusiveMinimum", "maximum")
+        )
+    return set(schema) == {"type"}
+
+
+def _is_nonnegative_int(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_finite_number(value):
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+    )
+
+
 def _matches_configuration_schema(value, schema):
     value_type = schema.get("type")
     if value_type == "object":
@@ -772,7 +863,7 @@ def _matches_configuration_schema(value, schema):
         if not schema.get("additionalProperties", True) and set(value) - set(properties):
             return False
         return all(
-            _matches_configuration_schema(value[name], properties[name])
+            matches_configuration_schema(value[name], properties[name])
             for name in value
             if name in properties
         )
@@ -790,7 +881,7 @@ def _matches_configuration_schema(value, schema):
         ):
             return False
         return all(
-            _matches_configuration_schema(item, schema["items"])
+            matches_configuration_schema(item, schema["items"])
             for item in value
         )
     if value_type == "string":
@@ -836,7 +927,7 @@ def validate_quality_rule_configuration(rule_id: str, configuration: dict) -> No
     if (
         entry["status"] != "implemented"
         or schema is None
-        or not _matches_configuration_schema(configuration, schema)
+        or not matches_configuration_schema(configuration, schema)
     ):
         raise ValueError("Configuration does not match the catalog schema.")
 
