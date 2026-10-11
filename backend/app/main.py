@@ -47,6 +47,11 @@ from app.quality_analysis import (
     quality_analysis_key,
     validate_quality_report,
 )
+from app.quality_catalog import (
+    QUALITY_RULE_CATALOG_VERSION,
+    get_quality_rule_catalog_entry,
+    list_quality_rule_catalog,
+)
 from app.quality_rules import MAX_RULE_INPUT_BYTES, run_quality_rules
 from app.service_health import check_database, check_redis, check_storage
 
@@ -1516,6 +1521,29 @@ def serialize_dataset_file(dataset_file: DatasetFile) -> dict:
         "error_message": dataset_file.error_message,
         "created_at": dataset_file.created_at,
         "updated_at": dataset_file.updated_at,
+    }
+
+
+@app.get("/api/v1/quality-rules")
+def list_quality_rules(category: str | None = None, status: str | None = None):
+    try:
+        rules = list_quality_rule_catalog(category=category, status=status)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    return {
+        "catalog_version": QUALITY_RULE_CATALOG_VERSION,
+        "rules": rules,
+    }
+
+
+@app.get("/api/v1/quality-rules/{rule_id}")
+def get_quality_rule(rule_id: str):
+    rule = get_quality_rule_catalog_entry(rule_id)
+    if rule is None:
+        raise HTTPException(status_code=404, detail="Quality rule not found.")
+    return {
+        "catalog_version": QUALITY_RULE_CATALOG_VERSION,
+        "rule": rule,
     }
 
 

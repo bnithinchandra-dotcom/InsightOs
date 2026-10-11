@@ -10,6 +10,11 @@ from typing import Callable, Iterable
 
 import pyarrow.parquet as pq
 
+from app.quality_catalog import (
+    get_quality_rule_catalog_entry,
+    quality_rule_catalog_entries,
+    validate_quality_rule_configuration,
+)
 from app.profiling import _normalize, _row_fingerprint
 
 
@@ -1251,6 +1256,27 @@ class QualityRuleRegistry:
             raise QualityRuleConfigurationError(
                 "A quality rule definition is invalid."
             )
+        catalog_entry = get_quality_rule_catalog_entry(rule.rule_id)
+        if catalog_entry is not None:
+            if catalog_entry["status"] != "implemented":
+                raise QualityRuleConfigurationError(
+                    f"Catalog rule {rule.rule_id!r} is not executable."
+                )
+            if _IMPLEMENTED_EXECUTORS.get(rule.rule_id) is not rule:
+                raise QualityRuleConfigurationError(
+                    f"Catalog rule {rule.rule_id!r} is bound to a different executor."
+                )
+            if (
+                rule.version != catalog_entry["version"]
+                or rule.scope != catalog_entry["scope"]
+                or rule.severity != catalog_entry["severity"]
+                or list(rule.prerequisites) != catalog_entry["prerequisites"]
+                or rule.configuration_defaults
+                != catalog_entry["default_configuration"]
+            ):
+                raise QualityRuleConfigurationError(
+                    f"Executor metadata for catalog rule {rule.rule_id!r} does not match."
+                )
         try:
             canonical_json(rule.configuration_defaults)
         except (TypeError, ValueError, OverflowError, RecursionError) as error:
@@ -1272,8 +1298,9 @@ class QualityRuleRegistry:
         return len(self._rules)
 
 
-DEFAULT_QUALITY_RULES = QualityRuleRegistry(
-    (
+_IMPLEMENTED_EXECUTORS = {
+    rule.rule_id: rule
+    for rule in (
         BUSINESS_KEY_DUPLICATE_RULE,
         EXACT_DUPLICATE_RULE,
         MISSING_VALUE_CANDIDATE_RULE,
@@ -1282,26 +1309,39 @@ DEFAULT_QUALITY_RULES = QualityRuleRegistry(
         STRING_CONSISTENCY_RULE,
         TYPE_CONSISTENCY_RULE,
     )
+}
+_CATALOG_IMPLEMENTED_IDS = {
+    entry["rule_id"]
+    for entry in quality_rule_catalog_entries()
+    if entry["status"] == "implemented"
+}
+if _CATALOG_IMPLEMENTED_IDS != set(_IMPLEMENTED_EXECUTORS):
+    raise QualityRuleConfigurationError(
+        "The quality-rule catalog and implemented executor registry do not match."
+    )
+DEFAULT_QUALITY_RULES = QualityRuleRegistry(
+    _IMPLEMENTED_EXECUTORS[entry["rule_id"]]
+    for entry in quality_rule_catalog_entries()
+    if entry["status"] == "implemented"
 )
+_DEFAULT_ENABLED_CATALOG = {
+    entry["rule_id"]: entry
+    for entry in quality_rule_catalog_entries()
+    if entry["status"] == "implemented" and entry["default_enabled"]
+}
 QUALITY_RULE_ENGINE_CONFIGURATION = {
     "candidate_comparisons": 10_000,
-    "enabled_rules": sorted(
-        rule.rule_id
-        for rule in DEFAULT_QUALITY_RULES
-        if rule.rule_id != BUSINESS_KEY_DUPLICATE_RULE.rule_id
-    ),
+    "enabled_rules": sorted(_DEFAULT_ENABLED_CATALOG),
     "max_examples_per_finding": MAX_RULE_EXAMPLES,
     "max_findings": MAX_RULE_FINDINGS,
     "max_report_bytes": MAX_RULE_RESULT_BYTES,
     "rule_versions": {
-        rule.rule_id: rule.version
-        for rule in DEFAULT_QUALITY_RULES
-        if rule.rule_id != BUSINESS_KEY_DUPLICATE_RULE.rule_id
+        rule_id: entry["version"]
+        for rule_id, entry in _DEFAULT_ENABLED_CATALOG.items()
     },
     "rules": {
-        rule.rule_id: copy.deepcopy(rule.configuration_defaults)
-        for rule in DEFAULT_QUALITY_RULES
-        if rule.rule_id != BUSINESS_KEY_DUPLICATE_RULE.rule_id
+        rule_id: copy.deepcopy(entry["default_configuration"])
+        for rule_id, entry in _DEFAULT_ENABLED_CATALOG.items()
     },
 }
 
@@ -1499,6 +1539,10 @@ def run_quality_rules(
     for rule in selected_rules:
         raw_configuration = copy.deepcopy(rule_configurations[rule.rule_id])
         try:
+            validate_quality_rule_configuration(
+                rule.rule_id,
+                raw_configuration,
+            )
             validated = rule.validate_configuration(raw_configuration)
         except QualityRuleConfigurationError:
             raise

@@ -16,6 +16,11 @@ version. Ruleset version 3 accepts prior version-1 and version-2 reports,
 preserving their validation and provenance; current analysis keys bind the new
 ruleset and canonical rule configuration.
 
+The [BA + DA preprocessing rule catalog](./QUALITY_RULE_CATALOG.md) is the
+versioned discovery surface for implemented and planned capabilities.
+Implemented catalog entries are validated against the executor registry;
+planned entries are not dispatchable.
+
 | Rule | Evidence and classification |
 | --- | --- |
 | `generic.missing_value_candidates` | Counts nulls and exact empty strings from validated normalization metadata. Reports an `unusual_candidate`, with row denominator; these values are not presumed invalid. |
