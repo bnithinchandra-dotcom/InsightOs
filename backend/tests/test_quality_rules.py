@@ -9,6 +9,7 @@ import pyarrow.parquet as pq
 
 from app.quality_rules import (
     BUSINESS_KEY_DUPLICATE_RULE,
+    CONSTANT_COLUMN_CANDIDATE_RULE,
     DEFAULT_QUALITY_RULES,
     MISSING_VALUE_CANDIDATE_RULE,
     NUMERIC_OUTLIER_CANDIDATE_RULE,
@@ -65,15 +66,27 @@ def parquet_rule_data(
     empty_counts = []
     for position, field in enumerate(arrow_table.schema):
         values = arrow_table.column(position).to_pylist()
-        null_counts.append(sum(value is None for value in values))
-        empty_counts.append(
-            sum(isinstance(value, str) and value == "" for value in values)
+        missing_count = sum(value is None for value in values)
+        empty_count = sum(
+            isinstance(value, str) and value == "" for value in values
         )
+        null_counts.append(missing_count)
+        empty_counts.append(empty_count)
         column_profiles.append(
             {
                 "name": field.name,
                 "position": position,
                 "physical_types": physical_types[field.name],
+                "missing_value_count": missing_count,
+                "empty_value_count": empty_count,
+                "distinct_value_count": len(
+                    {
+                        (type(value).__name__, repr(value))
+                        for value in values
+                        if value is not None
+                    }
+                ),
+                "distinct_count_exact": True,
             }
         )
     data = {
@@ -162,6 +175,129 @@ def fixture_rule(
 
 
 class QualityRuleEngineTests(unittest.TestCase):
+    def test_constant_columns_are_reported_from_exact_profile_counts(self):
+        data, path = parquet_rule_data(
+            {
+                "fixed": pa.array(["one", "one", None, ""], type=pa.string()),
+                "varies": pa.array([1, 2, 3, 4], type=pa.int64()),
+                "all_missing": pa.array([None, None, None, None], type=pa.string()),
+            },
+            physical_types={
+                "fixed": ["string"],
+                "varies": ["integer"],
+                "all_missing": ["null"],
+            },
+        )
+        self.addCleanup(os.unlink, path)
+
+        first = run_quality_rules(data)
+        second = run_quality_rules(data)
+        self.assertEqual(first, second)
+        result = next(
+            item
+            for item in first
+            if item.rule_id == CONSTANT_COLUMN_CANDIDATE_RULE.rule_id
+        )
+        self.assertEqual(result.status, "Completed")
+        self.assertEqual(len(result.findings), 1)
+        finding = result.findings[0]
+        self.assertEqual(finding.classification, "unusual_candidate")
+        self.assertEqual(finding.scope["column_name"], "fixed")
+        self.assertEqual(finding.affected_count, 2)
+        self.assertEqual(finding.denominator_basis, "non_empty_non_null_values")
+        self.assertEqual(finding.denominator_count, 2)
+        self.assertEqual(
+            finding.evidence["distinct_non_empty_non_null_value_count"],
+            1,
+        )
+        self.assertNotIn("one", str(finding.evidence))
+
+    def test_constant_column_rule_does_not_flag_varying_or_single_observations(self):
+        data, path = parquet_rule_data(
+            {
+                "varies": pa.array(["a", "b", "a"], type=pa.string()),
+                "single_observation": pa.array(["a", None, None], type=pa.string()),
+                "empty_only": pa.array(["", "", None], type=pa.string()),
+            },
+            physical_types={
+                "varies": ["string"],
+                "single_observation": ["string"],
+                "empty_only": ["string"],
+            },
+        )
+        self.addCleanup(os.unlink, path)
+        rule_id = CONSTANT_COLUMN_CANDIDATE_RULE.rule_id
+        result = run_quality_rules(
+            data,
+            configuration=configuration({rule_id: {}}),
+        )[0]
+        self.assertEqual(result.status, "Completed")
+        self.assertEqual(result.findings, ())
+
+    def test_constant_column_rule_requires_exact_aligned_profile_metadata(self):
+        data, path = parquet_rule_data(
+            {"fixed": pa.array(["x", "x"], type=pa.string())},
+            physical_types={"fixed": ["string"]},
+        )
+        self.addCleanup(os.unlink, path)
+        rule_id = CONSTANT_COLUMN_CANDIDATE_RULE.rule_id
+
+        for profile in (
+            None,
+            {
+                **data["_profile_result"],
+                "tables": [
+                    {
+                        **data["_profile_result"]["tables"][0],
+                        "columns": [
+                            {
+                                **data["_profile_result"]["tables"][0]["columns"][0],
+                                "distinct_count_exact": False,
+                            }
+                        ],
+                    }
+                ],
+            },
+        ):
+            candidate_data = dict(data)
+            if profile is None:
+                candidate_data.pop("_profile_result")
+            else:
+                candidate_data["_profile_result"] = profile
+            result = run_quality_rules(
+                candidate_data,
+                configuration=configuration({rule_id: {}}),
+            )[0]
+            self.assertEqual(result.status, "NotApplicable")
+            self.assertEqual(result.findings, ())
+
+        misaligned = copy.deepcopy(data)
+        misaligned["_profile_result"]["tables"][0]["columns"][0]["name"] = "other"
+        result = run_quality_rules(
+            misaligned,
+            configuration=configuration({rule_id: {}}),
+        )[0]
+        self.assertEqual(result.status, "NotApplicable")
+
+    def test_constant_column_rule_obeys_shared_comparison_budget(self):
+        data, path = parquet_rule_data(
+            {
+                "fixed_a": pa.array(["x", "x"], type=pa.string()),
+                "fixed_b": pa.array(["y", "y"], type=pa.string()),
+            },
+            physical_types={"fixed_a": ["string"], "fixed_b": ["string"]},
+        )
+        self.addCleanup(os.unlink, path)
+        result = run_quality_rules(
+            data,
+            configuration=configuration(
+                {CONSTANT_COLUMN_CANDIDATE_RULE.rule_id: {}},
+                candidate_comparisons=1,
+            ),
+        )[0]
+        self.assertEqual(result.status, "BudgetExhausted")
+        self.assertEqual(result.findings, ())
+
     def test_default_rule_reports_missing_values_as_candidates(self):
         result = run_quality_rules(normalization_result())
         missing_result = next(

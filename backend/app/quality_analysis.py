@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from app.quality_rules import (
     QUALITY_RULE_ENGINE_CONFIGURATION,
     QUALITY_RULESET_VERSION,
+    CONSTANT_COLUMN_CANDIDATE_RULE,
     MISSING_VALUE_CANDIDATE_RULE,
     NUMERIC_OUTLIER_CANDIDATE_RULE,
     RuleExecutionResult,
@@ -27,8 +28,20 @@ QUALITY_ANALYSIS_CONFIGURATION = {
     "batch_size": 8192,
     **QUALITY_RULE_ENGINE_CONFIGURATION,
 }
-RULESET_2_QUALITY_ANALYSIS_CONFIGURATION = copy.deepcopy(
+RULESET_3_QUALITY_ANALYSIS_CONFIGURATION = copy.deepcopy(
     QUALITY_ANALYSIS_CONFIGURATION
+)
+RULESET_3_QUALITY_ANALYSIS_CONFIGURATION["enabled_rules"].remove(
+    CONSTANT_COLUMN_CANDIDATE_RULE.rule_id
+)
+RULESET_3_QUALITY_ANALYSIS_CONFIGURATION["rule_versions"].pop(
+    CONSTANT_COLUMN_CANDIDATE_RULE.rule_id
+)
+RULESET_3_QUALITY_ANALYSIS_CONFIGURATION["rules"].pop(
+    CONSTANT_COLUMN_CANDIDATE_RULE.rule_id
+)
+RULESET_2_QUALITY_ANALYSIS_CONFIGURATION = copy.deepcopy(
+    RULESET_3_QUALITY_ANALYSIS_CONFIGURATION
 )
 RULESET_2_QUALITY_ANALYSIS_CONFIGURATION["enabled_rules"].remove(
     NUMERIC_OUTLIER_CANDIDATE_RULE.rule_id
@@ -65,7 +78,12 @@ LEGACY_QUALITY_ANALYSIS_CONFIGURATIONS = (
     LEGACY_QUALITY_ANALYSIS_CONFIGURATION,
     STAGE_3_3_1_QUALITY_ANALYSIS_CONFIGURATION,
 )
-SUPPORTED_QUALITY_RULESET_VERSIONS = {"1", "2", QUALITY_RULESET_VERSION}
+SUPPORTED_QUALITY_RULESET_VERSIONS = {
+    "1",
+    "2",
+    "3",
+    QUALITY_RULESET_VERSION,
+}
 
 _CLASSIFICATIONS = {
     "confirmed_violation",
@@ -293,6 +311,10 @@ def quality_analysis_key(
     )
     if ruleset_version == QUALITY_RULESET_VERSION:
         supported_configuration = config == QUALITY_ANALYSIS_CONFIGURATION
+    elif ruleset_version == "3":
+        supported_configuration = (
+            config == RULESET_3_QUALITY_ANALYSIS_CONFIGURATION
+        )
     elif ruleset_version == "2":
         supported_configuration = (
             config == RULESET_2_QUALITY_ANALYSIS_CONFIGURATION
@@ -593,6 +615,7 @@ def validate_quality_report(
         candidate_configurations = {
             "1": LEGACY_QUALITY_ANALYSIS_CONFIGURATIONS,
             "2": (RULESET_2_QUALITY_ANALYSIS_CONFIGURATION,),
+            "3": (RULESET_3_QUALITY_ANALYSIS_CONFIGURATION,),
             QUALITY_RULESET_VERSION: (QUALITY_ANALYSIS_CONFIGURATION,),
         }[analysis["ruleset_version"]]
         expected_identity_matches = False

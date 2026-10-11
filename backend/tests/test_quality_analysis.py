@@ -8,6 +8,7 @@ from app.quality_analysis import (
     MAX_QUALITY_FINDINGS,
     QualityAnalysisError,
     RULESET_2_QUALITY_ANALYSIS_CONFIGURATION,
+    RULESET_3_QUALITY_ANALYSIS_CONFIGURATION,
     build_contract_report,
     finding_id_for,
     quality_analysis_key,
@@ -193,6 +194,21 @@ class QualityAnalysisContractTests(unittest.TestCase):
             analysis_key=old_key,
             configuration_sha256=old_configuration_sha256,
             ruleset_version="2",
+        )
+        self.assertEqual(self.validate(report), report)
+
+    def test_pre_constant_column_ruleset_reports_remain_validatable(self):
+        report = self.report()
+        old_key, old_configuration_sha256 = quality_analysis_key(
+            self.source_sha256,
+            self.normalization_result,
+            RULESET_3_QUALITY_ANALYSIS_CONFIGURATION,
+            ruleset_version="3",
+        )
+        report["analysis"].update(
+            analysis_key=old_key,
+            configuration_sha256=old_configuration_sha256,
+            ruleset_version="3",
         )
         self.assertEqual(self.validate(report), report)
 

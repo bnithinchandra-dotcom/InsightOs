@@ -12,9 +12,9 @@ Rules have stable dotted IDs, independent versions, declared scope and
 prerequisites, explicit configuration defaults, and a configuration validator.
 The registry sorts rules by ID, and the engine sorts results by rule and
 finding scope. A rule semantic change requires incrementing that rule's
-version. Ruleset version 3 accepts prior version-1 and version-2 reports,
-preserving their validation and provenance; current analysis keys bind the new
-ruleset and canonical rule configuration.
+version. Ruleset version 4 accepts prior version-1, version-2, and version-3
+reports, preserving their validation and provenance; current analysis keys
+bind the current ruleset and canonical rule configuration.
 
 The [BA + DA preprocessing rule catalog](./QUALITY_RULE_CATALOG.md) is the
 versioned discovery surface for implemented and planned capabilities.
@@ -25,6 +25,7 @@ planned entries are not dispatchable.
 | --- | --- |
 | `generic.missing_value_candidates` | Counts nulls and exact empty strings from validated normalization metadata. Reports an `unusual_candidate`, with row denominator; these values are not presumed invalid. |
 | `generic.type_consistency` | Compares validated parsing physical-type metadata with normalized column types. Mixed or incompatible source representations are `suspected_issue` candidates; the metadata does not establish an affected-row count. |
+| `generic.constant_column_candidates` | Uses validated exact profile cardinality aligned to normalized schema. Flags a column only when at least two non-empty, non-null values have exactly one distinct value; reports an `unusual_candidate` and does not infer whether variation is expected. |
 | `generic.exact_duplicate_rows` | Scans normalized rows and counts repeated complete rows. Reports `unusual_candidate`; repeated rows can be intentional. |
 | `generic.string_whitespace_candidates` | Scans string columns for leading/trailing or repeated whitespace. Reports `unusual_candidate` counts and bounded row references without changing values. |
 | `generic.numeric_validity_candidates` | Detects non-finite values or values inconsistent with a normalized numeric type, where available. Reports `suspected_issue`; negative numbers and statistical outliers are not flagged. |
@@ -64,6 +65,11 @@ coverage. A failure or exhausted budget prevents the required aggregate rule
 check from being reported as completed. A report may complete when a
 non-applicable optional rule has no relevant input, with that rule's own
 coverage state preserved.
+
+The constant-column detector is metadata-backed: it consumes one comparison
+per normalized column from the shared budget and uses validated profile
+cardinality only. It does not scan Parquet rows, retain sample values, or
+report a business violation.
 
 No SQL connector, live data fetching, frontend, migration, or additional
 dependency is introduced for this stage.
