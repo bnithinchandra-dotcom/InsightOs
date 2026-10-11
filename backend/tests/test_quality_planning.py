@@ -14,8 +14,36 @@ def complete_context():
         profile_result={
             "tables": [
                 {
+                    "name": None,
+                    "row_count": 4,
                     "duplicate_row_count": 0,
                     "duplicate_row_count_exact": True,
+                    "columns": [
+                        {
+                            "name": "free_text",
+                            "position": 0,
+                            "missing_value_count": 0,
+                            "empty_value_count": 0,
+                            "distinct_value_count": 2,
+                            "distinct_count_exact": True,
+                        },
+                        {
+                            "name": "numeric_value",
+                            "position": 1,
+                            "missing_value_count": 0,
+                            "empty_value_count": 0,
+                            "distinct_value_count": 4,
+                            "distinct_count_exact": True,
+                        },
+                        {
+                            "name": "uninterpreted",
+                            "position": 2,
+                            "missing_value_count": 0,
+                            "empty_value_count": 0,
+                            "distinct_value_count": 1,
+                            "distinct_count_exact": True,
+                        },
+                    ],
                 }
             ]
         },
@@ -58,7 +86,7 @@ class QualityPlanningTests(unittest.TestCase):
         self.assertEqual(first, second)
         response = first.model_dump(mode="json")
         self.assertEqual(response["catalog_version"], QUALITY_RULE_CATALOG_VERSION)
-        self.assertEqual(response["catalog_version"], "2")
+        self.assertEqual(response["catalog_version"], "3")
         self.assertEqual(response["context"]["dataset_id"], 12)
         self.assertTrue(response["context"]["current_quality_report_available"])
         outlier = next(
@@ -69,6 +97,13 @@ class QualityPlanningTests(unittest.TestCase):
         self.assertEqual(outlier["planning_status"], "ready")
         self.assertTrue(outlier["execution_supported"])
         self.assertEqual(outlier["previous_execution_status"], "Completed")
+        constant_columns = next(
+            item
+            for item in response["recommendations"]
+            if item["rule_id"] == "generic.constant_column_candidates"
+        )
+        self.assertEqual(constant_columns["planning_status"], "ready")
+        self.assertTrue(constant_columns["execution_supported"])
 
     def test_missing_normalization_context_blocks_applicable_rules(self):
         context = complete_context()
@@ -168,6 +203,40 @@ class QualityPlanningTests(unittest.TestCase):
         )
         self.assertIsNone(outlier.previous_execution_status)
         self.assertFalse(plan.context.current_quality_report_available)
+
+    def test_constant_column_rule_needs_exact_cardinality_context(self):
+        context = complete_context()
+        profile_tables = [
+            dict(table)
+            for table in context.profile_result["tables"]
+        ]
+        profile_tables[0] = dict(profile_tables[0])
+        profile_tables[0]["columns"] = [
+            {**column, "distinct_count_exact": False}
+            for column in profile_tables[0]["columns"]
+        ]
+        unavailable_profile = QualityPlanningContext(
+            dataset_id=context.dataset_id,
+            file_id=context.file_id,
+            dataset_status=context.dataset_status,
+            file_status=context.file_status,
+            detected_format=context.detected_format,
+            profile_result={"tables": profile_tables},
+            normalization_result=context.normalization_result,
+            quality_report=None,
+            quality_report_current=False,
+        )
+        item = next(
+            item
+            for item in plan_quality_rules(
+                unavailable_profile,
+                status="implemented",
+            ).recommendations
+            if item.rule_id == "generic.constant_column_candidates"
+        )
+        self.assertEqual(item.planning_status, "needs_context")
+        self.assertIn("exact per-column distinct counts", item.missing_context)
+        self.assertFalse(item.execution_supported)
 
     def test_column_names_do_not_create_business_semantics(self):
         context = complete_context()

@@ -82,6 +82,8 @@ _PREREQUISITE_MISSING_CONTEXT = {
     "validated_source_type_profile": "validated source type profile",
     "normalized_column_schema": "normalized column schema",
     "validated_exact_duplicate_profile": "profile with exact duplicate counts",
+    "validated_profile_result": "validated column profile",
+    "exact_profile_column_cardinality": "exact per-column distinct counts",
     "verified_normalized_parquet": "validated normalized Parquet outputs",
     "normalized_numeric_columns": "normalized numeric columns",
     "normalized_string_columns": "normalized string columns",
@@ -137,6 +139,59 @@ def _available_prerequisites(
             for field in table.get("schema", [])
         ):
             available.add("normalized_string_columns")
+        profile_tables = (
+            profile.get("tables") if isinstance(profile, dict) else None
+        )
+        if (
+            isinstance(profile_tables, list)
+            and len(profile_tables) == len(tables)
+            and all(
+                isinstance(profile_table, dict)
+                and isinstance(table, dict)
+                and profile_table.get("name") == table.get("table_name")
+                and profile_table.get("row_count") == table.get("row_count")
+                and isinstance(table.get("row_count"), int)
+                and not isinstance(table.get("row_count"), bool)
+                and table["row_count"] >= 0
+                and isinstance(profile_table.get("columns"), list)
+                and len(profile_table["columns"]) == len(table.get("schema", []))
+                and all(
+                    isinstance(column, dict)
+                    and isinstance(field, dict)
+                    and column.get("name") == field.get("name")
+                    and column.get("position") == position
+                    and column.get("distinct_count_exact") is True
+                    and isinstance(column.get("distinct_value_count"), int)
+                    and not isinstance(column.get("distinct_value_count"), bool)
+                    and column["distinct_value_count"] >= 0
+                    and isinstance(column.get("missing_value_count"), int)
+                    and not isinstance(column.get("missing_value_count"), bool)
+                    and column["missing_value_count"] >= 0
+                    and isinstance(column.get("empty_value_count"), int)
+                    and not isinstance(column.get("empty_value_count"), bool)
+                    and column["empty_value_count"] >= 0
+                    and column["missing_value_count"]
+                    + column["empty_value_count"]
+                    <= table["row_count"]
+                    and column["distinct_value_count"]
+                    >= int(
+                        table["row_count"] - column["missing_value_count"] > 0
+                    )
+                    and column["distinct_value_count"]
+                    <= table["row_count"] - column["missing_value_count"]
+                    and not (
+                        column["empty_value_count"] > 0
+                        and column["distinct_value_count"] == 0
+                    )
+                    for position, (column, field) in enumerate(
+                        zip(profile_table["columns"], table["schema"])
+                    )
+                )
+                for profile_table, table in zip(profile_tables, tables)
+            )
+        ):
+            available.add("validated_profile_result")
+            available.add("exact_profile_column_cardinality")
     return available
 
 

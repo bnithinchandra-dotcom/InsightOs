@@ -30,7 +30,7 @@ MAX_BUSINESS_KEY_VALUE_BYTES = 64 * 1024
 MAX_EXACT_ROW_VALUE_BYTES = 128 * 1024
 MAX_OUTLIER_VALUE_BYTES = 128 * 1024
 MAX_SOURCE_PHYSICAL_TYPES = 32
-QUALITY_RULESET_VERSION = "3"
+QUALITY_RULESET_VERSION = "4"
 _RULE_ID = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
 _RULE_VERSION = re.compile(r"^\d+(?:\.\d+){0,2}$")
 _CLASSIFICATIONS = {
@@ -429,6 +429,147 @@ TYPE_CONSISTENCY_RULE = QualityRule(
     validate_configuration=_empty_rule_configuration,
     unsupported_reason=_type_consistency_unsupported,
     evaluate=_evaluate_type_consistency,
+)
+
+
+def _constant_columns_unsupported(
+    data: dict,
+    _configuration: dict,
+) -> str | None:
+    tables = data.get("tables")
+    profile = data.get("_profile_result")
+    profile_tables = profile.get("tables") if isinstance(profile, dict) else None
+    if not isinstance(tables, list) or not isinstance(profile_tables, list):
+        return "Validated profile metadata is unavailable."
+    if len(tables) != len(profile_tables):
+        return "Profile metadata does not match the normalized tables."
+    has_columns = False
+    for table, profile_table in zip(tables, profile_tables):
+        schema = table.get("schema") if isinstance(table, dict) else None
+        columns = (
+            profile_table.get("columns")
+            if isinstance(profile_table, dict)
+            else None
+        )
+        row_count = table.get("row_count") if isinstance(table, dict) else None
+        if (
+            not isinstance(schema, list)
+            or not isinstance(columns, list)
+            or len(schema) != len(columns)
+            or isinstance(row_count, bool)
+            or not isinstance(row_count, int)
+            or row_count < 0
+            or profile_table.get("name") != table.get("table_name")
+            or isinstance(profile_table.get("row_count"), bool)
+            or not isinstance(profile_table.get("row_count"), int)
+            or profile_table.get("row_count") != row_count
+        ):
+            return "Profile metadata does not match the normalized table schema."
+        has_columns = has_columns or bool(schema)
+        for position, (field, column) in enumerate(zip(schema, columns)):
+            if not isinstance(field, dict) or not isinstance(column, dict):
+                return "Exact, schema-aligned profile cardinality is unavailable."
+            distinct_count = column.get("distinct_value_count")
+            missing_count = column.get("missing_value_count")
+            empty_count = column.get("empty_value_count")
+            if (
+                column.get("name") != field.get("name")
+                or column.get("position") != position
+                or column.get("distinct_count_exact") is not True
+                or isinstance(distinct_count, bool)
+                or not isinstance(distinct_count, int)
+                or distinct_count < 0
+                or isinstance(missing_count, bool)
+                or not isinstance(missing_count, int)
+                or missing_count < 0
+                or isinstance(empty_count, bool)
+                or not isinstance(empty_count, int)
+                or empty_count < 0
+                or missing_count + empty_count > row_count
+                or distinct_count
+                < int(row_count - missing_count > 0)
+                or distinct_count > row_count - missing_count
+                or empty_count > 0 and distinct_count == 0
+            ):
+                return "Exact, schema-aligned profile cardinality is unavailable."
+    if not has_columns:
+        return "No normalized columns are available."
+    return None
+
+
+def _evaluate_constant_column_candidates(
+    data: dict,
+    _configuration: dict,
+    budget: RuleBudget,
+) -> Iterable[RuleFinding]:
+    for table, profile_table in zip(
+        data["tables"],
+        data["_profile_result"]["tables"],
+    ):
+        for position, (field, column) in enumerate(
+            zip(table["schema"], profile_table["columns"])
+        ):
+            budget.consume_comparisons()
+            missing_count = column["missing_value_count"]
+            empty_count = column["empty_value_count"]
+            nonempty_non_null_count = (
+                table["row_count"] - missing_count - empty_count
+            )
+            if nonempty_non_null_count < 2:
+                continue
+            distinct_nonempty_count = column["distinct_value_count"] - int(
+                empty_count > 0
+            )
+            if distinct_nonempty_count != 1:
+                continue
+            yield RuleFinding(
+                classification="unusual_candidate",
+                title="Constant-column candidate",
+                description=(
+                    f"All {nonempty_non_null_count} non-empty, non-null values "
+                    "in this column have one distinct value. This may be "
+                    "intentional and is not a validity error."
+                ),
+                scope={
+                    "table_index": table["table_index"],
+                    "table_name": table.get("table_name"),
+                    "column_position": position,
+                    "column_name": field["name"],
+                },
+                affected_count=nonempty_non_null_count,
+                denominator_basis="non_empty_non_null_values",
+                denominator_count=nonempty_non_null_count,
+                denominator_reason=None,
+                evidence={
+                    "distinct_non_empty_non_null_value_count": 1,
+                    "empty_values_excluded": True,
+                },
+                confidence=1.0,
+                confidence_basis=(
+                    "Exact distinct counts from the validated profile show one "
+                    "value among the non-empty, non-null observations."
+                ),
+                recommended_investigation=(
+                    "Confirm whether this field is expected to vary; fixed "
+                    "attributes and flags can be legitimate."
+                ),
+            )
+
+
+CONSTANT_COLUMN_CANDIDATE_RULE = QualityRule(
+    rule_id="generic.constant_column_candidates",
+    version="1",
+    scope="column",
+    severity="info",
+    prerequisites=(
+        "validated_profile_result",
+        "exact_profile_column_cardinality",
+        "normalized_column_schema",
+    ),
+    configuration_defaults={},
+    validate_configuration=_empty_rule_configuration,
+    unsupported_reason=_constant_columns_unsupported,
+    evaluate=_evaluate_constant_column_candidates,
 )
 
 
@@ -1305,6 +1446,7 @@ _IMPLEMENTED_EXECUTORS = {
     rule.rule_id: rule
     for rule in (
         BUSINESS_KEY_DUPLICATE_RULE,
+        CONSTANT_COLUMN_CANDIDATE_RULE,
         EXACT_DUPLICATE_RULE,
         MISSING_VALUE_CANDIDATE_RULE,
         NUMERIC_OUTLIER_CANDIDATE_RULE,

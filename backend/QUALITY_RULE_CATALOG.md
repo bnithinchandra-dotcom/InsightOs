@@ -4,7 +4,7 @@ The versioned catalog is the read-only discovery surface for preprocessing
 rules. It is available at `GET /api/v1/quality-rules` and
 `GET /api/v1/quality-rules/{rule_id}`. List results are sorted by stable rule
 ID; optional `category` and `status` filters are exact matches. The response
-includes `catalog_version` (`2`) separately from each rule's semantic `version`.
+includes `catalog_version` (`3`) separately from each rule's semantic `version`.
 
 The context-aware planning endpoint is
 `GET /api/v1/datasets/{dataset_id}/files/{file_id}/quality-rule-plan`. It reads
@@ -46,8 +46,9 @@ entries instead declare future operation types in `planned_operations`.
 
 The implemented inventory is missingness reporting, source/normalized type
 consistency, exact duplicate rows, explicitly configured business-key
-duplicate candidates, string whitespace candidates, numeric validity
-candidates, and configurable IQR or population Z-score outlier candidates.
+duplicate candidates, constant-column candidates from exact profile
+cardinality, string whitespace candidates, numeric validity candidates, and
+configurable IQR or population Z-score outlier candidates.
 All findings retain the existing quality engine's status, severity,
 classification, evidence, denominator, and resource-limit behavior. The
 business-key rule requires an explicit key configuration and is not enabled by
@@ -55,6 +56,24 @@ default. Statistical and formatting candidates do not establish errors.
 Approval metadata describes necessary future planner gates; this stage does not
 add an approval workflow. For the implemented business-key rule, execution
 requires an explicit key definition through its rule configuration.
+
+## BA + DA detection coverage
+
+This matrix describes executable behavior rather than catalog discoverability:
+
+| Area | Implemented | Partial | Planned | Unsupported |
+| --- | --- | --- | --- | --- |
+| BA detection | None; no business definition, KPI, scope, grain, or contextual missingness is inferred | None | Business anomaly/gap detection, KPI and status definitions, business-scope and reporting-grain checks, contextual missingness, category/master-dimension checks | None cataloged |
+| DA detection | Missingness counts; type consistency; exact-row and explicitly configured key-duplicate candidates; constant-column candidates; whitespace candidates; numeric validity | Schema-drift comparison only has current-file type-consistency foundations | Explicit logical constraints and referential-integrity detection | None cataloged |
+| Statistical detection | Configurable IQR and population Z-score outlier candidates | None | Other methods remain future work | None cataloged |
+| Temporal detection | None | None | Timezone and fiscal-calendar checks | None cataloged |
+
+Constant-column candidates use validated exact profile distinct counts and
+normalized schema alignment. Nulls and empty strings are excluded from the
+variation denominator. At least two non-empty, non-null values must be present
+and exactly one distinct value observed. Findings are `unusual_candidate`;
+fixed attributes may be entirely legitimate. Inexact or misaligned profile
+metadata makes the rule not applicable rather than guessing.
 
 BA business/KPI definitions, business scope, reporting grain and
 reconciliation, contextual missingness, business gaps and anomalies,
@@ -87,9 +106,9 @@ Never mark a planned capability executable merely because it has a catalog
 entry. Preserve the separate detection and transformation boundaries and the
 existing report contract and ruleset compatibility.
 
-Catalog version 2 declares verified normalized Parquet as a prerequisite for
+Catalog version 2 declared verified normalized Parquet as a prerequisite for
 exact-duplicate detection, matching the existing executor's actual input
-requirements; the rule algorithm and semantic version are unchanged.
+requirements. Catalog version 3 adds the constant-column detector.
 
 ## Current category coverage
 

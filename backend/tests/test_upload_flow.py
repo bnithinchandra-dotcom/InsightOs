@@ -472,6 +472,10 @@ class UploadFlowTests(unittest.TestCase):
             ],
             [
                 ("quality_rules.enabled", "Completed"),
+                (
+                    "quality_rules.rule.generic.constant_column_candidates",
+                    "Completed",
+                ),
                 ("quality_rules.rule.generic.exact_duplicate_rows", "Completed"),
                 (
                     "quality_rules.rule.generic.missing_value_candidates",

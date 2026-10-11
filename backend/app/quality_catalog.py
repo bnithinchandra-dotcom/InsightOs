@@ -3,7 +3,7 @@ import math
 import re
 
 
-QUALITY_RULE_CATALOG_VERSION = "2"
+QUALITY_RULE_CATALOG_VERSION = "3"
 QUALITY_RULE_CATEGORIES = frozenset(
     {
         "BA",
@@ -279,6 +279,28 @@ _RULE_CATALOG = (
         scope="table",
         test_references=[
             "backend/tests/test_quality_rules.py::test_exact_duplicates_use_the_bounded_normalized_row_scan"
+        ],
+    ),
+    _entry(
+        "generic.constant_column_candidates",
+        "Constant-column candidates",
+        "Identify columns with exactly one distinct non-empty, non-null value.",
+        "DA",
+        "Surface fields with no observed variation for review before analytical use.",
+        ["Reviewing low-information fields"],
+        ["validated profile with exact per-column cardinality", "normalized column schema"],
+        ["validated_profile_result", "exact_profile_column_cardinality", "normalized_column_schema"],
+        "Uses exact profile distinct counts, excluding null and empty-string values.",
+        ["detection"],
+        ["A constant field may be intentional, such as a fixed snapshot attribute or flag."],
+        ["Reports only an unusual candidate; it does not infer field meaning, require variation, or modify data."],
+        status="implemented",
+        configuration_schema=_EMPTY_CONFIGURATION,
+        default_configuration={},
+        default_enabled=True,
+        scope="column",
+        test_references=[
+            "backend/tests/test_quality_rules.py::test_constant_columns_are_reported_from_exact_profile_counts"
         ],
     ),
     _entry(
