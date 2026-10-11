@@ -1,4 +1,5 @@
 import copy
+import json
 import math
 import unittest
 from dataclasses import replace
@@ -54,11 +55,15 @@ def operation(operation_id, **overrides):
 
 
 class TransformationRegistryTests(unittest.TestCase):
-    def test_default_registry_contains_only_implemented_da_components(self):
+    def test_default_registry_contains_only_implemented_operations(self):
         operations = DEFAULT_TRANSFORMATION_REGISTRY.list_operations()
         self.assertEqual(
             [item.operation_id for item in operations],
             [
+                "ba.business_rule_filter",
+                "ba.business_rule_validation",
+                "ba.category_mapping",
+                "ba.derived_business_metric",
                 "da.missing_value_handling",
                 "da.numeric_outlier_handling",
                 "da.numeric_scaling",
@@ -66,7 +71,10 @@ class TransformationRegistryTests(unittest.TestCase):
             ],
         )
         self.assertEqual({item.status for item in operations}, {"implemented"})
-        self.assertEqual({item.category for item in operations}, {"DA"})
+        self.assertEqual(
+            {item.category for item in operations},
+            {"BA", "DA"},
+        )
         self.assertEqual(
             TRANSFORMATION_CATEGORIES,
             frozenset({"BA", "DA", "structural"}),
@@ -615,6 +623,628 @@ class DATransformationTests(unittest.TestCase):
                 {"category": ["a"]},
                 configuration={"columns": ["category"]},
             )
+
+class BABusinessTransformationTests(unittest.TestCase):
+    @staticmethod
+    def operation(operation_id):
+        return next(
+            item
+            for item in DEFAULT_TRANSFORMATION_REGISTRY.list_operations()
+            if item.operation_id == operation_id
+        )
+
+    def executor(self, operation_id, configuration):
+        operation = self.operation(operation_id)
+        return DEFAULT_TRANSFORMATION_REGISTRY.resolve_executor(
+            operation_id,
+            configuration=configuration,
+            available_prerequisites=operation.prerequisites,
+            approved_approvals=operation.required_approvals,
+        )
+
+    @staticmethod
+    def latest_trace(table):
+        return json.loads(
+            table.schema.metadata[b"insightos.transformation_lineage"]
+        )[-1]
+
+    def test_filter_requires_approval_and_applies_only_explicit_status_predicate(self):
+        operation = self.operation("ba.business_rule_filter")
+        configuration = {
+            "predicates": [
+                {
+                    "column": "status",
+                    "operator": "eq",
+                    "value_string": "completed",
+                }
+            ],
+            "composition": "all",
+            "null_policy": "exclude",
+            "reason": "This analysis explicitly includes completed orders only.",
+        }
+        with self.assertRaisesRegex(
+            TransformationRegistryError,
+            "approvals are missing",
+        ):
+            DEFAULT_TRANSFORMATION_REGISTRY.resolve_executor(
+                operation.operation_id,
+                configuration=configuration,
+                available_prerequisites=operation.prerequisites,
+                approved_approvals=(),
+            )
+
+        table = pa.table(
+            {
+                "order_id": ["O001", "O002", "O003", "O004"],
+                "gross_revenue": [100.0, 0.0, 200.0, 150.0],
+                "status": ["completed", "completed", "pending", "cancelled"],
+            }
+        )
+        executor = self.executor(operation.operation_id, configuration)
+        executor.fit(table, configuration=configuration)
+        first = executor.transform(table, configuration=configuration)
+        second = executor.transform(table, configuration=configuration)
+        self.assertEqual(first.column("order_id").to_pylist(), ["O001", "O002"])
+        self.assertEqual(first.column("gross_revenue").to_pylist(), [100.0, 0.0])
+        self.assertEqual(first, second)
+        self.assertEqual(table.num_rows, 4)
+        summary = self.latest_trace(first)["summary"]
+        self.assertEqual(summary["rows_before"], 4)
+        self.assertEqual(summary["rows_retained"], 2)
+        self.assertEqual(summary["rows_filtered"], 2)
+        self.assertEqual(summary["reason"], configuration["reason"])
+
+    def test_filter_composition_null_policy_and_review_counts_are_explicit(self):
+        table = pa.table(
+            {
+                "status": pa.array(["completed", None, "pending"], type=pa.string()),
+                "amount": [0.0, 5.0, 10.0],
+            }
+        )
+        config = {
+            "predicates": [
+                {
+                    "column": "status",
+                    "operator": "eq",
+                    "value_string": "completed",
+                },
+                {"column": "amount", "operator": "gt", "value_number": 7.0},
+            ],
+            "composition": "any",
+            "null_policy": "include",
+            "reason": "Keep completed or high-value rows, retaining uncertain rows for review.",
+        }
+        executor = self.executor("ba.business_rule_filter", config)
+        result = executor.transform(table, configuration=config)
+        self.assertEqual(result.num_rows, 3)
+        summary = self.latest_trace(result)["summary"]
+        self.assertEqual(summary["rows_requiring_review"], 1)
+        self.assertEqual(summary["rows_filtered"], 0)
+
+        config["null_policy"] = "exclude"
+        excluded = self.executor("ba.business_rule_filter", config).transform(
+            table,
+            configuration=config,
+        )
+        self.assertEqual(excluded.column("status").to_pylist(), ["completed", "pending"])
+        self.assertEqual(
+            self.latest_trace(excluded)["summary"]["rows_requiring_review"],
+            1,
+        )
+
+    def test_filter_supports_membership_null_and_numeric_predicates(self):
+        table = pa.table(
+            {
+                "status": pa.array(["completed", "pending", None, "cancelled"]),
+                "amount": [2.0, 4.0, 6.0, 8.0],
+            }
+        )
+        config = {
+            "predicates": [
+                {
+                    "column": "status",
+                    "operator": "in",
+                    "values_string": ["completed", "pending"],
+                },
+                {
+                    "column": "amount",
+                    "operator": "lte",
+                    "value_number": 4.0,
+                },
+            ],
+            "composition": "all",
+            "null_policy": "exclude",
+            "reason": "Explicit allowlist and numeric threshold.",
+        }
+        filtered = self.executor("ba.business_rule_filter", config).transform(
+            table,
+            configuration=config,
+        )
+        self.assertEqual(filtered.column("status").to_pylist(), ["completed", "pending"])
+
+        null_config = {
+            "predicates": [{"column": "status", "operator": "is_null"}],
+            "composition": "all",
+            "null_policy": "exclude",
+            "reason": "Select rows with a missing status for review.",
+        }
+        null_rows = self.executor("ba.business_rule_filter", null_config).transform(
+            table,
+            configuration=null_config,
+        )
+        self.assertEqual(null_rows.column("status").to_pylist(), [None])
+
+    def test_filter_membership_preserves_unknown_nulls_for_explicit_null_policy(self):
+        table = pa.table(
+            {"status": pa.array(["completed", None, "pending"], type=pa.string())}
+        )
+        for operator, include_expected, exclude_expected in (
+            ("in", ["completed", None], ["completed"]),
+            ("not_in", [None, "pending"], ["pending"]),
+        ):
+            base_config = {
+                "predicates": [
+                    {
+                        "column": "status",
+                        "operator": operator,
+                        "values_string": ["completed"],
+                    }
+                ],
+                "composition": "all",
+                "reason": "Apply an explicit membership condition.",
+            }
+            include_config = {**base_config, "null_policy": "include"}
+            include_result = self.executor(
+                "ba.business_rule_filter",
+                include_config,
+            ).transform(table, configuration=include_config)
+            self.assertEqual(
+                include_result.column("status").to_pylist(),
+                include_expected,
+            )
+            self.assertEqual(
+                self.latest_trace(include_result)["summary"][
+                    "rows_requiring_review"
+                ],
+                1,
+            )
+
+            exclude_config = {**base_config, "null_policy": "exclude"}
+            exclude_result = self.executor(
+                "ba.business_rule_filter",
+                exclude_config,
+            ).transform(table, configuration=exclude_config)
+            self.assertEqual(
+                exclude_result.column("status").to_pylist(),
+                exclude_expected,
+            )
+
+    def test_filter_rejects_bad_predicates_types_and_empty_input_safely(self):
+        table = pa.table({"status": ["completed"], "amount": [1]})
+        invalid_configs = (
+            {
+                "predicates": [],
+                "composition": "all",
+                "null_policy": "exclude",
+                "reason": "No predicates.",
+            },
+            {
+                "predicates": [
+                    {"column": "missing", "operator": "eq", "value_string": "x"}
+                ],
+                "composition": "all",
+                "null_policy": "exclude",
+                "reason": "Unknown column.",
+            },
+            {
+                "predicates": [
+                    {"column": "amount", "operator": "eq", "value_string": "1"}
+                ],
+                "composition": "all",
+                "null_policy": "exclude",
+                "reason": "Wrong comparison type.",
+            },
+            {
+                "predicates": [
+                    {"column": "amount", "operator": "gt", "value_number": 1.5}
+                ],
+                "composition": "all",
+                "null_policy": "exclude",
+                "reason": "Non-integral threshold for integer field.",
+            },
+        )
+        for configuration in invalid_configs:
+            with self.subTest(configuration=configuration):
+                executor = self.executor(
+                    "ba.business_rule_filter",
+                    configuration,
+                )
+                with self.assertRaises(TransformationRegistryError):
+                    executor.transform(table, configuration=configuration)
+
+        empty = pa.table(
+            {
+                "status": pa.array([], type=pa.string()),
+                "amount": pa.array([], type=pa.float64()),
+            }
+        )
+        valid_config = {
+            "predicates": [{"column": "status", "operator": "is_not_null"}],
+            "composition": "all",
+            "null_policy": "exclude",
+            "reason": "Keep known statuses.",
+        }
+        result = self.executor(
+            "ba.business_rule_filter",
+            valid_config,
+        ).transform(empty, configuration=valid_config)
+        self.assertEqual(result.num_rows, 0)
+        self.assertEqual(self.latest_trace(result)["summary"]["rows_filtered"], 0)
+
+    def test_category_mapping_preserves_unmapped_and_null_values_without_leaking_values(self):
+        table = pa.table(
+            {
+                "category": pa.array(
+                    ["Retail", "Wholesale", "Other", None],
+                    type=pa.string(),
+                ),
+                "amount": [100, 200, 300, 400],
+            }
+        )
+        config = {
+            "column": "category",
+            "mappings": [
+                {"from": "Retail", "to": "Consumer"},
+                {"from": "Wholesale", "to": "Trade"},
+            ],
+        }
+        executor = self.executor("ba.category_mapping", config)
+        result = executor.transform(table, configuration=config)
+        self.assertEqual(
+            result.column("category").to_pylist(),
+            ["Consumer", "Trade", "Other", None],
+        )
+        trace = self.latest_trace(result)
+        self.assertEqual(trace["summary"]["rows_mapped"], 2)
+        self.assertEqual(
+            trace["summary"]["rows_unmapped_preserved_or_replaced"],
+            1,
+        )
+        self.assertEqual(trace["summary"]["rows_null_preserved_or_replaced"], 1)
+        self.assertNotIn("Retail", json.dumps(trace))
+        self.assertNotIn("Consumer", json.dumps(trace))
+        self.assertEqual(table.column("category").to_pylist(), ["Retail", "Wholesale", "Other", None])
+
+    def test_category_mapping_explicit_unknown_and_null_policies(self):
+        table = pa.table(
+            {"category": pa.array(["Retail", "Other", None], type=pa.string())}
+        )
+        config = {
+            "column": "category",
+            "mappings": [{"from": "Retail", "to": "Consumer"}],
+            "unmapped_policy": "constant",
+            "unknown_value": "Unclassified",
+            "null_policy": "constant",
+            "null_value": "Missing",
+        }
+        result = self.executor("ba.category_mapping", config).transform(
+            table,
+            configuration=config,
+        )
+        self.assertEqual(
+            result.column("category").to_pylist(),
+            ["Consumer", "Unclassified", "Missing"],
+        )
+
+        for policy_config, error in (
+            (
+                {
+                    "column": "category",
+                    "mappings": [{"from": "Retail", "to": "Consumer"}],
+                    "unmapped_policy": "error",
+                },
+                "unmapped rows",
+            ),
+            (
+                {
+                    "column": "category",
+                    "mappings": [{"from": "Retail", "to": "Consumer"}],
+                    "null_policy": "error",
+                },
+                "null rows",
+            ),
+            (
+                {
+                    "column": "category",
+                    "mappings": [{"from": "Retail", "to": "Consumer"}],
+                    "unmapped_policy": "constant",
+                },
+                "requires unknown_value",
+            ),
+        ):
+            executor = self.executor("ba.category_mapping", policy_config)
+            with self.assertRaisesRegex(TransformationRegistryError, error):
+                executor.transform(table, configuration=policy_config)
+
+    def test_category_mapping_rejects_conflicts_missing_columns_and_types(self):
+        table = pa.table({"category": ["Retail", "Retail"], "amount": [1, 2]})
+        duplicate_sources = {
+            "column": "category",
+            "mappings": [
+                {"from": "Retail", "to": "Consumer"},
+                {"from": "Retail", "to": "Retail"},
+            ],
+        }
+        executor = self.executor("ba.category_mapping", duplicate_sources)
+        with self.assertRaisesRegex(TransformationRegistryError, "duplicate or conflicting"):
+            executor.fit(table, configuration=duplicate_sources)
+
+        for column, error in (("absent", "not found"), ("amount", "string type")):
+            config = {
+                "column": column,
+                "mappings": [{"from": "Retail", "to": "Consumer"}],
+            }
+            executor = self.executor("ba.category_mapping", config)
+            with self.assertRaisesRegex(TransformationRegistryError, error):
+                executor.transform(table, configuration=config)
+
+        empty_mapping = {"column": "category", "mappings": []}
+        executor = self.executor("ba.category_mapping", empty_mapping)
+        with self.assertRaisesRegex(TransformationRegistryError, "at least one"):
+            executor.transform(table, configuration=empty_mapping)
+
+    def test_derived_metric_uses_safe_arithmetic_and_records_formula_metadata(self):
+        table = pa.table(
+            {
+                "order_id": ["O001", "O002", "O003"],
+                "gross_revenue": [100.0, 0.0, 200.0],
+                "discount": pa.array([10.0, 0.0, None], type=pa.float64()),
+            }
+        )
+        config = {
+            "left_column": "gross_revenue",
+            "operator": "subtract",
+            "right_column": "discount",
+            "output_column": "net_revenue",
+        }
+        executor = self.executor("ba.derived_business_metric", config)
+        executor.fit(table, configuration=config)
+        first = executor.transform(table, configuration=config)
+        second = executor.transform(table, configuration=config)
+        self.assertEqual(
+            first.column("net_revenue").to_pylist(),
+            [90.0, 0.0, None],
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first.num_rows, table.num_rows)
+        self.assertEqual(
+            first.column_names,
+            ["order_id", "gross_revenue", "discount", "net_revenue"],
+        )
+        self.assertEqual(
+            self.latest_trace(first)["summary"]["formula"],
+            {
+                "left_column": "gross_revenue",
+                "operator": "subtract",
+                "right_column": "discount",
+                "output_column": "net_revenue",
+            },
+        )
+        self.assertEqual(table.column_names, ["order_id", "gross_revenue", "discount"])
+
+    def test_derived_metric_divide_by_zero_null_and_error_policies(self):
+        table = pa.table(
+            {
+                "profit": [10.0, 20.0, None],
+                "revenue": [2.0, 0.0, 5.0],
+            }
+        )
+        config = {
+            "left_column": "profit",
+            "operator": "divide",
+            "right_column": "revenue",
+            "output_column": "margin",
+            "divide_by_zero": "null",
+        }
+        result = self.executor("ba.derived_business_metric", config).transform(
+            table,
+            configuration=config,
+        )
+        self.assertEqual(result.column("margin").to_pylist(), [5.0, None, None])
+        self.assertEqual(
+            self.latest_trace(result)["summary"]["null_result_count"],
+            2,
+        )
+
+        config["divide_by_zero"] = "error"
+        executor = self.executor("ba.derived_business_metric", config)
+        with self.assertRaisesRegex(TransformationRegistryError, "zero denominators"):
+            executor.transform(table, configuration=config)
+
+    def test_derived_metric_validates_columns_types_collisions_and_empty_data(self):
+        table = pa.table({"left": [1.0], "right": ["2"], "metric": [7.0]})
+        for config, error in (
+            (
+                {
+                    "left_column": "absent",
+                    "operator": "add",
+                    "right_column": "right",
+                    "output_column": "new_metric",
+                },
+                "not found",
+            ),
+            (
+                {
+                    "left_column": "left",
+                    "operator": "add",
+                    "right_column": "right",
+                    "output_column": "new_metric",
+                },
+                "integer or floating",
+            ),
+            (
+                {
+                    "left_column": "left",
+                    "operator": "add",
+                    "right_column": "left",
+                    "output_column": "metric",
+                },
+                "already exists",
+            ),
+        ):
+            executor = self.executor("ba.derived_business_metric", config)
+            with self.assertRaisesRegex(TransformationRegistryError, error):
+                executor.transform(table, configuration=config)
+
+        empty = pa.table(
+            {
+                "left": pa.array([], type=pa.float64()),
+                "right": pa.array([], type=pa.float64()),
+            }
+        )
+        config = {
+            "left_column": "left",
+            "operator": "multiply",
+            "right_column": "right",
+            "output_column": "product",
+        }
+        result = self.executor("ba.derived_business_metric", config).transform(
+            empty,
+            configuration=config,
+        )
+        self.assertEqual(result.num_rows, 0)
+        self.assertEqual(result.schema.field("product").type, pa.float64())
+
+    def test_business_validation_reports_without_removing_or_rewriting_rows(self):
+        table = pa.table(
+            {
+                "status": pa.array(
+                    ["completed", "other", "", None],
+                    type=pa.string(),
+                ),
+                "amount": pa.array([10.0, -1.0, 5.0, None], type=pa.float64()),
+                "discount": pa.array([2.0, 3.0, 8.0, 1.0], type=pa.float64()),
+            }
+        )
+        original = table
+        config = {
+            "empty_strings_are_missing": True,
+            "rules": [
+                {"column": "status", "check": "required"},
+                {
+                    "column": "status",
+                    "check": "allowed_values",
+                    "values": ["completed", "pending"],
+                },
+                {
+                    "column": "amount",
+                    "check": "numeric_range",
+                    "minimum": 0.0,
+                    "maximum": 100.0,
+                },
+                {
+                    "column": "discount",
+                    "check": "less_or_equal",
+                    "other_column": "amount",
+                },
+            ],
+        }
+        executor = self.executor("ba.business_rule_validation", config)
+        result = executor.transform(table, configuration=config)
+        trace = self.latest_trace(result)
+        self.assertEqual(trace["summary"]["rows_checked"], 4)
+        self.assertFalse(trace["summary"]["data_modified"])
+        self.assertEqual(result.num_rows, table.num_rows)
+        self.assertEqual(result.column_names, table.column_names)
+        self.assertEqual(result.column("status").to_pylist(), original.column("status").to_pylist())
+        findings = trace["summary"]["validation_results"]
+        self.assertEqual(
+            [(item["check"], item["affected_count"], item["review_count"]) for item in findings],
+            [
+                ("required", 2, 0),
+                ("allowed_values", 1, 2),
+                ("numeric_range", 1, 1),
+                ("less_or_equal", 2, 1),
+            ],
+        )
+
+    def test_business_validation_handles_empty_input_and_rejects_invalid_rules(self):
+        empty = pa.table(
+            {
+                "status": pa.array([], type=pa.string()),
+                "amount": pa.array([], type=pa.float64()),
+            }
+        )
+        empty_config = {"rules": [{"column": "status", "check": "required"}]}
+        result = self.executor("ba.business_rule_validation", empty_config).transform(
+            empty,
+            configuration=empty_config,
+        )
+        self.assertEqual(self.latest_trace(result)["summary"]["rows_checked"], 0)
+
+        table = pa.table({"status": ["completed"], "amount": [1.0]})
+        invalid_configs = (
+            {"rules": []},
+            {"rules": [{"column": "absent", "check": "required"}]},
+            {"rules": [{"column": "amount", "check": "allowed_values", "values": ["1"]}]},
+            {"rules": [{"column": "status", "check": "numeric_range", "minimum": 0}]},
+            {"rules": [{"column": "amount", "check": "numeric_range"}]},
+            {"rules": [{"column": "amount", "check": "less_than", "other_column": "absent"}]},
+            {"rules": [{"column": "status", "check": "less_than", "other_column": "amount"}]},
+        )
+        for config in invalid_configs:
+            with self.subTest(configuration=config):
+                executor = self.executor("ba.business_rule_validation", config)
+                with self.assertRaises(TransformationRegistryError):
+                    executor.transform(table, configuration=config)
+
+    def test_ba_metadata_lineage_is_bounded_and_existing_metadata_is_preserved(self):
+        table = pa.table(
+            {"status": ["pending"]},
+            schema=pa.schema(
+                [pa.field("status", pa.string())],
+                metadata={b"source": b"fixture"},
+            ),
+        )
+        config = {
+            "predicates": [
+                {"column": "status", "operator": "is_not_null"}
+            ],
+            "composition": "all",
+            "null_policy": "exclude",
+            "reason": "Check a known status.",
+        }
+        first = self.executor("ba.business_rule_filter", config).transform(
+            table,
+            configuration=config,
+        )
+        second = self.executor("ba.business_rule_filter", config).transform(
+            first,
+            configuration=config,
+        )
+        self.assertEqual(second.schema.metadata[b"source"], b"fixture")
+        self.assertEqual(len(json.loads(second.schema.metadata[b"insightos.transformation_lineage"])), 2)
+        full_lineage = [
+            {
+                "operation_id": "ba.business_rule_filter",
+                "version": "1",
+                "configuration_sha256": "a" * 64,
+                "summary": {},
+            }
+            for _ in range(32)
+        ]
+        metadata_table = table.replace_schema_metadata(
+            {
+                **table.schema.metadata,
+                b"insightos.transformation_lineage": json.dumps(full_lineage).encode(),
+            }
+        )
+        with self.assertRaisesRegex(TransformationRegistryError, "exceeds 32"):
+            self.executor("ba.business_rule_filter", config).transform(
+                metadata_table,
+                configuration=config,
+            )
+
 
 class TransformationRegistryContractTests(unittest.TestCase):
     def test_discovery_is_deterministic_and_filterable(self):

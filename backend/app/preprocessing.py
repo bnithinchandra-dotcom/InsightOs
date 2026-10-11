@@ -63,6 +63,7 @@ class TransformationOperation:
     required_approvals: tuple[str, ...]
     resource_limits: dict[str, int]
     catalog_reference: str | None = None
+    changes_metadata: bool = False
 
 
 @dataclass(frozen=True)
@@ -104,11 +105,13 @@ def _validate_operation(operation: TransformationOperation) -> None:
         or not isinstance(operation.changes_rows, bool)
         or not isinstance(operation.changes_columns, bool)
         or not isinstance(operation.changes_values, bool)
+        or not isinstance(operation.changes_metadata, bool)
         or not any(
             (
                 operation.changes_rows,
                 operation.changes_columns,
                 operation.changes_values,
+                operation.changes_metadata,
             )
         )
     ):
@@ -212,11 +215,11 @@ def _columns_schema():
     }
 
 
-def _object_schema(properties):
+def _object_schema(properties, required=()):
     return {
         "type": "object",
         "properties": properties,
-        "required": [],
+        "required": list(required),
         "additionalProperties": False,
     }
 
@@ -272,6 +275,137 @@ _NUMERIC_SCALING_SCHEMA = _object_schema(
         "feature_max": {"type": "number"},
     }
 )
+_PREDICATE_SCHEMA = _object_schema(
+    {
+        "column": {"type": "string", "minLength": 1},
+        "operator": {
+            "type": "string",
+            "enum": [
+                "eq",
+                "ne",
+                "in",
+                "not_in",
+                "gt",
+                "gte",
+                "lt",
+                "lte",
+                "is_null",
+                "is_not_null",
+            ],
+        },
+        "value_string": {"type": "string"},
+        "value_number": {"type": "number"},
+        "value_boolean": {"type": "boolean"},
+        "values_string": {
+            "type": "array",
+            "maxItems": 256,
+            "uniqueItems": True,
+            "items": {"type": "string"},
+        },
+        "values_number": {
+            "type": "array",
+            "maxItems": 256,
+            "uniqueItems": True,
+            "items": {"type": "number"},
+        },
+        "values_boolean": {
+            "type": "array",
+            "maxItems": 2,
+            "uniqueItems": True,
+            "items": {"type": "boolean"},
+        },
+    },
+    ("column", "operator"),
+)
+_BUSINESS_FILTER_SCHEMA = _object_schema(
+    {
+        "predicates": {
+            "type": "array",
+            "minItems": 0,
+            "maxItems": 64,
+            "items": _PREDICATE_SCHEMA,
+        },
+        "composition": {"type": "string", "enum": ["all", "any"]},
+        "null_policy": {"type": "string", "enum": ["exclude", "include"]},
+        "reason": {"type": "string", "minLength": 1},
+    },
+)
+_CATEGORY_MAPPING_SCHEMA = _object_schema(
+    {
+        "column": {"type": "string", "minLength": 1},
+        "mappings": {
+            "type": "array",
+            "minItems": 0,
+            "maxItems": 256,
+            "items": _object_schema(
+                {
+                    "from": {"type": "string"},
+                    "to": {"type": "string"},
+                },
+                ("from", "to"),
+            ),
+        },
+        "unmapped_policy": {
+            "type": "string",
+            "enum": ["preserve", "constant", "error"],
+        },
+        "unknown_value": {"type": "string"},
+        "null_policy": {"type": "string", "enum": ["preserve", "constant", "error"]},
+        "null_value": {"type": "string"},
+    },
+)
+_DERIVED_METRIC_SCHEMA = _object_schema(
+    {
+        "left_column": {"type": "string", "minLength": 1},
+        "operator": {
+            "type": "string",
+            "enum": ["add", "subtract", "multiply", "divide"],
+        },
+        "right_column": {"type": "string", "minLength": 1},
+        "output_column": {"type": "string", "minLength": 1},
+        "divide_by_zero": {"type": "string", "enum": ["error", "null"]},
+    },
+)
+_VALIDATION_RULE_SCHEMA = _object_schema(
+    {
+        "column": {"type": "string", "minLength": 1},
+        "check": {
+            "type": "string",
+            "enum": [
+                "required",
+                "allowed_values",
+                "numeric_range",
+                "less_than",
+                "less_or_equal",
+                "greater_than",
+                "greater_or_equal",
+                "equals_column",
+            ],
+        },
+        "values": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 256,
+            "uniqueItems": True,
+            "items": {"type": "string"},
+        },
+        "minimum": {"type": "number"},
+        "maximum": {"type": "number"},
+        "other_column": {"type": "string", "minLength": 1},
+    },
+    ("column", "check"),
+)
+_BUSINESS_VALIDATION_SCHEMA = _object_schema(
+    {
+        "rules": {
+            "type": "array",
+            "minItems": 0,
+            "maxItems": 64,
+            "items": _VALIDATION_RULE_SCHEMA,
+        },
+        "empty_strings_are_missing": {"type": "boolean"},
+    },
+)
 
 
 def _operation_configuration(
@@ -320,11 +454,45 @@ def _operation_configuration(
         raise TransformationRegistryError(
             "Transformation column names must be no longer than 512 characters."
         )
-    if len(resolved.get("constant_string", "")) > _MAX_TEXT_LENGTH:
+    if not _configuration_strings_are_bounded(resolved):
         raise TransformationRegistryError(
-            "String imputation constants must be no longer than 512 characters."
+            "Transformation text fields must not exceed 512 characters."
         )
     return resolved
+
+
+def _configuration_strings_are_bounded(value, depth: int = 0) -> bool:
+    if depth > 8:
+        return False
+    if isinstance(value, str):
+        return len(value) <= _MAX_TEXT_LENGTH
+    if isinstance(value, list):
+        return all(
+            _configuration_strings_are_bounded(item, depth + 1)
+            for item in value
+        )
+    if isinstance(value, dict):
+        return all(
+            isinstance(key, str)
+            and len(key) <= _MAX_TEXT_LENGTH
+            and _configuration_strings_are_bounded(item, depth + 1)
+            for key, item in value.items()
+        )
+    return True
+
+
+def _require_configuration_fields(
+    configuration: dict,
+    required: tuple[str, ...],
+    operation: str,
+) -> None:
+    missing = [key for key in required if key not in configuration]
+    if missing:
+        raise TransformationRegistryError(
+            f"{operation} configuration is missing required fields: "
+            + ", ".join(missing)
+            + "."
+        )
 
 
 def _validate_table(
@@ -333,7 +501,7 @@ def _validate_table(
 ) -> pa.Table:
     if not isinstance(data, pa.Table):
         raise TransformationRegistryError(
-            "DA transformations require a PyArrow Table."
+            "Transformations require a PyArrow Table."
         )
     limits = operation.resource_limits
     if (
@@ -407,6 +575,57 @@ def _configuration_fingerprint(configuration: dict) -> str:
             "Transformation configuration cannot be represented safely."
         ) from error
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _attach_transformation_metadata(
+    data: pa.Table,
+    operation: TransformationOperation,
+    configuration: dict,
+    summary: dict,
+) -> pa.Table:
+    _validate_table(data, operation)
+    metadata = dict(data.schema.metadata or {})
+    lineage_key = b"insightos.transformation_lineage"
+    previous = metadata.get(lineage_key)
+    if previous is None:
+        lineage = []
+    else:
+        try:
+            lineage = json.loads(previous.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise TransformationRegistryError(
+                "Existing transformation lineage metadata is invalid."
+            ) from error
+        if not isinstance(lineage, list) or len(lineage) >= 32:
+            raise TransformationRegistryError(
+                "Transformation lineage is invalid or exceeds 32 operations."
+            )
+    lineage.append(
+        {
+            "operation_id": operation.operation_id,
+            "version": operation.version,
+            "configuration_sha256": _configuration_fingerprint(configuration),
+            "summary": summary,
+        }
+    )
+    try:
+        encoded = json.dumps(
+            lineage,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError, RecursionError) as error:
+        raise TransformationRegistryError(
+            "Transformation summary cannot be represented safely."
+        ) from error
+    if len(encoded) > 16 * 1024:
+        raise TransformationRegistryError(
+            "Transformation lineage metadata exceeds its 16 KiB limit."
+        )
+    metadata[lineage_key] = encoded
+    return data.replace_schema_metadata(metadata)
 
 
 def _fitted_context(
@@ -1129,6 +1348,737 @@ class _NumericScaling:
         return output
 
 
+class _BusinessRuleFilter:
+    operation: TransformationOperation
+
+    def fit(
+        self,
+        data: Any,
+        *,
+        configuration: dict,
+        context: dict | None = None,
+    ) -> None:
+        _ = context
+        table = _validate_table(data, self.operation)
+        resolved = _operation_configuration(self.operation, configuration)
+        self._evaluate(table, resolved, return_masks=False)
+        return None
+
+    def transform(
+        self,
+        data: Any,
+        *,
+        configuration: dict,
+        context: dict | None = None,
+    ) -> pa.Table:
+        _ = context
+        table = _validate_table(data, self.operation)
+        resolved = _operation_configuration(self.operation, configuration)
+        keep, review = self._evaluate(table, resolved, return_masks=True)
+        if resolved["null_policy"] == "include":
+            keep = pc.fill_null(keep, True)
+        else:
+            keep = pc.fill_null(keep, False)
+        output = table.filter(keep)
+        retained = output.num_rows
+        summary = {
+            "rows_before": table.num_rows,
+            "rows_retained": retained,
+            "rows_filtered": table.num_rows - retained,
+            "rows_requiring_review": pc.sum(
+                pc.cast(review, pa.int64())
+            ).as_py() or 0,
+            "reason": resolved["reason"],
+            "composition": resolved["composition"],
+            "null_policy": resolved["null_policy"],
+            "affected_columns": sorted(
+                {predicate["column"] for predicate in resolved["predicates"]}
+            ),
+        }
+        return _attach_transformation_metadata(
+            output,
+            self.operation,
+            resolved,
+            summary,
+        )
+
+    def _evaluate(
+        self,
+        table: pa.Table,
+        configuration: dict,
+        *,
+        return_masks: bool,
+    ):
+        _require_configuration_fields(
+            configuration,
+            ("predicates", "composition", "null_policy", "reason"),
+            "Business filter",
+        )
+        predicates = configuration["predicates"]
+        if (
+            not predicates
+            or configuration["composition"] not in {"all", "any"}
+            or configuration["null_policy"] not in {"exclude", "include"}
+            or not configuration["reason"].strip()
+        ):
+            raise TransformationRegistryError(
+                "Business filters need a valid composition, null policy, and reason."
+            )
+        result = (
+            pa.array([True] * table.num_rows, type=pa.bool_())
+            if configuration["composition"] == "all"
+            else pa.array([False] * table.num_rows, type=pa.bool_())
+        )
+        for predicate in predicates:
+            mask = self._predicate_mask(table, predicate)
+            result = (
+                pc.and_kleene(result, mask)
+                if configuration["composition"] == "all"
+                else pc.or_kleene(result, mask)
+            )
+        if return_masks:
+            return result, pc.is_null(result)
+        return None
+
+    @staticmethod
+    def _predicate_value(predicate: dict, field: pa.Field):
+        operator = predicate["operator"]
+        if operator in {"is_null", "is_not_null"}:
+            value_keys = {
+                "value_string",
+                "value_number",
+                "value_boolean",
+                "values_string",
+                "values_number",
+                "values_boolean",
+            }
+            if value_keys.intersection(predicate):
+                raise TransformationRegistryError(
+                    f"{operator} does not accept comparison values."
+                )
+            return None
+
+        if operator in {"in", "not_in"}:
+            choices = [
+                (key, predicate[key])
+                for key in ("values_string", "values_number", "values_boolean")
+                if key in predicate
+            ]
+            if len(choices) != 1 or not choices[0][1]:
+                raise TransformationRegistryError(
+                    f"{operator} requires exactly one non-empty typed values list."
+                )
+            key, values = choices[0]
+            expected = {
+                "values_string": _is_string_type(field.type),
+                "values_number": _is_numeric_type(field.type),
+                "values_boolean": pa.types.is_boolean(field.type),
+            }[key]
+            if not expected:
+                raise TransformationRegistryError(
+                    f"{operator} values are incompatible with column {field.name!r}."
+                )
+            return [
+                _coerce_predicate_scalar(value, field)
+                for value in values
+            ]
+
+        choices = [
+            (key, predicate[key])
+            for key in ("value_string", "value_number", "value_boolean")
+            if key in predicate
+        ]
+        if len(choices) != 1:
+            raise TransformationRegistryError(
+                f"{operator} requires exactly one typed comparison value."
+            )
+        key, value = choices[0]
+        expected = (
+            key == "value_string" and _is_string_type(field.type)
+            or key == "value_number" and _is_numeric_type(field.type)
+            or key == "value_boolean" and pa.types.is_boolean(field.type)
+        )
+        if not expected:
+            raise TransformationRegistryError(
+                f"Comparison value is incompatible with column {field.name!r}."
+            )
+        return _coerce_predicate_scalar(value, field)
+
+    @classmethod
+    def _predicate_mask(
+        cls,
+        table: pa.Table,
+        predicate: dict,
+    ) -> pa.Array | pa.ChunkedArray:
+        if not isinstance(predicate, dict):
+            raise TransformationRegistryError(
+                "Business filter predicates must be objects."
+            )
+        operator = predicate.get("operator")
+        allowed_fields = {
+            "eq": {"column", "operator", "value_string", "value_number", "value_boolean"},
+            "ne": {"column", "operator", "value_string", "value_number", "value_boolean"},
+            "gt": {"column", "operator", "value_number"},
+            "gte": {"column", "operator", "value_number"},
+            "lt": {"column", "operator", "value_number"},
+            "lte": {"column", "operator", "value_number"},
+            "in": {"column", "operator", "values_string", "values_number", "values_boolean"},
+            "not_in": {"column", "operator", "values_string", "values_number", "values_boolean"},
+            "is_null": {"column", "operator"},
+            "is_not_null": {"column", "operator"},
+        }.get(operator)
+        if allowed_fields is None or set(predicate) - allowed_fields:
+            raise TransformationRegistryError(
+                f"Business filter predicate {operator!r} has unsupported fields."
+            )
+        index = table.schema.get_field_index(predicate.get("column"))
+        if index < 0:
+            raise TransformationRegistryError(
+                f"Business filter column {predicate.get('column')!r} was not found."
+            )
+        field = table.schema.field(index)
+        values = table.column(index)
+        comparison = cls._predicate_value(predicate, field)
+        if operator == "is_null":
+            return pc.is_null(values)
+        if operator == "is_not_null":
+            return pc.is_valid(values)
+        if operator in {"gt", "gte", "lt", "lte"} and not _is_numeric_type(
+            field.type
+        ):
+            raise TransformationRegistryError(
+                f"{operator} comparisons require a numeric column."
+            )
+        if operator in {"in", "not_in"}:
+            mask = pc.is_in(
+                values,
+                value_set=pa.array(comparison, type=field.type),
+            )
+            if operator == "not_in":
+                mask = pc.invert(mask)
+            return pc.if_else(
+                pc.is_null(values),
+                pa.scalar(None, type=pa.bool_()),
+                mask,
+            )
+        functions = {
+            "eq": pc.equal,
+            "ne": pc.not_equal,
+            "gt": pc.greater,
+            "gte": pc.greater_equal,
+            "lt": pc.less,
+            "lte": pc.less_equal,
+        }
+        if operator not in functions:
+            raise TransformationRegistryError(
+                f"Unsupported business filter operator {operator!r}."
+            )
+        return functions[operator](values, comparison)
+
+
+def _coerce_predicate_scalar(value, field: pa.Field) -> pa.Scalar:
+    if _is_numeric_type(field.type):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TransformationRegistryError(
+                f"Comparison value for {field.name!r} must be numeric."
+            )
+        if not math.isfinite(value):
+            raise TransformationRegistryError(
+                f"Comparison value for {field.name!r} must be finite."
+            )
+        if pa.types.is_integer(field.type):
+            if not float(value).is_integer():
+                raise TransformationRegistryError(
+                    f"Comparison value for integer column {field.name!r} must be integral."
+                )
+            value = int(value)
+    try:
+        return pa.scalar(value, type=field.type)
+    except (pa.ArrowException, OverflowError, TypeError, ValueError) as error:
+        raise TransformationRegistryError(
+            f"Comparison value cannot be represented by column {field.name!r}."
+        ) from error
+
+
+class _CategoryMapping:
+    operation: TransformationOperation
+
+    def fit(
+        self,
+        data: Any,
+        *,
+        configuration: dict,
+        context: dict | None = None,
+    ) -> None:
+        _ = context
+        table = _validate_table(data, self.operation)
+        resolved = _operation_configuration(self.operation, configuration)
+        self._mapping(table, resolved)
+        return None
+
+    def transform(
+        self,
+        data: Any,
+        *,
+        configuration: dict,
+        context: dict | None = None,
+    ) -> pa.Table:
+        _ = context
+        table = _validate_table(data, self.operation)
+        resolved = _operation_configuration(self.operation, configuration)
+        index, mapping = self._mapping(table, resolved)
+        if resolved["unmapped_policy"] not in {"preserve", "constant", "error"}:
+            raise TransformationRegistryError("Unknown unmapped category policy.")
+        if resolved["null_policy"] not in {"preserve", "constant", "error"}:
+            raise TransformationRegistryError("Unknown null category policy.")
+        if (
+            resolved["unmapped_policy"] == "constant"
+            and "unknown_value" not in resolved
+        ):
+            raise TransformationRegistryError(
+                "The constant unmapped policy requires unknown_value."
+            )
+        if (
+            resolved["unmapped_policy"] != "constant"
+            and "unknown_value" in resolved
+        ):
+            raise TransformationRegistryError(
+                "unknown_value is valid only with the constant unmapped policy."
+            )
+        if (
+            resolved["null_policy"] == "constant"
+            and "null_value" not in resolved
+        ):
+            raise TransformationRegistryError(
+                "The constant null policy requires null_value."
+            )
+        if (
+            resolved["null_policy"] != "constant"
+            and "null_value" in resolved
+        ):
+            raise TransformationRegistryError(
+                "null_value is valid only with the constant null policy."
+            )
+        field = table.schema.field(index)
+        source_values = table.column(index).to_pylist()
+        null_count = sum(value is None for value in source_values)
+        unmapped_count = sum(
+            value is not None and value not in mapping
+            for value in source_values
+        )
+        if resolved["unmapped_policy"] == "error" and unmapped_count:
+            raise TransformationRegistryError(
+                f"Category mapping encountered {unmapped_count} unmapped rows."
+            )
+        if resolved["null_policy"] == "error" and null_count:
+            raise TransformationRegistryError(
+                f"Category mapping encountered {null_count} null rows."
+            )
+        mapped_values = []
+        for value in source_values:
+            if value is None:
+                mapped_values.append(
+                    resolved.get("null_value")
+                    if resolved["null_policy"] == "constant"
+                    else None
+                )
+            elif value in mapping:
+                mapped_values.append(mapping[value])
+            elif resolved["unmapped_policy"] == "constant":
+                mapped_values.append(resolved["unknown_value"])
+            else:
+                mapped_values.append(value)
+        output = _replace_column(
+            table,
+            index,
+            pa.array(mapped_values, type=pa.string()),
+            value_type=pa.string(),
+        )
+        summary = {
+            "affected_columns": [field.name],
+            "rows_total": table.num_rows,
+            "rows_mapped": table.num_rows - unmapped_count - null_count,
+            "rows_unmapped_preserved_or_replaced": unmapped_count,
+            "rows_null_preserved_or_replaced": null_count,
+            "unmapped_policy": resolved["unmapped_policy"],
+            "null_policy": resolved["null_policy"],
+        }
+        return _attach_transformation_metadata(
+            output,
+            self.operation,
+            resolved,
+            summary,
+        )
+
+    @staticmethod
+    def _mapping(table: pa.Table, configuration: dict) -> tuple[int, dict[str, str]]:
+        _require_configuration_fields(
+            configuration,
+            ("column", "mappings"),
+            "Category mapping",
+        )
+        if not configuration["mappings"]:
+            raise TransformationRegistryError(
+                "Category mapping needs at least one explicit mapping."
+            )
+        column = configuration["column"]
+        index = table.schema.get_field_index(column)
+        if index < 0:
+            raise TransformationRegistryError(
+                f"Category mapping column {column!r} was not found."
+            )
+        if not _is_string_type(table.schema.field(index).type):
+            raise TransformationRegistryError(
+                f"Category mapping column {column!r} must have a string type."
+            )
+        mapping = {}
+        for pair in configuration["mappings"]:
+            if set(pair) != {"from", "to"}:
+                raise TransformationRegistryError(
+                    "Each category mapping must define exactly from and to values."
+                )
+            source = pair["from"]
+            if source in mapping:
+                raise TransformationRegistryError(
+                    f"Category mapping contains a duplicate or conflicting source value for {column!r}."
+                )
+            mapping[source] = pair["to"]
+        return index, mapping
+
+
+class _DerivedBusinessMetric:
+    operation: TransformationOperation
+
+    def fit(
+        self,
+        data: Any,
+        *,
+        configuration: dict,
+        context: dict | None = None,
+    ) -> None:
+        _ = context
+        table = _validate_table(data, self.operation)
+        resolved = _operation_configuration(self.operation, configuration)
+        self._columns(table, resolved)
+        return None
+
+    def transform(
+        self,
+        data: Any,
+        *,
+        configuration: dict,
+        context: dict | None = None,
+    ) -> pa.Table:
+        _ = context
+        table = _validate_table(data, self.operation)
+        resolved = _operation_configuration(self.operation, configuration)
+        left_index, right_index = self._columns(table, resolved)
+        output_name = resolved["output_column"]
+        if len(output_name) > _MAX_TEXT_LENGTH or not output_name.strip():
+            raise TransformationRegistryError(
+                "Derived metric output_column must be non-empty and no longer than 512 characters."
+            )
+        if table.schema.get_field_index(output_name) >= 0:
+            raise TransformationRegistryError(
+                f"Derived metric output column {output_name!r} already exists; source columns are never overwritten."
+            )
+        left_field = table.schema.field(left_index)
+        right_field = table.schema.field(right_index)
+        _require_numeric_column(left_field, table.column(left_index))
+        _require_numeric_column(right_field, table.column(right_index))
+        left = pc.cast(table.column(left_index), pa.float64())
+        right = pc.cast(table.column(right_index), pa.float64())
+        operator = resolved["operator"]
+        if operator == "add":
+            result = pc.add(left, right)
+        elif operator == "subtract":
+            result = pc.subtract(left, right)
+        elif operator == "multiply":
+            result = pc.multiply(left, right)
+        elif operator == "divide":
+            zero_denominator = pc.equal(right, 0.0)
+            zero_count = pc.sum(pc.cast(zero_denominator, pa.int64())).as_py() or 0
+            if zero_count and resolved["divide_by_zero"] == "error":
+                raise TransformationRegistryError(
+                    f"Derived metric division encountered {zero_count} zero denominators."
+                )
+            result = pc.divide(left, right)
+            result = pc.if_else(
+                zero_denominator,
+                pa.scalar(None, type=pa.float64()),
+                result,
+            )
+        else:
+            raise TransformationRegistryError(
+                f"Unsupported metric operator {operator!r}."
+            )
+        finite = pc.fill_null(pc.is_finite(result), True)
+        if pc.any(pc.invert(finite)).as_py():
+            raise TransformationRegistryError(
+                "Derived metric produced a non-finite result."
+            )
+        output = table.append_column(
+            pa.field(output_name, pa.float64(), nullable=True),
+            result,
+        )
+        summary = {
+            "affected_columns": [output_name],
+            "formula": {
+                "left_column": left_field.name,
+                "operator": operator,
+                "right_column": right_field.name,
+                "output_column": output_name,
+            },
+            "rows_before": table.num_rows,
+            "rows_after": output.num_rows,
+            "null_result_count": pc.sum(
+                pc.cast(pc.is_null(result), pa.int64())
+            ).as_py() or 0,
+            "divide_by_zero": resolved.get("divide_by_zero"),
+        }
+        return _attach_transformation_metadata(
+            output,
+            self.operation,
+            resolved,
+            summary,
+        )
+
+    @staticmethod
+    def _columns(table: pa.Table, configuration: dict) -> tuple[int, int]:
+        _require_configuration_fields(
+            configuration,
+            ("left_column", "operator", "right_column", "output_column"),
+            "Derived metric",
+        )
+        indices = []
+        for key in ("left_column", "right_column"):
+            name = configuration[key]
+            index = table.schema.get_field_index(name)
+            if index < 0:
+                raise TransformationRegistryError(
+                    f"Derived metric column {name!r} was not found."
+                )
+            indices.append(index)
+        return indices[0], indices[1]
+
+
+class _BusinessRuleValidation:
+    operation: TransformationOperation
+
+    def fit(
+        self,
+        data: Any,
+        *,
+        configuration: dict,
+        context: dict | None = None,
+    ) -> None:
+        _ = context
+        table = _validate_table(data, self.operation)
+        resolved = _operation_configuration(self.operation, configuration)
+        self._validate_rules(table, resolved)
+        return None
+
+    def transform(
+        self,
+        data: Any,
+        *,
+        configuration: dict,
+        context: dict | None = None,
+    ) -> pa.Table:
+        _ = context
+        table = _validate_table(data, self.operation)
+        resolved = _operation_configuration(self.operation, configuration)
+        checked = self._validate_rules(table, resolved)
+        findings = []
+        for rule, affected, review in checked:
+            findings.append(
+                {
+                    "column": rule["column"],
+                    "check": rule["check"],
+                    "affected_count": affected,
+                    "review_count": review,
+                    "denominator_count": table.num_rows,
+                }
+            )
+        summary = {
+            "rows_checked": table.num_rows,
+            "validation_results": findings,
+            "affected_columns": sorted(
+                {rule["column"] for rule in resolved["rules"]}
+            ),
+            "data_modified": False,
+        }
+        return _attach_transformation_metadata(
+            table,
+            self.operation,
+            resolved,
+            summary,
+        )
+
+    @staticmethod
+    def _validate_rules(table: pa.Table, configuration: dict):
+        _require_configuration_fields(
+            configuration,
+            ("rules",),
+            "Business validation",
+        )
+        if not configuration["rules"]:
+            raise TransformationRegistryError(
+                "Business validation needs at least one explicit rule."
+            )
+        results = []
+        for rule in configuration["rules"]:
+            if not isinstance(rule, dict):
+                raise TransformationRegistryError(
+                    "Business validation rules must be objects."
+                )
+            column = rule["column"]
+            index = table.schema.get_field_index(column)
+            if index < 0:
+                raise TransformationRegistryError(
+                    f"Business validation column {column!r} was not found."
+                )
+            field = table.schema.field(index)
+            values = table.column(index)
+            check = rule["check"]
+            allowed_fields = {
+                "required": {"column", "check"},
+                "allowed_values": {"column", "check", "values"},
+                "numeric_range": {"column", "check", "minimum", "maximum"},
+                "less_than": {"column", "check", "other_column"},
+                "less_or_equal": {"column", "check", "other_column"},
+                "greater_than": {"column", "check", "other_column"},
+                "greater_or_equal": {"column", "check", "other_column"},
+                "equals_column": {"column", "check", "other_column"},
+            }.get(check)
+            if allowed_fields is None or set(rule) - allowed_fields:
+                raise TransformationRegistryError(
+                    f"Validation rule {check!r} has unsupported fields."
+                )
+            required_fields = {
+                "required": (),
+                "allowed_values": ("values",),
+                "numeric_range": (),
+                "less_than": ("other_column",),
+                "less_or_equal": ("other_column",),
+                "greater_than": ("other_column",),
+                "greater_or_equal": ("other_column",),
+                "equals_column": ("other_column",),
+            }[check]
+            _require_configuration_fields(
+                rule,
+                required_fields,
+                f"Validation rule {check}",
+            )
+            missing = pc.is_null(values)
+            if (
+                configuration["empty_strings_are_missing"]
+                and _is_string_type(field.type)
+            ):
+                missing = pc.or_kleene(missing, pc.equal(values, ""))
+            missing = pc.fill_null(missing, False)
+            review = 0
+            if check == "required":
+                affected = pc.sum(pc.cast(missing, pa.int64())).as_py() or 0
+            elif check == "allowed_values":
+                if not _is_string_type(field.type):
+                    raise TransformationRegistryError(
+                        f"Allowed-value validation for {column!r} requires a string column."
+                    )
+                allowed = pa.array(rule["values"], type=field.type)
+                valid = pc.is_in(values, value_set=allowed)
+                review = pc.sum(pc.cast(missing, pa.int64())).as_py() or 0
+                violations = pc.and_kleene(pc.invert(valid), pc.invert(missing))
+                affected = pc.sum(
+                    pc.cast(pc.fill_null(violations, False), pa.int64())
+                ).as_py() or 0
+            elif check == "numeric_range":
+                if not _is_numeric_type(field.type):
+                    raise TransformationRegistryError(
+                        f"Numeric-range validation for {column!r} requires a numeric column."
+                    )
+                lower = rule.get("minimum")
+                upper = rule.get("maximum")
+                if (
+                    lower is None and upper is None
+                    or lower is not None
+                    and (
+                        isinstance(lower, bool)
+                        or not isinstance(lower, (int, float))
+                        or not math.isfinite(lower)
+                    )
+                    or upper is not None
+                    and (
+                        isinstance(upper, bool)
+                        or not isinstance(upper, (int, float))
+                        or not math.isfinite(upper)
+                    )
+                    or lower is not None
+                    and upper is not None
+                    and lower > upper
+                ):
+                    raise TransformationRegistryError(
+                        f"Numeric range for {column!r} needs valid ordered minimum/maximum bounds."
+                    )
+                violations = pa.array([False] * table.num_rows, type=pa.bool_())
+                if lower is not None:
+                    violations = pc.or_kleene(
+                        violations,
+                        pc.less(values, _coerce_predicate_scalar(lower, field)),
+                    )
+                if upper is not None:
+                    violations = pc.or_kleene(
+                        violations,
+                        pc.greater(values, _coerce_predicate_scalar(upper, field)),
+                    )
+                review = pc.sum(pc.cast(missing, pa.int64())).as_py() or 0
+                violations = pc.and_kleene(violations, pc.invert(missing))
+                affected = pc.sum(
+                    pc.cast(pc.fill_null(violations, False), pa.int64())
+                ).as_py() or 0
+            else:
+                if "other_column" not in rule:
+                    raise TransformationRegistryError(
+                        f"Validation rule {check!r} requires other_column."
+                    )
+                other_name = rule["other_column"]
+                other_index = table.schema.get_field_index(other_name)
+                if other_index < 0:
+                    raise TransformationRegistryError(
+                        f"Business validation column {other_name!r} was not found."
+                    )
+                other_field = table.schema.field(other_index)
+                other_values = table.column(other_index)
+                if not _is_numeric_type(field.type) or not _is_numeric_type(
+                    other_field.type
+                ):
+                    raise TransformationRegistryError(
+                        f"Cross-column comparison {column!r}/{other_name!r} requires numeric columns."
+                    )
+                _require_numeric_column(field, values)
+                _require_numeric_column(other_field, other_values)
+                both_missing = pc.or_kleene(missing, pc.is_null(other_values))
+                review = pc.sum(
+                    pc.cast(pc.fill_null(both_missing, False), pa.int64())
+                ).as_py() or 0
+                comparison = {
+                    "less_than": pc.less,
+                    "less_or_equal": pc.less_equal,
+                    "greater_than": pc.greater,
+                    "greater_or_equal": pc.greater_equal,
+                    "equals_column": pc.equal,
+                }[check](values, other_values)
+                violations = pc.and_kleene(
+                    pc.invert(comparison),
+                    pc.invert(both_missing),
+                )
+                affected = pc.sum(
+                    pc.cast(pc.fill_null(violations, False), pa.int64())
+                ).as_py() or 0
+            results.append((rule, affected, review))
+        return results
+
+
 _TRANSFORMATION_RESOURCE_LIMITS = {
     "max_input_bytes": _MAX_TRANSFORMATION_INPUT_BYTES,
     "max_rows": _MAX_TRANSFORMATION_ROWS,
@@ -1138,6 +2088,7 @@ _TRANSFORMATION_PREREQUISITES = (
     "pyarrow_table",
     "explicit_column_selection",
 )
+_BA_PREREQUISITES = ("pyarrow_table", "explicit_business_rule_definition")
 
 
 class TransformationRegistry:
@@ -1367,8 +2318,109 @@ _NUMERIC_SCALING.operation = TransformationOperation(
     resource_limits=dict(_TRANSFORMATION_RESOURCE_LIMITS),
 )
 
+_BUSINESS_RULE_FILTER = _BusinessRuleFilter()
+_BUSINESS_RULE_FILTER.operation = TransformationOperation(
+    operation_id="ba.business_rule_filter",
+    version="1",
+    category="BA",
+    status="implemented",
+    input_requirements=("bounded PyArrow table", "explicit filter predicates"),
+    output_requirements=(
+        "filtered PyArrow table with row counts and review counts in lineage metadata",
+    ),
+    prerequisites=_BA_PREREQUISITES,
+    configuration_schema=_BUSINESS_FILTER_SCHEMA,
+    configuration_defaults={
+        "composition": "all",
+        "null_policy": "exclude",
+    },
+    requires_fit=False,
+    changes_rows=True,
+    changes_columns=False,
+    changes_values=False,
+    required_approvals=("approved_business_scope_filter",),
+    resource_limits=dict(_TRANSFORMATION_RESOURCE_LIMITS),
+    changes_metadata=True,
+)
+_CATEGORY_MAPPING = _CategoryMapping()
+_CATEGORY_MAPPING.operation = TransformationOperation(
+    operation_id="ba.category_mapping",
+    version="1",
+    category="BA",
+    status="implemented",
+    input_requirements=("bounded PyArrow table", "explicit category mapping table"),
+    output_requirements=(
+        "PyArrow table with mapped category and mapping-coverage metadata",
+    ),
+    prerequisites=_BA_PREREQUISITES,
+    configuration_schema=_CATEGORY_MAPPING_SCHEMA,
+    configuration_defaults={
+        "unmapped_policy": "preserve",
+        "null_policy": "preserve",
+    },
+    requires_fit=False,
+    changes_rows=False,
+    changes_columns=True,
+    changes_values=True,
+    required_approvals=(
+        "approved_category_mapping",
+        "approved_category_merging",
+    ),
+    resource_limits=dict(_TRANSFORMATION_RESOURCE_LIMITS),
+    changes_metadata=True,
+)
+_DERIVED_BUSINESS_METRIC = _DerivedBusinessMetric()
+_DERIVED_BUSINESS_METRIC.operation = TransformationOperation(
+    operation_id="ba.derived_business_metric",
+    version="1",
+    category="BA",
+    status="implemented",
+    input_requirements=("bounded PyArrow table", "explicit two-column arithmetic formula"),
+    output_requirements=(
+        "PyArrow table with a new float64 metric column and formula trace metadata",
+    ),
+    prerequisites=_BA_PREREQUISITES,
+    configuration_schema=_DERIVED_METRIC_SCHEMA,
+    configuration_defaults={
+        "operator": "add",
+        "divide_by_zero": "error",
+    },
+    requires_fit=False,
+    changes_rows=False,
+    changes_columns=True,
+    changes_values=True,
+    required_approvals=("approved_business_metric_definition",),
+    resource_limits=dict(_TRANSFORMATION_RESOURCE_LIMITS),
+    changes_metadata=True,
+)
+_BUSINESS_RULE_VALIDATION = _BusinessRuleValidation()
+_BUSINESS_RULE_VALIDATION.operation = TransformationOperation(
+    operation_id="ba.business_rule_validation",
+    version="1",
+    category="BA",
+    status="implemented",
+    input_requirements=("bounded PyArrow table", "explicit validation rules"),
+    output_requirements=(
+        "unchanged data table with aggregate validation findings in lineage metadata",
+    ),
+    prerequisites=_BA_PREREQUISITES,
+    configuration_schema=_BUSINESS_VALIDATION_SCHEMA,
+    configuration_defaults={"empty_strings_are_missing": False},
+    requires_fit=False,
+    changes_rows=False,
+    changes_columns=False,
+    changes_values=False,
+    required_approvals=("approved_business_validation_rules",),
+    resource_limits=dict(_TRANSFORMATION_RESOURCE_LIMITS),
+    changes_metadata=True,
+)
+
 DEFAULT_TRANSFORMATION_REGISTRY = TransformationRegistry(
     (
+        (_BUSINESS_RULE_FILTER.operation, _BUSINESS_RULE_FILTER),
+        (_BUSINESS_RULE_VALIDATION.operation, _BUSINESS_RULE_VALIDATION),
+        (_CATEGORY_MAPPING.operation, _CATEGORY_MAPPING),
+        (_DERIVED_BUSINESS_METRIC.operation, _DERIVED_BUSINESS_METRIC),
         (_STRING_NORMALIZATION.operation, _STRING_NORMALIZATION),
         (_MISSING_VALUE_HANDLING.operation, _MISSING_VALUE_HANDLING),
         (_NUMERIC_OUTLIER_HANDLING.operation, _NUMERIC_OUTLIER_HANDLING),
