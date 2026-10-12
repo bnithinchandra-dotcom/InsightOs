@@ -136,10 +136,142 @@ Supply an approval token only after obtaining the corresponding explicit
 approval; the registry metadata describes the approval required, not whether it
 has been granted.
 
+## Ordered preprocessing orchestration
+
+`orchestrate_preprocessing()` composes registered DA and BA executors without
+changing their implementations or selecting transformations from column names.
+The caller provides a PyArrow table, an ordered list of `PreprocessingStep`
+values, explicit `PreprocessingApproval` records, and any non-table
+prerequisites established by the caller:
+
+```python
+from app.preprocessing import (
+    PreprocessingApproval,
+    PreprocessingStep,
+    orchestrate_preprocessing,
+)
+
+steps = [
+    PreprocessingStep(
+        step_id="normalize-category",
+        operation_id="da.string_normalization",
+        configuration={"columns": ["category"], "trim": True},
+    ),
+    PreprocessingStep(
+        step_id="derive-net",
+        operation_id="ba.derived_business_metric",
+        configuration={
+            "left_column": "amount",
+            "operator": "subtract",
+            "right_column": "discount",
+            "output_column": "net_amount",
+        },
+    ),
+]
+approvals = [
+    PreprocessingApproval(
+        step_id="normalize-category",
+        operation_id="da.string_normalization",
+        configuration={"columns": ["category"], "trim": True},
+        approved_approvals=("approved_normalization_policy",),
+    ),
+    PreprocessingApproval(
+        step_id="derive-net",
+        operation_id="ba.derived_business_metric",
+        configuration={
+            "left_column": "amount",
+            "operator": "subtract",
+            "right_column": "discount",
+            "output_column": "net_amount",
+        },
+        approved_approvals=("approved_business_metric_definition",),
+    ),
+]
+result = orchestrate_preprocessing(
+    input_table,
+    steps,
+    approvals=approvals,
+    available_prerequisites=(
+        "explicit_column_selection",
+        "explicit_business_rule_definition",
+    ),
+)
+if result.status == "completed":
+    output_table = result.final_table
+```
+
+The orchestrator validates the whole plan before calling an executor: step IDs
+are unique and bounded, operation IDs resolve to implemented registry entries,
+configurations pass the existing schema and size checks, prerequisite tokens
+are present, and every required approval is supplied. `pyarrow_table` is
+established by validating the input; callers must supply other prerequisites
+such as `explicit_column_selection` or
+`explicit_business_rule_definition`. Steps execute in the exact list order;
+the orchestrator does not reorder steps or infer columns. Plans are bounded to
+32 steps.
+
+An approval identifies a step ID, operation ID, effective configuration, and
+the exact approval tokens required by that operation. The configuration is
+normalized with operation defaults before comparison, so changing either an
+explicit value or the effective configuration invalidates the approval.
+Approvals are separate from transformation configuration and are not generated
+by the orchestrator.
+
+Each step result records its ID, operation ID/version, effective-configuration
+SHA-256, status, before/after row and column counts when available, configured
+affected-column names, and a bounded numeric summary from existing
+transformation lineage where available. Free text and row values are excluded
+from that summary. A completed result exposes the final table. On a runtime
+step failure, execution stops; the result
+identifies the failed step, retains prior step metadata, marks later steps
+`not_executed`, and has no final table. Arbitrary executor exception messages
+are not copied into results; registry validation errors retain their bounded,
+actionable descriptions. Runtime checks of
+table-dependent column presence, types, and fitted-context schema occur as
+each executor runs. Thus a data-dependent failure in a later step can follow
+earlier completed steps, but no partial table is returned as a successful
+result. Static plan errors raise `PreprocessingOrchestrationError` before any
+step is executed. Empty plans complete with the validated input table.
+
+The caller's PyArrow table is never modified in place. The initial and each
+step's output table are checked against the transformation resource limits and
+column-name constraints. No row values are copied into orchestration results;
+affected-column metadata is derived only from configuration. Existing BA
+transformation summaries remain attached by their registered executors to the
+returned table. The orchestrator does not persist additional execution history
+or lineage.
+
+### Fit-context boundary
+
+The orchestrator does not call `fit()` on the execution table for operations
+whose registry metadata sets `requires_fit`. The caller must fit the same
+registered executor using designated training data, then attach that context
+to the corresponding `PreprocessingStep`. The operation's existing context
+checks bind the context to operation ID/version, effective configuration,
+learned-parameter checksum, and the full schema at the step input. This avoids
+silently learning from the execution table and rejects a context fitted for a
+different operation or configuration during plan validation. The context
+contract does not attest whether its source table was training or
+evaluation/inference data, so callers remain responsible for supplying only
+training-fitted contexts. The context contains no dataset identity or input
+value fingerprint, so it cannot detect reuse from a different dataset with the
+same schema. Exact schema compatibility is checked when the step receives its
+input table.
+
+`requires_fit` is currently an operation-level gate, not a per-strategy
+contract. Therefore the orchestrator conservatively requires a context for all
+registered missing-value handling, outlier-handling, and scaling steps marked
+`requires_fit`, including configurations whose selected strategy may not learn
+statistics. For a step after earlier transformations, fit the context against
+the training table with the same schema that the step will receive. The
+orchestrator does not simulate schemas or provide a training/evaluation
+framework; future work may refine this lifecycle contract without silently
+fitting on inference data.
+
 ## Safety, boundedness, and limitations
 
 Dispatch requires explicit operation approvals in addition to the `pyarrow_table`
-and `explicit_column_selection` prerequisites. Inputs are bounded to 64 MiB,
+and operation-specific prerequisites. Inputs are bounded to 64 MiB,
 1,000,000 rows, and 256 columns; a configuration is bounded to 64 KiB and at
 most 64 selected columns. Invalid configurations, missing columns, unsupported
 types, non-finite numeric values, empty/all-null statistic-training columns,
@@ -148,11 +280,12 @@ Constant columns are handled deterministically and missing values do not imply
 zero.
 
 These components do not infer business meaning, determine whether an outlier
-is an error, join datasets, or run a complete pipeline. Lineage is attached to
-the returned in-memory PyArrow table; it is not persisted to storage by these
-operations. Callers must retain the operation version, configuration,
-approval, fitted context, and input/output provenance when assembling a later
-pipeline. No API, database migration, or new dependency is introduced.
+is an error, join datasets, or run a complete ingestion workflow. Lineage is
+attached to the returned in-memory PyArrow table; it is not persisted to
+storage by these operations. Callers must retain the operation version,
+configuration, approval, fitted context, and input/output provenance when
+assembling later workflows. No API, database migration, or new dependency is
+introduced.
 
 The quality catalog remains unchanged: its transformation descriptions are
 catalog metadata for the quality-rule surface, while executable transformation
@@ -161,9 +294,10 @@ versions are not changed. Do not mark a catalog capability executable merely
 because it shares a concept with a DA operation.
 
 Future work includes fiscal calendars, KPI/status semantics, reporting grain,
-business anomaly detection, approved master-dimension joins, and broader
-validation rules. The four operations above are not an orchestrator and do not
-provide these capabilities.
+business anomaly detection, approved master-dimension joins, persistent
+execution history, and broader validation rules. The orchestrator does not
+provide AI-driven planning, retries, persistence, API endpoints, or a complete
+end-to-end ingestion workflow.
 
 To add an operation, define complete `TransformationOperation` metadata,
 implement `fit`/`transform` only for supported behavior, and register the pair.

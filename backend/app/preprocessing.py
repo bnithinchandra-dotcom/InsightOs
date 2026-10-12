@@ -4,7 +4,8 @@ import json
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable, Protocol
+from itertools import islice
+from typing import Any, Iterable, Literal, Protocol
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -651,6 +652,23 @@ def _validate_fitted_context(
     configuration: dict,
     data: pa.Table,
 ) -> dict:
+    parameters = _validate_fitted_context_binding(
+        context,
+        operation,
+        configuration,
+    )
+    if context["schema"] != _schema_fingerprint(data):
+        raise TransformationRegistryError(
+            "Fitted transformation context does not match this operation, configuration, or input schema."
+        )
+    return parameters
+
+
+def _validate_fitted_context_binding(
+    context: dict | None,
+    operation: TransformationOperation,
+    configuration: dict,
+) -> dict:
     if not isinstance(context, dict):
         raise TransformationRegistryError(
             "Transformation must be fitted before transform is called."
@@ -660,7 +678,13 @@ def _validate_fitted_context(
         or context.get("version") != operation.version
         or context.get("configuration_sha256")
         != _configuration_fingerprint(configuration)
-        or context.get("schema") != _schema_fingerprint(data)
+        or not isinstance(context.get("schema"), list)
+        or any(
+            not isinstance(field, list)
+            or len(field) != 2
+            or any(not isinstance(value, str) for value in field)
+            for field in context["schema"]
+        )
         or not isinstance(context.get("parameters"), dict)
         or context.get("parameters_sha256")
         != _configuration_fingerprint(context["parameters"])
@@ -2427,3 +2451,582 @@ DEFAULT_TRANSFORMATION_REGISTRY = TransformationRegistry(
         (_NUMERIC_SCALING.operation, _NUMERIC_SCALING),
     )
 )
+
+
+_MAX_ORCHESTRATION_STEPS = 32
+_MAX_ORCHESTRATION_PREREQUISITES = 64
+_MAX_ORCHESTRATION_AFFECTED_COLUMNS = 128
+_ORCHESTRATION_STEP_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_SAFE_AGGREGATE_SUMMARY_KEYS = frozenset(
+    {
+        "rows_before",
+        "rows_retained",
+        "rows_filtered",
+        "rows_requiring_review",
+        "rows_total",
+        "rows_mapped",
+        "rows_unmapped_preserved_or_replaced",
+        "rows_null_preserved_or_replaced",
+        "rows_after",
+        "null_result_count",
+        "rows_checked",
+        "affected_count",
+        "review_count",
+        "denominator_count",
+    }
+)
+
+
+class PreprocessingOrchestrationError(TransformationRegistryError):
+    """Raised when an orchestration plan cannot be validated safely."""
+
+
+@dataclass(frozen=True)
+class PreprocessingStep:
+    step_id: str
+    operation_id: str
+    configuration: dict | None = None
+    fit_context: dict | None = None
+
+
+@dataclass(frozen=True)
+class PreprocessingApproval:
+    step_id: str
+    operation_id: str
+    configuration: dict | None
+    approved_approvals: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PreprocessingStepResult:
+    step_id: str
+    operation_id: str
+    operation_version: str
+    configuration_sha256: str
+    status: Literal["completed", "failed", "not_executed"]
+    rows_before: int | None
+    rows_after: int | None
+    columns_before: int | None
+    columns_after: int | None
+    affected_columns: tuple[str, ...]
+    summary_metadata: dict | list | None = None
+
+
+@dataclass(frozen=True)
+class PreprocessingResult:
+    status: Literal["completed", "failed"]
+    final_table: pa.Table | None
+    steps: tuple[PreprocessingStepResult, ...]
+    execution_order: tuple[str, ...]
+    completed_steps: tuple[str, ...]
+    unexecuted_steps: tuple[str, ...]
+    failure_step_id: str | None = None
+    error_description: str | None = None
+
+
+@dataclass(frozen=True)
+class _PreparedPreprocessingStep:
+    step: PreprocessingStep
+    operation: TransformationOperation
+    executor: TransformationExecutor
+    configuration: dict
+    fit_context: dict | None
+    affected_columns: tuple[str, ...]
+
+
+def _validate_orchestration_table(data: Any) -> pa.Table:
+    if not isinstance(data, pa.Table):
+        raise PreprocessingOrchestrationError(
+            "Preprocessing orchestration requires a PyArrow Table."
+        )
+    names = data.schema.names
+    if (
+        data.num_rows > _MAX_TRANSFORMATION_ROWS
+        or data.num_columns > _MAX_TRANSFORMATION_COLUMNS
+        or data.nbytes > _MAX_TRANSFORMATION_INPUT_BYTES
+    ):
+        raise PreprocessingOrchestrationError(
+            "Preprocessing table exceeds the global row, column, or byte limit."
+        )
+    if any(not name.strip() for name in names) or len(names) != len(set(names)):
+        raise PreprocessingOrchestrationError(
+            "Preprocessing input must have unique, non-empty column names."
+        )
+    return data
+
+
+def _orchestration_tokens(values: Iterable[str], field_name: str) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)):
+        raise PreprocessingOrchestrationError(
+            f"Preprocessing {field_name} must be a collection of identifiers."
+        )
+    try:
+        supplied = tuple(islice(values, _MAX_ORCHESTRATION_PREREQUISITES + 1))
+    except Exception as error:
+        raise PreprocessingOrchestrationError(
+            f"Preprocessing {field_name} must be a collection of identifiers."
+        ) from error
+    if len(supplied) > _MAX_ORCHESTRATION_PREREQUISITES:
+        raise PreprocessingOrchestrationError(
+            f"Preprocessing {field_name} cannot contain more than "
+            f"{_MAX_ORCHESTRATION_PREREQUISITES} identifiers."
+        )
+    tokens = _validated_tokens(supplied, field_name)
+    if len(supplied) != len(tokens):
+        raise PreprocessingOrchestrationError(
+            f"Preprocessing {field_name} must not contain duplicate identifiers."
+        )
+    return tuple(sorted(tokens))
+
+
+def _affected_columns(configuration: dict) -> tuple[str, ...]:
+    columns = set(configuration.get("columns", ()))
+    for key in ("column", "left_column", "right_column", "output_column"):
+        value = configuration.get(key)
+        if isinstance(value, str):
+            columns.add(value)
+    for key in ("predicates", "rules"):
+        for item in configuration.get(key, ()):
+            if isinstance(item, dict):
+                for column_key in ("column", "other_column"):
+                    value = item.get(column_key)
+                    if isinstance(value, str):
+                        columns.add(value)
+    if len(columns) > _MAX_ORCHESTRATION_AFFECTED_COLUMNS:
+        raise PreprocessingOrchestrationError(
+            "A preprocessing step exceeds the affected-column metadata limit."
+        )
+    return tuple(sorted(columns))
+
+
+def _safe_step_error(error: Exception, phase: str, operation_id: str) -> str:
+    if isinstance(error, TransformationRegistryError):
+        message = "".join(
+            character
+            for character in str(error)
+            if character >= " " and character not in "\x7f"
+        )
+        if len(message) > 512:
+            message = message[:509] + "..."
+        return f"{operation_id} failed during {phase}: {message}"
+    error_type = type(error).__name__
+    if not error_type.isidentifier():
+        error_type = "ExecutorError"
+    return f"{operation_id} failed during {phase} ({error_type})."
+
+
+def _read_transformation_lineage(data: pa.Table) -> list[dict] | None:
+    encoded = (data.schema.metadata or {}).get(
+        b"insightos.transformation_lineage"
+    )
+    if encoded is None:
+        return None
+    if not isinstance(encoded, bytes) or len(encoded) > 16 * 1024:
+        raise TransformationRegistryError(
+            "Transformation lineage metadata is invalid or exceeds its size limit."
+        )
+    try:
+        lineage = json.loads(encoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise TransformationRegistryError(
+            "Transformation lineage metadata is invalid."
+        ) from error
+    if (
+        not isinstance(lineage, list)
+        or len(lineage) > 32
+        or any(not isinstance(entry, dict) for entry in lineage)
+    ):
+        raise TransformationRegistryError(
+            "Transformation lineage metadata is invalid or exceeds its operation limit."
+        )
+    return lineage
+
+
+def _bounded_summary_value(value: Any, budget: list[int], depth: int = 0) -> Any:
+    if depth > 4 or budget[0] <= 0:
+        return None
+    if isinstance(value, dict):
+        result = {}
+        for key in sorted(value):
+            if (
+                budget[0] <= 0
+                or not isinstance(key, str)
+                or key not in _SAFE_AGGREGATE_SUMMARY_KEYS
+            ):
+                continue
+            budget[0] -= 1
+            item = _bounded_summary_value(value[key], budget, depth + 1)
+            if item is not None:
+                result[key] = item
+        return result or None
+    if isinstance(value, list):
+        result = []
+        for item in value[:32]:
+            if budget[0] <= 0:
+                break
+            budget[0] -= 1
+            bounded = _bounded_summary_value(item, budget, depth + 1)
+            if bounded is not None:
+                result.append(bounded)
+        return result or None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and abs(value) <= 2**63:
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return None
+
+
+def _step_summary_metadata(
+    input_table: pa.Table,
+    output_table: pa.Table,
+    operation: TransformationOperation,
+    configuration: dict,
+) -> dict | list | None:
+    if not operation.changes_metadata:
+        return None
+    input_lineage = _read_transformation_lineage(input_table)
+    output_lineage = _read_transformation_lineage(output_table)
+    if (
+        output_lineage is None
+        or len(output_lineage)
+        != (0 if input_lineage is None else len(input_lineage)) + 1
+    ):
+        return None
+    entry = output_lineage[-1]
+    if (
+        entry.get("operation_id") != operation.operation_id
+        or entry.get("version") != operation.version
+        or entry.get("configuration_sha256")
+        != _configuration_fingerprint(configuration)
+        or not isinstance(entry.get("summary"), (dict, list))
+    ):
+        return None
+    summary = _bounded_summary_value(entry["summary"], [32])
+    if not isinstance(summary, (dict, list)):
+        return None
+    if len(
+        json.dumps(
+            summary,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ) > 4096:
+        return None
+    return summary
+
+
+def orchestrate_preprocessing(
+    data: pa.Table,
+    steps: list[PreprocessingStep] | tuple[PreprocessingStep, ...],
+    *,
+    approvals: list[PreprocessingApproval] | tuple[PreprocessingApproval, ...] = (),
+    available_prerequisites: Iterable[str] = (),
+    registry: TransformationRegistry = DEFAULT_TRANSFORMATION_REGISTRY,
+) -> PreprocessingResult:
+    """Validate a complete ordered plan, then execute it without fitting on evaluation data."""
+    _validate_orchestration_table(data)
+    if not isinstance(steps, (list, tuple)):
+        raise PreprocessingOrchestrationError(
+            "Preprocessing steps must be an ordered list or tuple."
+        )
+    if len(steps) > _MAX_ORCHESTRATION_STEPS:
+        raise PreprocessingOrchestrationError(
+            f"A preprocessing plan cannot contain more than {_MAX_ORCHESTRATION_STEPS} steps."
+        )
+    if not isinstance(approvals, (list, tuple)) or len(approvals) > _MAX_ORCHESTRATION_STEPS:
+        raise PreprocessingOrchestrationError(
+            "Preprocessing approvals must be a bounded list or tuple."
+        )
+    if not isinstance(registry, TransformationRegistry):
+        raise PreprocessingOrchestrationError(
+            "Preprocessing registry is invalid."
+        )
+
+    available = set(
+        _orchestration_tokens(
+            available_prerequisites,
+            "available prerequisites",
+        )
+    )
+    available.add("pyarrow_table")
+    operations = {
+        operation.operation_id: operation
+        for operation in registry.list_operations()
+    }
+    operation_steps: dict[
+        str,
+        tuple[PreprocessingStep, TransformationOperation, dict, dict | None],
+    ] = {}
+    step_ids = set()
+    for step in steps:
+        if (
+            not isinstance(step, PreprocessingStep)
+            or not isinstance(step.step_id, str)
+            or _ORCHESTRATION_STEP_ID.fullmatch(step.step_id) is None
+            or not isinstance(step.operation_id, str)
+            or len(step.operation_id) > 480
+            or _OPERATION_ID.fullmatch(step.operation_id) is None
+        ):
+            raise PreprocessingOrchestrationError(
+                "Each preprocessing step needs a bounded step ID and operation ID."
+            )
+        if step.step_id in step_ids:
+            raise PreprocessingOrchestrationError(
+                "Preprocessing step IDs must be unique."
+            )
+        step_ids.add(step.step_id)
+        operation = operations.get(step.operation_id)
+        if operation is None:
+            raise PreprocessingOrchestrationError(
+                f"Unknown transformation operation {step.operation_id!r}."
+            )
+        try:
+            configuration = _operation_configuration(
+                operation,
+                copy.deepcopy(step.configuration),
+            )
+        except Exception as error:
+            raise PreprocessingOrchestrationError(
+                f"Preprocessing step {step.step_id!r} has an invalid configuration."
+            ) from error
+
+        if operation.requires_fit:
+            if not isinstance(step.fit_context, dict):
+                raise PreprocessingOrchestrationError(
+                    f"Preprocessing step {step.step_id!r} requires a fitted context from training data."
+                )
+            try:
+                fit_context = copy.deepcopy(step.fit_context)
+                _validate_fitted_context_binding(
+                    fit_context,
+                    operation,
+                    configuration,
+                )
+            except TransformationRegistryError as error:
+                raise PreprocessingOrchestrationError(
+                    f"Preprocessing step {step.step_id!r} has an incompatible fitted context: {error}"
+                ) from error
+            except Exception as error:
+                raise PreprocessingOrchestrationError(
+                    f"Preprocessing step {step.step_id!r} has an invalid fitted context."
+                ) from error
+        else:
+            if step.fit_context is not None:
+                raise PreprocessingOrchestrationError(
+                    f"Preprocessing step {step.step_id!r} does not accept a fitted context."
+                )
+            fit_context = None
+        operation_steps[step.step_id] = (
+            step,
+            operation,
+            configuration,
+            fit_context,
+        )
+
+    approval_by_step: dict[str, tuple[set[str], dict]] = {}
+    for approval in approvals:
+        if (
+            not isinstance(approval, PreprocessingApproval)
+            or not isinstance(approval.step_id, str)
+            or not isinstance(approval.operation_id, str)
+        ):
+            raise PreprocessingOrchestrationError(
+                "Each preprocessing approval must identify a plan step and operation."
+            )
+        if approval.step_id in approval_by_step:
+            raise PreprocessingOrchestrationError(
+                "A preprocessing step cannot have duplicate approval records."
+            )
+        planned = operation_steps.get(approval.step_id)
+        if planned is None:
+            raise PreprocessingOrchestrationError(
+                "A preprocessing approval refers to an unknown step."
+            )
+        step, operation, configuration, _ = planned
+        if approval.operation_id != step.operation_id:
+            raise PreprocessingOrchestrationError(
+                f"Approval for step {step.step_id!r} names a different operation."
+            )
+        try:
+            approved_configuration = _operation_configuration(
+                operation,
+                copy.deepcopy(approval.configuration),
+            )
+            tokens = _orchestration_tokens(
+                approval.approved_approvals,
+                "approved approvals",
+            )
+        except Exception as error:
+            raise PreprocessingOrchestrationError(
+                f"Approval for step {step.step_id!r} is invalid."
+            ) from error
+        if approved_configuration != configuration:
+            raise PreprocessingOrchestrationError(
+                f"Approval for step {step.step_id!r} does not match its effective configuration."
+            )
+        if set(tokens) != set(operation.required_approvals):
+            raise PreprocessingOrchestrationError(
+                f"Approval for step {step.step_id!r} must exactly match the operation's required approval tokens."
+            )
+        approval_by_step[step.step_id] = (set(tokens), approved_configuration)
+
+    prepared_steps = []
+    for step in steps:
+        _, operation, configuration, fit_context = operation_steps[step.step_id]
+        approval = approval_by_step.get(step.step_id)
+        approved_tokens = () if approval is None else tuple(sorted(approval[0]))
+        missing_approval = set(operation.required_approvals) - set(approved_tokens)
+        if missing_approval:
+            raise PreprocessingOrchestrationError(
+                f"Approval is required for preprocessing step {step.step_id!r}."
+            )
+        try:
+            executor = registry.resolve_executor(
+                operation.operation_id,
+                configuration=configuration,
+                available_prerequisites=available,
+                approved_approvals=approved_tokens,
+            )
+        except TransformationRegistryError as error:
+            raise PreprocessingOrchestrationError(
+                f"Preprocessing step {step.step_id!r} cannot be dispatched: {error}"
+            ) from error
+        prepared_steps.append(
+            _PreparedPreprocessingStep(
+                step=step,
+                operation=operation,
+                executor=executor,
+                configuration=configuration,
+                fit_context=fit_context,
+                affected_columns=_affected_columns(configuration),
+            )
+        )
+
+    execution_order = tuple(step.step.step_id for step in prepared_steps)
+    if not prepared_steps:
+        return PreprocessingResult(
+            status="completed",
+            final_table=data,
+            steps=(),
+            execution_order=(),
+            completed_steps=(),
+            unexecuted_steps=(),
+        )
+
+    working = data
+    results = []
+    completed_steps = []
+    for index, prepared in enumerate(prepared_steps):
+        step = prepared.step
+        before_rows = working.num_rows
+        before_columns = working.num_columns
+        phase = "fit"
+        try:
+            if prepared.operation.requires_fit:
+                context = prepared.fit_context
+            else:
+                context = prepared.executor.fit(
+                    working,
+                    configuration=prepared.configuration,
+                )
+            phase = "transform"
+            output = prepared.executor.transform(
+                working,
+                configuration=prepared.configuration,
+                context=context,
+            )
+            phase = "output validation"
+            if not isinstance(output, pa.Table):
+                raise TransformationRegistryError(
+                    "Transformation output must be a PyArrow Table."
+                )
+            _validate_table(output, prepared.operation)
+            _validate_orchestration_table(output)
+            summary_metadata = _step_summary_metadata(
+                working,
+                output,
+                prepared.operation,
+                prepared.configuration,
+            )
+        except Exception as error:
+            results.append(
+                PreprocessingStepResult(
+                    step_id=step.step_id,
+                    operation_id=step.operation_id,
+                    operation_version=prepared.operation.version,
+                    configuration_sha256=_configuration_fingerprint(
+                        prepared.configuration
+                    ),
+                    status="failed",
+                    rows_before=before_rows,
+                    rows_after=None,
+                    columns_before=before_columns,
+                    columns_after=None,
+                    affected_columns=prepared.affected_columns,
+                )
+            )
+            unexecuted = prepared_steps[index + 1 :]
+            results.extend(
+                PreprocessingStepResult(
+                    step_id=item.step.step_id,
+                    operation_id=item.step.operation_id,
+                    operation_version=item.operation.version,
+                    configuration_sha256=_configuration_fingerprint(
+                        item.configuration
+                    ),
+                    status="not_executed",
+                    rows_before=None,
+                    rows_after=None,
+                    columns_before=None,
+                    columns_after=None,
+                    affected_columns=item.affected_columns,
+                )
+                for item in unexecuted
+            )
+            return PreprocessingResult(
+                status="failed",
+                final_table=None,
+                steps=tuple(results),
+                execution_order=execution_order,
+                completed_steps=tuple(completed_steps),
+                unexecuted_steps=tuple(item.step.step_id for item in unexecuted),
+                failure_step_id=step.step_id,
+                error_description=_safe_step_error(
+                    error,
+                    phase,
+                    step.operation_id,
+                ),
+            )
+
+        results.append(
+            PreprocessingStepResult(
+                step_id=step.step_id,
+                operation_id=step.operation_id,
+                operation_version=prepared.operation.version,
+                configuration_sha256=_configuration_fingerprint(
+                    prepared.configuration
+                ),
+                status="completed",
+                rows_before=before_rows,
+                rows_after=output.num_rows,
+                columns_before=before_columns,
+                columns_after=output.num_columns,
+                affected_columns=prepared.affected_columns,
+                summary_metadata=summary_metadata,
+            )
+        )
+        completed_steps.append(step.step_id)
+        working = output
+
+    return PreprocessingResult(
+        status="completed",
+        final_table=working,
+        steps=tuple(results),
+        execution_order=execution_order,
+        completed_steps=tuple(completed_steps),
+        unexecuted_steps=(),
+    )
