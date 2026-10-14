@@ -10,6 +10,7 @@ from typing import Callable, Iterable
 
 import pyarrow.parquet as pq
 
+from app.execution import ExecutionBudget, ExecutionBudgetExceeded
 from app.quality_catalog import (
     get_quality_rule_catalog_entry,
     quality_rule_catalog_entries,
@@ -101,29 +102,51 @@ class RuleExecutionResult:
 
 class RuleBudget:
     def __init__(self, limit: int):
-        self.limit = limit
-        self.used = 0
-        self.memory_used = 0
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("Quality rule comparison limits must be positive integers.")
+        self._budget = ExecutionBudget(
+            {
+                "comparisons": limit,
+                "tracking_memory_bytes": MAX_RULE_MEMORY_BYTES,
+            }
+        )
+        self._limit = limit
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def used(self) -> int:
+        return self._budget.used("comparisons")
+
+    @property
+    def memory_used(self) -> int:
+        return self._budget.used("tracking_memory_bytes")
 
     def consume_comparisons(self, count: int = 1) -> None:
         if (
             isinstance(count, bool)
             or not isinstance(count, int)
             or count <= 0
-            or self.used + count > self.limit
         ):
             raise RuleBudgetExhausted
-        self.used += count
+        try:
+            self._budget.consume("comparisons", count)
+        except ExecutionBudgetExceeded:
+            raise RuleBudgetExhausted from None
 
     def consume_memory(self, count: int) -> None:
         if (
             isinstance(count, bool)
             or not isinstance(count, int)
             or count < 0
-            or self.memory_used + count > MAX_RULE_MEMORY_BYTES
         ):
             raise RuleBudgetExhausted
-        self.memory_used += count
+        try:
+            self._budget.consume("tracking_memory_bytes", count)
+        except ExecutionBudgetExceeded:
+            raise RuleBudgetExhausted from None
 
 
 def canonical_json(value) -> bytes:

@@ -77,37 +77,79 @@ currently have no persisted execution-history lifecycle.
 
 1. Each operation creates or receives a budget with named resources and
    operation-specific limits.
-2. Counters are cumulative for the lifetime of that operation and are passed
-   to helpers that contribute to the same resource. A new independent operation
-   gets a new budget.
+2. Consumption is cumulative for the lifetime of that operation. A new
+   independent operation gets a new budget; budgets are never module-global.
+   A child budget can only use parent-declared resources and its consumption
+   is charged atomically to every ancestor.
 3. Resource units must be explicit (for example bytes, rows, comparisons,
    decoded Python strings, result bytes). Similar units do not make two
    operation limits interchangeable.
-4. Check a limit before the corresponding expensive allocation or work where
+4. `consume` records completed work. `reserve` makes capacity unavailable
+   before an operation starts; callers must commit it after success or cancel
+   it after failure. Reservations and consumption are synchronized within a
+   shared budget instance.
+5. Check a limit before the corresponding expensive allocation or work where
    practical. If an implementation can only check after a bounded batch, its
    maximum overshoot must be documented.
-5. Exhaustion must be visible as a typed rejection/failure or an explicitly
+6. Exhaustion must be visible as a typed rejection/failure or an explicitly
    marked partial result. It must not silently return incomplete statistics as
    complete.
-6. An estimate is not a hard process-memory limit. Report the estimate and
+7. An estimate is not a hard process-memory limit. Report the estimate and
    its scope accurately; do not call it a process-wide memory guarantee.
 
-The shared `ExecutionBudget` primitive currently provides monotonic counters
-and structured exhaustion for normalization and EDA. Quality uses a separate
-`RuleBudget`; profiling and preprocessing use operation-specific policies.
-These implementations are not yet unified under one shared accounting
-interface.
+**Implemented and tested:** `ExecutionBudget` provides validated named limits,
+atomic cumulative counters, hierarchical child budgets, explicit reservations,
+and structured exhaustion. Quality's `RuleBudget` preserves its comparison and
+tracking-memory API while delegating accounting to this primitive. Preprocessing
+and EDA use it for estimated string materialization; normalization reserves
+exact temporary-output file growth before each local file write.
+
+**Operation-specific by design:** profiling retains its separate exactness and
+cardinality policies, now with bounded per-value and cumulative estimated
+tracking bytes. Parser row/depth/element limits and quality-rule comparison
+units remain phase-specific. These do not share a process-global budget.
+The HTTP upload, normalization, and quality routes are separate request
+operations; there is no request-to-worker execution context that propagates
+one parent budget across them. Child propagation is available to nested work
+that explicitly receives a parent budget, not an implicit cross-request quota.
+
+### Resource units and enforcement points
+
+| Dimension | Unit and scope | Accounting and enforcement | Status/limitation |
+| --- | --- | --- | --- |
+| Uploaded source | Exact bytes per upload | API reads bounded chunks before parsing/storage. | Implemented; does not cap reverse-proxy buffering. |
+| Parser records and structure | Rows/columns/elements/depth per parse | Checked during CSV/XLSX/Parquet/XML reading or before JSON result processing; XML source bytes are counted while read. | Implemented and tested, with format-specific paths. |
+| JSON expansion | Estimated bytes per parse | Source is limited to 1/64 of configured decoded budget; source depth is scanned before object decoding. | Estimate only; stdlib parsing still materializes the document and decoded string. |
+| XML row expansion | Current record and bounded parser chunk | Structural pass builds no tree; later passes build/flatten one record at a time. | Implemented; a single record can approach the configured file-size limit. |
+| Profile retention | Exact counts plus estimated bytes per profile operation | Per-value and cumulative retained-profile estimates; disables only affected exact summaries and warns. | Implemented with 64 KiB per-value and 16 MiB aggregate estimates; not RSS measurement. |
+| Preprocessing/EDA decoded strings | Estimated Python bytes per transform/analysis | Arrow string payload and conservative object/list overhead estimated before conversion; cumulative within the operation budget. | Implemented for covered conversions; not a process-wide cap. |
+| Quality work | Comparisons and retained tracking bytes per quality analysis | `RuleBudget` uses the shared counter/reservation primitive; partial results from an exhausted rule are discarded. | Implemented with operation-specific units and limits. |
+| Normalized output | Exact resulting temporary Parquet file bytes, cumulative across tables | Batch payload estimate checked before `write_batch`; sink reserves actual file growth before each write, including footer/finalization; successful file length must equal charged bytes. | Implemented and tested as a file-length cap; not a filesystem-block or total-disk quota. |
+| EDA pair/result work | Pairwise comparisons, scan bytes, estimated decoded strings, serialized bytes | Checked before/while selecting and analyzing pairs and before returning bounded JSON-safe output. | Implemented with deterministic operation-specific limits. |
+| Temporary storage | Temporary file length/lifecycle | Normalization removes output on all exit paths; callers use scoped temporary files/directories for artifact copies. | Implemented in covered paths; process crash cleanup is OS/temp-directory dependent. |
 
 ### Errors and result states
+
+- **Completed:** the requested bounded operation finished.
+- **Truncated:** partial output is returned only by an operation that explicitly
+  supports truncation and includes counts/warnings; EDA uses this for configured
+  pair/category/feature caps.
+- **Insufficient data:** an analysis does not meet its minimum input
+  requirements and returns its existing insufficient-data result.
+- **Rejected:** typed validation, provenance, configuration, or resource-limit
+  errors stop execution without a success-shaped complete result.
+- **Failed:** unexpected operation failures use the existing typed error or
+  failure-result contract for that module.
+
+These are canonical meanings, not a new universal serialized enum. Parsers and
+normalization continue to raise typed errors; quality reports per-rule
+budget-exhausted states; EDA retains its existing status/result schema.
+Consumers must not infer one phase's status field names apply to another phase.
 
 - Invalid configuration, invalid schema/input, provenance mismatch and
   exhausted hard limits are rejected with stable, sanitized typed errors.
 - Storage/integrity and execution failures retain operation-specific codes;
   internal data values are not included in public failure messages.
-- `completed` means the requested bounded operation finished.
-- `partially_completed` is allowed only where the contract explicitly reports
-  what was omitted or unsupported (such as EDA pair/category truncation).
-- `insufficient data` is an analysis outcome, not a fabricated statistic.
 - `failed` results are used only where that API already returns a result object;
   raised typed errors remain raised.
 - Failure, truncation, and insufficient-data metadata must remain
@@ -156,10 +198,10 @@ backend, and the health check does not mutate storage.
 | Module | Status | Entry point and actual responsibility | Limits, failure, provenance, and remaining boundary |
 | --- | --- | --- | --- |
 | Foundation/API | **Partial** | FastAPI in `backend/app/main.py`; SQLAlchemy metadata models and Alembic migrations; health and CRUD/upload/normalize/quality routes. | Local Compose only. No authentication or ownership enforcement. Requests perform significant work synchronously. |
-| Ingestion/parsing | **Partial** | `parse_dataset_file` handles CSV, TSV, XLSX, JSON, Parquet, and XML; validates parsing metadata; stores original bytes and deterministic profile. | Upload size defaults to 150 MiB; row/column and format-specific limits exist. CSV/TSV and Parquet are scanned in bounded records/batches. XML has file/depth/element caps but materializes a tree and flattened rows. JSON uses stdlib whole-document decoding and now applies a pre-read source-size estimate (see JSON boundary below). ZIP/folder/database/API sources are not implemented. |
-| Profiling | **Implemented for current parsers** | `DatasetProfiler` computes missing/empty, exact distinct/duplicate counts and numeric/category summaries within its own tracking budgets. | Distinct values default 100,000; numeric values 250,000; duplicate-row fingerprints 250,000. Exact fields become unavailable with warnings when tracking budgets are exceeded. Profile data does not replace artifact-bound analysis. |
-| Normalization | **Partial** | `normalize_file` reparses and validates source, builds normalized Parquet per logical table, validates rows/schema/nulls and stores checksummed objects. | Output defaults to 600 MiB, written in batches. Output-size enforcement occurs after each written batch/close, so a documented batch/footer overshoot may occur before cleanup. Uses `ExecutionBudget` for the cumulative temporary-output bytes. |
-| Quality analysis | **Partial** | API validates normalized artifacts, downloads verified local copies, runs deterministic registered rules, and persists versioned provenance-bound reports. | 600 MiB normalized-input cap, 4 MiB rule-tracking memory cap, shared comparison budget, bounded findings/examples/report serialization. `RuleBudget` is separate from `ExecutionBudget`. Real PostgreSQL advisory locking and MinIO integration are not established by unit tests. |
+| Ingestion/parsing | **Partial** | `parse_dataset_file` handles CSV, TSV, XLSX, JSON, Parquet, and XML; validates parsing metadata; stores original bytes and deterministic profile. | Upload size defaults to 150 MiB; row/column and format-specific limits exist. CSV/TSV and Parquet are scanned in bounded records/batches. XML uses secure bounded event passes and materializes at most one record tree at a time; parser profiling rereads the source rather than retaining all parsed rows. JSON uses stdlib whole-document decoding with source-byte and pre-decode depth checks (see JSON boundary below). ZIP/folder/database/API sources are not implemented. |
+| Profiling | **Implemented with documented limits** | `DatasetProfiler` computes missing/empty, exact distinct/duplicate counts and numeric/category summaries within operation-specific budgets. | Distinct values default 100,000; numeric values 250,000; duplicate-row fingerprints 250,000. Per-value estimates and a cumulative 16 MiB estimated-retention budget stop hashing/retaining oversized values and mark exact fields unavailable with warnings. Estimates are not measured heap usage. Profile data does not replace artifact-bound analysis. |
+| Normalization | **Partial** | `normalize_file` reparses and validates source, builds normalized Parquet per logical table, validates rows/schema/nulls and stores checksummed objects. | Output defaults to 600 MiB, written in batches. A raw Arrow batch-size estimate is checked before each batch; a write-through reservation enforces the exact resulting temporary Parquet file length, including footer bytes, before writes. Temporary files are removed on success and failure. This is an output-file length cap, not a process-memory or filesystem-allocation quota. |
+| Quality analysis | **Partial** | API validates normalized artifacts, downloads verified local copies, runs deterministic registered rules, and persists versioned provenance-bound reports. | 600 MiB normalized-input cap, 4 MiB rule-tracking memory cap, shared comparison budget, bounded findings/examples/report serialization. `RuleBudget` delegates its counters to `ExecutionBudget` while preserving quality-specific units and exhaustion semantics. Real PostgreSQL advisory locking and MinIO integration are not established by unit tests in this checkout. |
 | Preprocessing | **Partial** | `DEFAULT_TRANSFORMATION_REGISTRY` and `orchestrate_preprocessing` run explicit DA/BA transforms on Arrow tables; business-semantic operations require explicit approvals. | Input cap 64 MiB Arrow buffers, 1,000,000 rows, 256 columns. Python-string estimates are checked before the two whole-column `to_pylist` paths and share the byte ceiling across selected columns/chunks. This is not streaming or a process-wide memory bound. Output is in memory; no API/persistence. |
 | EDA | **Partial** | `analyze_normalized_file` performs univariate, bivariate and multivariate deterministic analysis on a selected verified normalized table. | Defaults/caps include 1,000,000 rows, 600 MiB selected-column scan metadata, 250,000 numeric values, 50,000 categories, 250,000 grouped values, 50,000 contingency cells, 4,000,000 pairwise work units, 128 MiB estimated decoded strings, and configured result serialization up to 1 MiB. EDA remains service-level; no API/history/UI. |
 | Frontend | **Partial** | React shell and system-health view. | API client currently calls only health and system-info; dataset and analysis workflows are not connected. |
@@ -168,18 +210,31 @@ backend, and the health check does not mutate storage.
 
 ### JSON expansion boundary
 
-`MAX_JSON_ESTIMATED_DECODED_MB` defaults to 256 MiB. The parser estimates
-decoded working memory conservatively as 64 times source bytes and rejects a
-document whose declared or observed source bytes exceed that budget before
-calling `json.loads`. This prevents an unbounded whole-document decode from
-proceeding beyond the configured estimate and ensures the read itself is
-bounded.
+`MAX_JSON_ESTIMATED_DECODED_MB` defaults to 256 MiB. The parser limits source
+bytes to 1/64 of that ceiling, checks nesting depth from the raw bytes before
+`json.loads`, and bounds the read even when declared file size is inaccurate.
+It releases the decoded text after constructing the Python document.
 
 The multiplier is an estimate, not a Python-version-independent upper bound on
-allocator/RSS usage. JSON still uses whole-document decoding below the cap.
+allocator/RSS usage. JSON still uses whole-document decoding below the cap and
+temporarily holds the source bytes and decoded text during decoding.
 Large JSON datasets may be rejected earlier than other formats. A true
 incremental JSON parser is a future option if the format contract and additional
 complexity are approved; this implementation does not claim streaming JSON.
+
+### XML record memory boundary
+
+**Implemented and tested:** XML uses `defusedxml` event callbacks with DTD,
+entity, and external access disabled. Source bytes, depth, elements, repeated
+record rows, and flattened columns are checked while scanning. One pass finds
+the single supported record group without constructing a document tree; later
+passes build and flatten one record at a time. Profiling uses another bounded
+pass. Normalization applies the same streaming row reader.
+
+This bounds retained XML parse structures by one record plus parser chunks,
+not total process memory. A single large record and its flattened fields can
+still be large up to the source-file limit; callers also retain their own
+inputs and profiles.
 
 ## Contracts retained by operation
 
@@ -210,9 +265,11 @@ deployment networking, or peak process memory.
 CI also defines a separate integration job that provisions a fresh PostgreSQL
 service, builds an isolated MinIO service, applies migrations, and exercises
 upload, source-object verification, normalization/Parquet verification, and
-quality analysis. This path is implemented but remains unverified until that
-job has run successfully. Do not run destructive database/storage integration
-tests against developer data or shared services.
+quality analysis. The job passed on baseline commit
+`3ba1bdce665574fff37259cb2b88d5b2ee1558db`; uncommitted changes still require
+their own CI run before their integration behavior is considered verified.
+Do not run destructive database/storage integration tests against developer
+data or shared services.
 The repository does not currently provide a verified production worker,
 authentication boundary, or remote deployment profile.
 

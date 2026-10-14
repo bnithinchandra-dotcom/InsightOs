@@ -12,9 +12,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from openpyxl import Workbook
 
+from app.execution import ExecutionBudget
 from app.normalization import (
     MAX_BATCH_SIZE,
     NormalizationError,
+    _BudgetedOutput,
+    _OutputLimitReached,
+    _json_load,
     get_normalization_configuration,
     normalize_file,
 )
@@ -40,6 +44,9 @@ class FakeObjectStorage:
     def get_object(self, bucket, key):
         return BytesIO(self.objects[(bucket, key)])
 
+    def remove_object(self, bucket, key):
+        self.objects.pop((bucket, key), None)
+
     def put_object(
         self,
         bucket,
@@ -56,6 +63,28 @@ class FakeObjectStorage:
 
 
 class NormalizationTests(unittest.TestCase):
+    def test_budgeted_output_enforces_exact_cap_and_releases_failed_write_reservations(self):
+        budget = ExecutionBudget({"normalized_output_bytes": 4})
+        output = BytesIO()
+        sink = _BudgetedOutput(output, budget)
+        self.assertEqual(sink.write(b"1234"), 4)
+        self.assertEqual(budget.used("normalized_output_bytes"), 4)
+        with self.assertRaises(_OutputLimitReached):
+            sink.write(b"5")
+        self.assertEqual(output.getvalue(), b"1234")
+        self.assertEqual(budget.used("normalized_output_bytes"), 4)
+
+        class FailingBuffer(BytesIO):
+            def write(self, _data):
+                raise OSError("injected local write failure")
+
+        failed_budget = ExecutionBudget({"normalized_output_bytes": 4})
+        failed_sink = _BudgetedOutput(FailingBuffer(), failed_budget)
+        with self.assertRaisesRegex(OSError, "injected local write failure"):
+            failed_sink.write(b"1234")
+        self.assertEqual(failed_budget.used("normalized_output_bytes"), 0)
+        self.assertEqual(failed_budget.remaining("normalized_output_bytes"), 4)
+
     def normalize(self, filename: str, content: bytes, storage=None):
         storage = storage or FakeObjectStorage()
         parsed = parse_dataset_file(filename, BytesIO(content), len(content)).as_dict()
@@ -351,10 +380,119 @@ class NormalizationTests(unittest.TestCase):
             for index in range(20)
         ]
         content = b"value\n" + b"\n".join(values) + b"\n"
+        storage = FakeObjectStorage()
         with patch.dict("os.environ", {"MAX_NORMALIZED_OUTPUT_MB": "1"}):
             with self.assertRaises(NormalizationError) as error:
-                self.normalize("large.csv", content)
+                self.normalize("large.csv", content, storage)
         self.assertEqual(error.exception.code, "resource_limit")
+        self.assertEqual(storage.put_count, 0)
+
+    def test_output_limit_during_writer_cleanup_preserves_typed_failure(self):
+        created_paths = []
+        original = tempfile.NamedTemporaryFile
+
+        def tracking_temp_file(*args, **kwargs):
+            output = original(*args, **kwargs)
+            created_paths.append(Path(output.name))
+            return output
+
+        with (
+            patch(
+                "app.normalization._normalization_settings",
+                return_value=("zstd", 8192, 10, "0" * 64),
+            ),
+            patch(
+                "app.normalization.tempfile.NamedTemporaryFile",
+                side_effect=tracking_temp_file,
+            ),
+            self.assertRaises(NormalizationError) as error,
+        ):
+            self.normalize("tiny-output-cap.csv", b"value\nx\n")
+
+        self.assertEqual(error.exception.code, "resource_limit")
+        self.assertEqual(len(created_paths), 1)
+        self.assertFalse(created_paths[0].exists())
+
+    def test_output_size_limit_removes_earlier_table_objects_from_failed_operation(self):
+        workbook = Workbook()
+        first = workbook.active
+        first.title = "small"
+        first.append(["value"])
+        first.append(["kept only if all tables normalize"])
+        second = workbook.create_sheet("large")
+        second.append(["value"])
+        for index in range(60):
+            value = base64.b64encode(
+                hashlib.shake_256(
+                    f"stable-multitable-limit-fixture-{index}".encode()
+                ).digest(60_000)
+            ).decode("ascii")
+            second.append([value])
+        output = BytesIO()
+        workbook.save(output)
+        storage = FakeObjectStorage()
+
+        with (
+            patch.dict("os.environ", {"MAX_NORMALIZED_OUTPUT_MB": "1"}),
+            self.assertRaises(NormalizationError) as error,
+        ):
+            self.normalize("multitable.xlsx", output.getvalue(), storage)
+
+        self.assertEqual(error.exception.code, "resource_limit")
+        self.assertEqual(storage.put_count, 1)
+        self.assertEqual(storage.objects, {})
+
+    def test_failed_output_validation_removes_the_temporary_parquet_file(self):
+        content = b"value\none\ntwo\n"
+        created_paths = []
+        original = tempfile.NamedTemporaryFile
+
+        def tracking_temp_file(*args, **kwargs):
+            output = original(*args, **kwargs)
+            created_paths.append(Path(output.name))
+            return output
+
+        with (
+            patch(
+                "app.normalization.tempfile.NamedTemporaryFile",
+                side_effect=tracking_temp_file,
+            ),
+            patch(
+                "app.normalization._validate_parquet",
+                side_effect=NormalizationError(
+                    "fidelity_validation_failed",
+                    "Injected validation failure.",
+                ),
+            ),
+            self.assertRaises(NormalizationError),
+        ):
+            self.normalize("validation-failure.csv", content)
+
+        self.assertEqual(len(created_paths), 1)
+        self.assertFalse(created_paths[0].exists())
+
+    def test_json_normalization_repeats_source_and_depth_preflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.json"
+            path.write_bytes(b'{"records":[]}' + b" " * (16 * 1024))
+            with (
+                patch.dict("os.environ", {"MAX_JSON_ESTIMATED_DECODED_MB": "1"}),
+                patch("app.normalization.json.loads") as loads,
+                self.assertRaises(NormalizationError) as error,
+            ):
+                _json_load(path)
+            self.assertEqual(error.exception.code, "resource_limit")
+            loads.assert_not_called()
+
+            path.write_text('{"a":{"b":{"c":1}}}', encoding="utf-8")
+            with (
+                patch.dict("os.environ", {"MAX_JSON_DEPTH": "2"}),
+                patch("app.normalization.json.loads") as loads,
+                self.assertRaises(NormalizationError) as error,
+            ):
+                _json_load(path)
+            self.assertEqual(error.exception.code, "resource_limit")
+            loads.assert_not_called()
 
     def test_normalization_batch_size_has_a_hard_upper_bound(self):
         with patch.dict("os.environ", {"NORMALIZATION_BATCH_SIZE": "0"}):

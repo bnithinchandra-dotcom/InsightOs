@@ -1,4 +1,5 @@
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 import pyarrow as pa
 
@@ -36,6 +37,72 @@ class ExecutionBudgetTests(unittest.TestCase):
             with self.subTest(resource=resource, amount=amount):
                 with self.assertRaises(ValueError):
                     budget.consume(resource, amount)
+
+    def test_child_budget_charges_parent_once_and_keeps_child_scope(self):
+        root = ExecutionBudget({"comparisons": 8})
+        child = root.child({"comparisons": 3})
+        child.consume("comparisons", 2)
+        root.consume("comparisons", 2)
+
+        self.assertEqual(root.used("comparisons"), 4)
+        self.assertEqual(child.used("comparisons"), 2)
+        self.assertEqual(child.remaining("comparisons"), 1)
+
+        with self.assertRaises(ExecutionBudgetExceeded):
+            child.consume("comparisons", 2)
+        self.assertEqual(root.used("comparisons"), 4)
+        self.assertEqual(child.used("comparisons"), 2)
+
+    def test_child_cannot_exceed_or_invent_parent_resources(self):
+        budget = ExecutionBudget({"rows": 5})
+        for limits in ({"rows": 6}, {"bytes": 1}):
+            with self.subTest(limits=limits), self.assertRaises(ValueError):
+                budget.child(limits)
+
+    def test_reservations_are_visible_and_cancelled_or_committed_atomically(self):
+        root = ExecutionBudget({"bytes": 10})
+        child = root.child({"bytes": 8})
+        reservation = child.reserve("bytes", 6)
+        self.assertEqual(root.remaining("bytes"), 4)
+        self.assertEqual(root.used("bytes"), 0)
+        reservation.cancel()
+        self.assertEqual(root.remaining("bytes"), 10)
+
+        committed = child.reserve("bytes", 6)
+        committed.commit(4)
+        self.assertEqual(root.used("bytes"), 4)
+        self.assertEqual(child.used("bytes"), 4)
+        self.assertEqual(root.remaining("bytes"), 6)
+
+        with self.assertRaises(ExecutionBudgetExceeded):
+            child.reserve("bytes", 5)
+
+    def test_concurrent_consumption_is_atomic_and_independent_budgets_are_isolated(self):
+        shared = ExecutionBudget({"work": 50})
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(
+                executor.map(
+                    lambda _index: self._consume_one(shared),
+                    range(100),
+                )
+            )
+        self.assertEqual(sum(results), 50)
+        self.assertEqual(shared.used("work"), 50)
+
+        first = ExecutionBudget({"work": 1})
+        second = ExecutionBudget({"work": 1})
+        first.consume("work")
+        second.consume("work")
+        self.assertEqual(first.used("work"), 1)
+        self.assertEqual(second.used("work"), 1)
+
+    @staticmethod
+    def _consume_one(budget):
+        try:
+            budget.consume("work")
+        except ExecutionBudgetExceeded:
+            return 0
+        return 1
 
     def test_string_estimate_accounts_for_dictionary_payload_and_expanded_rows(self):
         values = pa.DictionaryArray.from_arrays(

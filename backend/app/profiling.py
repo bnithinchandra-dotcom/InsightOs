@@ -8,7 +8,42 @@ from decimal import Decimal, InvalidOperation
 _MISSING = object()
 _MAX_SUMMARY_VALUES = 10
 _MAX_DISPLAY_VALUE_LENGTH = 256
+MAX_PROFILE_VALUE_ESTIMATE_BYTES = 64 * 1024
+MAX_PROFILE_TRACKING_ESTIMATE_BYTES = 16 * 1024 * 1024
 MISSING = _MISSING
+
+
+def _bounded_value_size_estimate(value, limit: int) -> int:
+    pending = [iter((value,))]
+    estimated = 64
+    while pending:
+        try:
+            item = next(pending[-1])
+        except StopIteration:
+            pending.pop()
+            continue
+        if isinstance(item, str):
+            estimated += len(item) * 8 + 64
+        elif isinstance(item, bytes):
+            estimated += len(item) + 64
+        elif isinstance(item, dict):
+            estimated += len(item) * 16 + 64
+            pending.append(iter(item.values()))
+            pending.append(iter(item.keys()))
+        elif isinstance(item, (list, tuple)):
+            estimated += len(item) * 8 + 64
+            pending.append(iter(item))
+        elif isinstance(item, bool):
+            estimated += 64
+        elif isinstance(item, int):
+            estimated += (item.bit_length() + 7) // 8 + 64
+        elif isinstance(item, Decimal):
+            estimated += len(item.as_tuple().digits) * 2 + 128
+        else:
+            estimated += 128
+        if estimated > limit:
+            return limit + 1
+    return estimated
 
 
 def _canonical_value(value) -> str:
@@ -112,13 +147,16 @@ class ProfileBudget:
         max_distinct_values: int,
         max_numeric_values: int,
         max_duplicate_rows: int,
+        max_tracking_bytes: int = MAX_PROFILE_TRACKING_ESTIMATE_BYTES,
     ):
         self.max_distinct_values = max_distinct_values
         self.max_numeric_values = max_numeric_values
         self.max_duplicate_rows = max_duplicate_rows
+        self.max_tracking_bytes = max_tracking_bytes
         self.distinct_values_used = 0
         self.numeric_values_used = 0
         self.duplicate_rows_used = 0
+        self.tracking_bytes_used = 0
         self.warnings: list[str] = []
         self.unsupported: list[str] = []
 
@@ -148,6 +186,8 @@ class ColumnProfiler:
         self.numeric_max: Decimal | None = None
         self.numeric_values: list[Decimal] | None = []
         self.value_counts: dict[str, list] | None = {}
+        self.tracked_bytes = 0
+        self.numeric_tracked_bytes = 0
         self.distinct_complete = True
 
     def observe(self, value) -> None:
@@ -158,27 +198,45 @@ class ColumnProfiler:
         if is_empty:
             self.empty += 1
 
-        fingerprint = _fingerprint(value)
+        value_estimate = _bounded_value_size_estimate(
+            value,
+            MAX_PROFILE_VALUE_ESTIMATE_BYTES,
+        )
+        fingerprint = None
+        if self.value_counts is not None and value_estimate <= MAX_PROFILE_VALUE_ESTIMATE_BYTES:
+            fingerprint = _fingerprint(value)
         if self.value_counts is not None:
-            if fingerprint in self.value_counts:
+            if fingerprint is not None and fingerprint in self.value_counts:
                 self.value_counts[fingerprint][1] += 1
-            elif self.budget.distinct_values_used < self.budget.max_distinct_values:
+            elif (
+                fingerprint is not None
+                and self.budget.distinct_values_used < self.budget.max_distinct_values
+                and self.budget.tracking_bytes_used + value_estimate * 2 + 256
+                <= self.budget.max_tracking_bytes
+            ):
                 display = _display_value(value)
                 truncated = len(display) > _MAX_DISPLAY_VALUE_LENGTH
                 if truncated:
                     display = display[:_MAX_DISPLAY_VALUE_LENGTH]
                 self.value_counts[fingerprint] = [display, 1, truncated]
                 self.budget.distinct_values_used += 1
+                retained_estimate = value_estimate * 2 + 256
+                self.budget.tracking_bytes_used += retained_estimate
+                self.tracked_bytes += retained_estimate
             else:
-                self.distinct_complete = False
-                self.budget.distinct_values_used -= len(self.value_counts)
-                self.value_counts = None
-                self.budget.warning(
+                self._discard_value_tracking(
                     "Exact distinct-value and categorical summaries exceeded the configured memory budget.",
                     "Exact distinct counts and categorical summaries are unavailable for columns exceeding the profile tracking budget.",
                 )
 
         if is_empty:
+            return
+        if value_estimate > MAX_PROFILE_VALUE_ESTIMATE_BYTES:
+            self.non_numeric += 1
+            self.budget.warning(
+                "Oversized values were excluded from exact profile summaries.",
+                "Values above the per-value profile estimate limit are excluded from numeric coercion, exact distinct counts, and categorical summaries.",
+            )
             return
         number = self._number(value, self.coerce_numeric_strings)
         if number is None:
@@ -190,16 +248,39 @@ class ColumnProfiler:
         self.numeric_min = number if self.numeric_min is None else min(self.numeric_min, number)
         self.numeric_max = number if self.numeric_max is None else max(self.numeric_max, number)
         if self.numeric_values is not None:
-            if self.budget.numeric_values_used < self.budget.max_numeric_values:
+            numeric_estimate = value_estimate + 128
+            if (
+                self.budget.numeric_values_used < self.budget.max_numeric_values
+                and self.budget.tracking_bytes_used + numeric_estimate
+                <= self.budget.max_tracking_bytes
+            ):
                 self.numeric_values.append(number)
                 self.budget.numeric_values_used += 1
+                self.budget.tracking_bytes_used += numeric_estimate
+                self.numeric_tracked_bytes += numeric_estimate
             else:
                 self.budget.numeric_values_used -= len(self.numeric_values)
+                self.budget.tracking_bytes_used -= self.numeric_tracked_bytes
+                self.numeric_tracked_bytes = 0
                 self.numeric_values = None
                 self.budget.warning(
                     "Exact numeric medians exceeded the configured memory budget.",
                     "Numeric minimum, maximum, and mean remain exact; median is unavailable where retaining all numeric values would exceed the profile tracking budget.",
                 )
+
+    def _discard_value_tracking(
+        self,
+        warning: str,
+        explanation: str,
+    ) -> None:
+        if self.value_counts is None:
+            return
+        self.distinct_complete = False
+        self.budget.distinct_values_used -= len(self.value_counts)
+        self.budget.tracking_bytes_used -= self.tracked_bytes
+        self.tracked_bytes = 0
+        self.value_counts = None
+        self.budget.warning(warning, explanation)
 
     @staticmethod
     def _number(value, coerce_numeric_strings: bool) -> Decimal | None:
@@ -329,6 +410,7 @@ class TableProfiler:
         ]
         self.row_count = 0
         self.row_fingerprints: set[str] | None = set()
+        self.row_fingerprint_estimate_bytes = 0
         self.duplicate_rows = 0
         self.budget = budget
 
@@ -346,8 +428,17 @@ class TableProfiler:
             column.observe(value)
 
         if self.row_fingerprints is not None:
-            if self.budget.duplicate_rows_used >= self.budget.max_duplicate_rows:
+            row_estimate = _bounded_value_size_estimate(
+                values,
+                MAX_PROFILE_VALUE_ESTIMATE_BYTES,
+            )
+            if (
+                self.budget.duplicate_rows_used >= self.budget.max_duplicate_rows
+                or row_estimate > MAX_PROFILE_VALUE_ESTIMATE_BYTES
+            ):
                 self.budget.duplicate_rows_used -= len(self.row_fingerprints)
+                self.budget.tracking_bytes_used -= self.row_fingerprint_estimate_bytes
+                self.row_fingerprint_estimate_bytes = 0
                 self.row_fingerprints = None
                 self.budget.warning(
                     "Duplicate-row detection exceeded the configured memory budget.",
@@ -357,9 +448,23 @@ class TableProfiler:
                 fingerprint = _row_fingerprint(values)
                 if fingerprint in self.row_fingerprints:
                     self.duplicate_rows += 1
+                elif (
+                    self.budget.tracking_bytes_used + 256
+                    > self.budget.max_tracking_bytes
+                ):
+                    self.budget.duplicate_rows_used -= len(self.row_fingerprints)
+                    self.budget.tracking_bytes_used -= self.row_fingerprint_estimate_bytes
+                    self.row_fingerprint_estimate_bytes = 0
+                    self.row_fingerprints = None
+                    self.budget.warning(
+                        "Duplicate-row detection exceeded the configured memory budget.",
+                        "Duplicate-row counts are unavailable when the dataset exceeds the configured row-fingerprint tracking budget.",
+                    )
                 else:
                     self.row_fingerprints.add(fingerprint)
                     self.budget.duplicate_rows_used += 1
+                    self.budget.tracking_bytes_used += 256
+                    self.row_fingerprint_estimate_bytes += 256
 
     def as_dict(self) -> dict:
         return {

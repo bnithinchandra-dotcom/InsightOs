@@ -54,12 +54,16 @@ release cannot be guaranteed until the connection or backend process terminates.
 resource limits. `MAX_PROFILE_DISTINCT_VALUES` (default 100,000),
 `MAX_PROFILE_NUMERIC_VALUES` (default 250,000), and
 `MAX_PROFILE_DUPLICATE_ROWS` (default 250,000) bound additional profiling
-memory use. `MAX_JSON_ESTIMATED_DECODED_MB` (default 256 MiB) sets the estimated
+cardinality. Profile tracking also stops hashing or retaining any value whose
+conservative estimate exceeds 64 KiB and enforces a cumulative estimated
+16 MiB retained-value budget. These estimates bound selected profile
+structures; they are not measured Python heap usage.
+`MAX_JSON_ESTIMATED_DECODED_MB` (default 256 MiB) sets the estimated
 decoded-memory ceiling for JSON parsing. Before reading or decoding the
-document, the parser limits source bytes to 1/64 of that ceiling. This is a
-conservative input-expansion estimate, not an exact Python heap measurement;
-JSON files above the resulting source-byte limit are rejected with
-`resource_limit`.
+document, the parser limits source bytes to 1/64 of that ceiling and scans raw
+bytes for nesting depth. This is a conservative input-expansion estimate, not
+an exact Python heap measurement; JSON files above the resulting source-byte
+limit are rejected with `resource_limit`.
 
 CSV and TSV use UTF-8 (an optional UTF-8 BOM is accepted), with the first record
 as the header and strict row widths. Their physical type is text; values are
@@ -85,9 +89,12 @@ constant source value on each record row. Missing elements and empty values
 are counted separately, and mixed text/element content or repeated nested
 fields are rejected as unsupported rather than silently flattened.
 All DTD declarations, including internal subsets, and external entities are
-forbidden. XML is parsed with a bounded tree builder that enforces depth and
-element-count limits as start elements arrive, before those nodes are added to
-the tree. The configured XML file-size limit is also applied before parsing.
+forbidden. XML is scanned with secure event callbacks. Source-byte, depth,
+element, row, and flattened-column limits are enforced while parsing. The first
+pass identifies the unique repeated-record group without retaining an XML
+tree; later passes flatten one record at a time. A single record can still
+consume memory proportional to its content, bounded by the configured source
+file limit.
 
 Parsing metadata describes file structure and physical types. Neither parsing
 nor profiling infers semantic meaning, modifies source values, or performs
@@ -170,17 +177,23 @@ present values are null.
 
 `NORMALIZATION_COMPRESSION` selects an installed Parquet codec (default `zstd`;
 `none` disables compression). `NORMALIZATION_BATCH_SIZE` bounds row batches
-(default 8,192; maximum 65,536), and `MAX_NORMALIZED_OUTPUT_MB` caps total generated output
-(default 600 MiB). CSV/TSV, XLSX, and Parquet values are processed in batches.
-The existing JSON parser materializes a JSON document, and XML normalization
-uses the parser's bounded XML tree; those formats are therefore bounded by the
-configured upload, row, nesting, and XML limits but are not fully streaming.
+(default 8,192; maximum 65,536), and `MAX_NORMALIZED_OUTPUT_MB` caps total
+generated Parquet file length (default 600 MiB). An Arrow batch-size estimate
+is checked before writing; a bounded output sink reserves exact file growth
+before each write, including Parquet finalization. The cap applies to the
+resulting file bytes, not filesystem allocation overhead or process memory.
+CSV/TSV, XLSX, and Parquet values are processed in batches. XML normalization
+uses a bounded event parser and materializes one record at a time. JSON parsing
+still materializes the full document within its configured source-size
+estimate.
 Normalization is synchronous; the current worker does not run background jobs.
 The output can be larger than its source. The API does not implement
 application-level authentication or project ownership checks; deployments must
 place it behind a trusted network boundary or an authenticating gateway.
-Automated tests use mocked object storage and isolated SQLite databases; live
-PostgreSQL advisory-lock and MinIO behavior has not been exercised.
+Unit tests use mocked object storage and isolated SQLite databases. The
+separate PostgreSQL/MinIO CI integration job passed on baseline commit
+`3ba1bdce665574fff37259cb2b88d5b2ee1558db`; these uncommitted changes require
+their own CI run before their live-service behavior is considered verified.
 
 Database sources such as PostgreSQL and MySQL, live servers, streaming, polling,
 and cloud object storage require separate connector-based ingestion paths.

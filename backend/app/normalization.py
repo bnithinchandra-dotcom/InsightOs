@@ -1,8 +1,10 @@
 import csv
 import hashlib
 import json
+import logging
 import math
 import os
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime, time
@@ -21,14 +23,13 @@ from app.parsing import (
     MISSING,
     ParserConfigurationError,
     ParsingError,
-    _flatten_xml_record,
-    _parse_xml_tree,
-    _xml_candidates,
-    _xml_depths,
+    _iter_xml_records,
+    _check_json_source_depth,
     get_parse_limits,
     parse_dataset_file,
 )
 
+logger = logging.getLogger(__name__)
 
 NORMALIZATION_PIPELINE_VERSION = "1"
 DEFAULT_BATCH_SIZE = 8192
@@ -42,6 +43,68 @@ class NormalizationError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class _OutputLimitReached(OSError):
+    pass
+
+
+class _BudgetedOutput:
+    def __init__(self, output, budget: ExecutionBudget):
+        self._output = output
+        self._budget = budget
+        self._size = 0
+        self.exhausted = False
+
+    def write(self, data):
+        position = self._output.tell()
+        end = position + len(data)
+        growth = max(0, end - self._size)
+        try:
+            reservation = self._budget.reserve("normalized_output_bytes", growth)
+        except ExecutionBudgetExceeded:
+            self.exhausted = True
+            raise _OutputLimitReached(
+                "Normalized output exceeds MAX_NORMALIZED_OUTPUT_MB."
+            ) from None
+        try:
+            written = self._output.write(data)
+            if written != len(data):
+                raise OSError("The temporary Parquet output accepted a partial write.")
+            reservation.commit(growth)
+            self._size = max(self._size, end)
+            return written
+        except BaseException:
+            reservation.cancel()
+            raise
+
+    def tell(self):
+        return self._output.tell()
+
+    def seek(self, offset, whence=0):
+        return self._output.seek(offset, whence)
+
+    def flush(self):
+        return self._output.flush()
+
+    def close(self):
+        return self._output.close()
+
+    @property
+    def closed(self):
+        return self._output.closed
+
+    def writable(self):
+        return True
+
+    def readable(self):
+        return False
+
+    def seekable(self):
+        return True
+
+    def __getattr__(self, name):
+        return getattr(self._output, name)
 
 
 @dataclass
@@ -116,6 +179,40 @@ def _normalization_settings() -> tuple[str, int, int, str]:
 
 
 def _json_load(path: Path):
+    try:
+        limits = get_parse_limits()
+    except ParserConfigurationError:
+        raise NormalizationError(
+            "invalid_configuration",
+            "Parser limits are invalid for JSON normalization.",
+        ) from None
+    max_source_bytes = limits.max_json_decoded_bytes // 64
+    try:
+        if path.stat().st_size > max_source_bytes:
+            raise NormalizationError(
+                "resource_limit",
+                "The JSON source exceeds the configured decoded-memory estimate.",
+            )
+        with path.open("rb") as source:
+            encoded = source.read(max_source_bytes + 1)
+        if len(encoded) > max_source_bytes:
+            raise NormalizationError(
+                "resource_limit",
+                "The JSON source exceeds the configured decoded-memory estimate.",
+            )
+        _check_json_source_depth(encoded, limits.max_json_depth)
+        text = encoded.decode("utf-8-sig")
+        del encoded
+    except NormalizationError:
+        raise
+    except ParsingError as error:
+        raise NormalizationError(error.code, error.message) from None
+    except (OSError, UnicodeError):
+        raise NormalizationError(
+            "invalid_source",
+            "The JSON source could not be read using its supported structure.",
+        ) from None
+
     def reject_constant(_value):
         raise NormalizationError(
             "invalid_source",
@@ -134,14 +231,15 @@ def _json_load(path: Path):
         return result
 
     try:
-        with path.open("r", encoding="utf-8-sig", newline="") as source:
-            return json.load(
-                source,
-                object_pairs_hook=reject_duplicate_keys,
-                parse_float=Decimal,
-                parse_int=int,
-                parse_constant=reject_constant,
-            )
+        document = json.loads(
+            text,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_float=Decimal,
+            parse_int=int,
+            parse_constant=reject_constant,
+        )
+        del text
+        return document
     except NormalizationError:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
@@ -383,16 +481,6 @@ def _read_parquet_tables(path: Path, parsed: dict):
 
 
 def _read_xml_tables(path: Path, parsed: dict):
-    with path.open("rb") as source:
-        root, _element_count = _parse_xml_tree(source, get_parse_limits())
-    depths, _count = _xml_depths(root, get_parse_limits())
-    candidates = _xml_candidates(root, depths)
-    if len(candidates) != 1:
-        raise NormalizationError(
-            "unsupported_structure",
-            "The XML source no longer has the single record group selected during parsing.",
-        )
-    _depth, _parent, _tag, records = candidates[0]
     container_columns, container_values = _xml_container_fields(parsed)
     record_columns = parsed["columns"]
     record_names = [column["name"] for column in record_columns]
@@ -406,12 +494,22 @@ def _read_xml_tables(path: Path, parsed: dict):
     columns = record_columns + container_columns
 
     def rows():
-        for record in records:
+        with path.open("rb") as source:
             try:
-                flattened = _flatten_xml_record(record)
+                for flattened in _iter_xml_records(
+                    source,
+                    get_parse_limits(),
+                    parsed.get("metadata", {}).get("record_path"),
+                    parsed.get("metadata", {}).get("record_element"),
+                ):
+                    yield [flattened.get(name) for name in record_names] + container_values
+            except ParserConfigurationError as error:
+                raise NormalizationError(
+                    "invalid_configuration",
+                    "Parser limits are invalid for XML normalization.",
+                ) from error
             except ParsingError as error:
                 raise NormalizationError(error.code, error.message) from None
-            yield [flattened.get(name) for name in record_names] + container_values
 
     yield LogicalTable(None, columns, rows())
 
@@ -793,33 +891,25 @@ def _normalize_table(
     arrow_schema = arrow_schema.with_metadata(
         {**(arrow_schema.metadata or {}), **metadata}
     )
-    output_temp = tempfile.NamedTemporaryFile(prefix="insightos-normalized-", suffix=".parquet", delete=False)
+    output_temp = tempfile.NamedTemporaryFile(
+        prefix="insightos-normalized-",
+        suffix=".parquet",
+        mode="w+b",
+        delete=False,
+    )
     output_path = Path(output_temp.name)
-    output_temp.close()
     expected_digest = hashlib.sha256()
     expected_nulls = [0] * len(arrow_schema)
     expected_empty = [0] * len(arrow_schema)
     row_count = 0
     writer = None
     output_budget = ExecutionBudget({"normalized_output_bytes": remaining_output_bytes})
+    output_sink = _BudgetedOutput(output_temp, output_budget)
 
     try:
-        def check_temporary_size() -> None:
-            current_size = output_path.stat().st_size
-            try:
-                output_budget.consume(
-                    "normalized_output_bytes",
-                    current_size - output_budget.used("normalized_output_bytes"),
-                )
-            except ExecutionBudgetExceeded:
-                raise NormalizationError(
-                    "resource_limit",
-                    "Normalized output exceeds MAX_NORMALIZED_OUTPUT_MB.",
-                ) from None
-
         try:
             writer = pq.ParquetWriter(
-                output_path,
+                output_sink,
                 arrow_schema,
                 compression=None if compression == "uncompressed" else compression,
             )
@@ -845,9 +935,9 @@ def _normalize_table(
                             expected_digest,
                             expected_nulls,
                             expected_empty,
+                            output_budget,
                         )
                         current_rows.clear()
-                        check_temporary_size()
                     if row_count + len(current_rows) > _positive_env(
                         "MAX_DATASET_ROWS", 1_000_000
                     ):
@@ -867,20 +957,30 @@ def _normalize_table(
                     expected_digest,
                     expected_nulls,
                     expected_empty,
+                    output_budget,
                 )
-                check_temporary_size()
             writer.close()
             writer = None
         except NormalizationError:
             raise
         except (OSError, ValueError, TypeError, OverflowError, pa.ArrowException):
+            if output_sink.exhausted:
+                raise NormalizationError(
+                    "resource_limit",
+                    "Normalized output exceeds MAX_NORMALIZED_OUTPUT_MB.",
+                ) from None
             raise NormalizationError(
                 "conversion_failed",
                 "Source values could not be represented by the normalized Parquet schema.",
             ) from None
 
+        output_temp.flush()
         size = output_path.stat().st_size
-        check_temporary_size()
+        if size != output_budget.used("normalized_output_bytes"):
+            raise NormalizationError(
+                "output_validation_failed",
+                "The normalized output size did not match its reserved byte count.",
+            )
         checksum = _file_sha256(output_path)
         validation = _validate_parquet(
             output_path,
@@ -923,7 +1023,7 @@ def _normalize_table(
 
         if not storage.bucket_exists(processed_bucket):
             storage.make_bucket(processed_bucket)
-        _put_verified_object(
+        object_created = _put_verified_object(
             storage,
             processed_bucket,
             object_key,
@@ -931,14 +1031,28 @@ def _normalize_table(
             size,
             checksum,
         )
-        return output, size
+        return output, size, object_created
     finally:
-        if writer is not None:
-            writer.close()
         try:
-            output_path.unlink()
-        except FileNotFoundError:
-            pass
+            if writer is not None:
+                active_error = sys.exception()
+                try:
+                    writer.close()
+                except (OSError, ValueError, TypeError, pa.ArrowException) as cleanup_error:
+                    if active_error is None:
+                        raise
+                    logger.error(
+                        "Could not close temporary Parquet writer while handling normalization failure (%s)",
+                        type(cleanup_error).__name__,
+                    )
+        finally:
+            try:
+                output_temp.close()
+            finally:
+                try:
+                    output_path.unlink()
+                except FileNotFoundError:
+                    pass
 
 
 def _write_batch(
@@ -948,6 +1062,7 @@ def _write_batch(
     digest,
     null_counts: list[int],
     empty_counts: list[int],
+    output_budget: ExecutionBudget,
 ) -> int:
     arrays = []
     for column_index, field in enumerate(schema):
@@ -960,6 +1075,12 @@ def _write_batch(
                 f"Values in column {field.name!r} do not fit the safe Parquet type.",
             ) from None
     batch = pa.RecordBatch.from_arrays(arrays, schema=schema)
+    encoded_size_estimate = batch.nbytes + max(4096, len(schema) * 1024)
+    if encoded_size_estimate > output_budget.remaining("normalized_output_bytes"):
+        raise NormalizationError(
+            "resource_limit",
+            "The next normalized batch is estimated to exceed MAX_NORMALIZED_OUTPUT_MB.",
+        )
     for row_index in range(batch.num_rows):
         values = [
             batch.column(column_index)[row_index].as_py()
@@ -998,7 +1119,7 @@ def _put_verified_object(
             raise
     else:
         if stat.size == size and _remote_sha256(storage, bucket, key, size) == checksum:
-            return
+            return False
 
     with path.open("rb") as source:
         storage.put_object(
@@ -1021,6 +1142,7 @@ def _put_verified_object(
             "storage_verification_failed",
             "Normalized Parquet output size or checksum did not match after storage.",
         )
+    return True
 
 
 def _remote_sha256(storage, bucket: str, key: str, expected_size: int) -> str:
@@ -1297,87 +1419,100 @@ def normalize_file(
 
     tables = []
     output_bytes = 0
+    created_objects = []
     table_sources = _table_sources(source_path, parsed_result)
     try:
-        for table_index, table in enumerate(table_sources):
-            if not table.columns and parsed_result["detected_format"] == "xlsx":
-                tables.append(
-                    {
-                        "table_index": table_index,
-                        "table_name": table.name,
-                        "object_key": None,
-                        "file_size_bytes": 0,
-                        "sha256": None,
-                        "compression": compression,
-                        "schema": [],
-                        "row_count": 0,
-                        "column_count": 0,
-                        "null_value_counts": [],
-                        "empty_value_counts": [],
-                        "validation_status": "passed",
-                        "warnings": [
-                            "Empty worksheet has no columns; its identity is retained in normalization metadata without a Parquet object."
-                        ],
-                    }
+        try:
+            for table_index, table in enumerate(table_sources):
+                if not table.columns and parsed_result["detected_format"] == "xlsx":
+                    tables.append(
+                        {
+                            "table_index": table_index,
+                            "table_name": table.name,
+                            "object_key": None,
+                            "file_size_bytes": 0,
+                            "sha256": None,
+                            "compression": compression,
+                            "schema": [],
+                            "row_count": 0,
+                            "column_count": 0,
+                            "null_value_counts": [],
+                            "empty_value_counts": [],
+                            "validation_status": "passed",
+                            "warnings": [
+                                "Empty worksheet has no columns; its identity is retained in normalization metadata without a Parquet object."
+                            ],
+                        }
+                    )
+                    continue
+                result, size, object_created = _normalize_table(
+                    table,
+                    source_path,
+                    parsed_result["detected_format"],
+                    dataset_id,
+                    file_id,
+                    source_checksum,
+                    config_hash,
+                    table_index,
+                    compression,
+                    batch_size,
+                    max_output_bytes - output_bytes,
+                    storage,
+                    processed_bucket,
                 )
-                continue
-            result, size = _normalize_table(
-                table,
-                source_path,
-                parsed_result["detected_format"],
-                dataset_id,
-                file_id,
-                source_checksum,
-                config_hash,
-                table_index,
-                compression,
-                batch_size,
-                max_output_bytes - output_bytes,
-                storage,
-                processed_bucket,
-            )
-            output_bytes += size
-            tables.append(result)
-    finally:
-        close_tables = getattr(table_sources, "close", None)
-        if close_tables is not None:
-            close_tables()
+                output_bytes += size
+                tables.append(result)
+                if object_created:
+                    created_objects.append(result["object_key"])
+            if not tables:
+                raise NormalizationError(
+                    "empty_source",
+                    "No logical tables were available to normalize.",
+                )
+            if sum(table["row_count"] for table in tables) != parsed_result["row_count"]:
+                raise NormalizationError(
+                    "fidelity_validation_failed",
+                    "Normalized table row counts do not match the parsed source.",
+                )
 
-    if not tables:
-        raise NormalizationError(
-            "empty_source",
-            "No logical tables were available to normalize.",
-        )
-    if sum(table["row_count"] for table in tables) != parsed_result["row_count"]:
-        raise NormalizationError(
-            "fidelity_validation_failed",
-            "Normalized table row counts do not match the parsed source.",
-        )
-
-    return {
-        "version": 1,
-        "pipeline_version": NORMALIZATION_PIPELINE_VERSION,
-        "status": "Ready",
-        "source": {
-            "dataset_id": dataset_id,
-            "file_id": file_id,
-            "filename": source_filename,
-            "sha256": source_checksum,
-            "file_size_bytes": source_path.stat().st_size,
-        },
-        "configuration": {
-            "compression": compression,
-            "batch_size": batch_size,
-            "configuration_sha256": config_hash,
-            "pipeline_version": NORMALIZATION_PIPELINE_VERSION,
-        },
-        "detected_format": parsed_result["detected_format"],
-        "row_count": sum(table["row_count"] for table in tables),
-        "column_count": sum(table["column_count"] for table in tables),
-        "output_size_bytes": output_bytes,
-        "tables": tables,
-        "validation_status": "passed",
-        "warnings": list(dict.fromkeys(
-            warning for table in tables for warning in table["warnings"]
-        )),
-    }
+            return {
+                "version": 1,
+                "pipeline_version": NORMALIZATION_PIPELINE_VERSION,
+                "status": "Ready",
+                "source": {
+                    "dataset_id": dataset_id,
+                    "file_id": file_id,
+                    "filename": source_filename,
+                    "sha256": source_checksum,
+                    "file_size_bytes": source_path.stat().st_size,
+                },
+                "configuration": {
+                    "compression": compression,
+                    "batch_size": batch_size,
+                    "configuration_sha256": config_hash,
+                    "pipeline_version": NORMALIZATION_PIPELINE_VERSION,
+                },
+                "detected_format": parsed_result["detected_format"],
+                "row_count": sum(table["row_count"] for table in tables),
+                "column_count": sum(table["column_count"] for table in tables),
+                "output_size_bytes": output_bytes,
+                "tables": tables,
+                "validation_status": "passed",
+                "warnings": list(dict.fromkeys(
+                    warning for table in tables for warning in table["warnings"]
+                )),
+            }
+        finally:
+            close_tables = getattr(table_sources, "close", None)
+            if close_tables is not None:
+                close_tables()
+    except Exception:
+        for object_key in reversed(created_objects):
+            try:
+                storage.remove_object(processed_bucket, object_key)
+            except (MinioException, HTTPError, OSError) as cleanup_error:
+                logger.error(
+                    "Could not remove normalized object after failed operation (%s)",
+                    type(cleanup_error).__name__,
+                )
+        raise

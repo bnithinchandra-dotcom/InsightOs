@@ -8,6 +8,7 @@ import pyarrow.parquet as pq
 from openpyxl import Workbook
 
 from app.parsing import ParsingError, parse_dataset_file
+from app.parsing import _flatten_xml_record as flatten_xml_record
 
 
 def parse(filename: str, content: bytes):
@@ -23,6 +24,23 @@ class ReadTrackingStream(BytesIO):
         result = super().read(size)
         self.bytes_read += len(result)
         return result
+
+
+class PassTrackingStream(BytesIO):
+    def __init__(self, content: bytes):
+        super().__init__(content)
+        self.pass_bytes_read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        result = super().read(size)
+        self.pass_bytes_read += len(result)
+        return result
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        position = super().seek(offset, whence)
+        if offset == 0 and whence == 0:
+            self.pass_bytes_read = 0
+        return position
 
 
 def make_xlsx() -> bytes:
@@ -302,6 +320,24 @@ class ParsingTests(unittest.TestCase):
         ).profile_result["tables"][0]["columns"][0]["categorical_summary"]
         self.assertLessEqual(len(categorical), 10)
 
+    def test_profile_large_value_is_rejected_before_fingerprinting_or_row_hashing(self):
+        content = ("value\n" + "x" * (80 * 1024) + "\n").encode()
+        with (
+            patch("app.profiling._fingerprint") as fingerprint,
+            patch("app.profiling._row_fingerprint") as row_fingerprint,
+        ):
+            result = parse("large-value.csv", content)
+
+        column = result.profile_result["tables"][0]["columns"][0]
+        self.assertIsNone(column["distinct_value_count"])
+        self.assertIsNone(column["categorical_summary"])
+        self.assertIsNone(
+            result.profile_result["tables"][0]["duplicate_row_count"]
+        )
+        self.assertTrue(result.profile_result["warnings"])
+        fingerprint.assert_not_called()
+        row_fingerprint.assert_not_called()
+
     def test_xml_namespaces_attributes_nested_and_missing_values(self):
         content = (
             b'<d:root xmlns:d="urn:records">'
@@ -332,6 +368,51 @@ class ParsingTests(unittest.TestCase):
             "{urn:records}note",
             [column["name"] for column in result.columns],
         )
+
+    def test_xml_records_are_flattened_incrementally_without_retaining_the_document(self):
+        content = (
+            b"<root>"
+            + b"".join(
+                f"<record><value>{index:05d}-".encode()
+                + b"x" * 48
+                + b"</value></record>"
+                for index in range(2_000)
+            )
+            + b"</root>"
+        )
+        stream = PassTrackingStream(content)
+        flattened_while_streaming = []
+
+        def tracked_flatten(record, max_columns=None):
+            flattened_while_streaming.append(stream.pass_bytes_read)
+            return flatten_xml_record(record, max_columns)
+
+        with patch(
+            "app.parsing._flatten_xml_record",
+            side_effect=tracked_flatten,
+        ):
+            result = parse_dataset_file("large-records.xml", stream, len(content))
+
+        self.assertEqual(result.row_count, 2_000)
+        self.assertGreater(len(content), 64 * 1024)
+        self.assertTrue(flattened_while_streaming)
+        self.assertLess(flattened_while_streaming[0], len(content))
+
+    def test_xml_row_and_column_limits_are_enforced_while_records_are_processed(self):
+        content = (
+            b"<root><record><a>1</a><b>2</b></record>"
+            b"<record><a>3</a><b>4</b></record>"
+            b"<record><a>5</a><b>6</b></record></root>"
+        )
+        with patch.dict(os.environ, {"MAX_DATASET_ROWS": "2"}):
+            with self.assertRaises(ParsingError) as context:
+                parse("rows.xml", content)
+        self.assertEqual(context.exception.code, "resource_limit")
+
+        with patch.dict(os.environ, {"MAX_DATASET_COLUMNS": "1"}):
+            with self.assertRaises(ParsingError) as context:
+                parse("columns.xml", content)
+        self.assertEqual(context.exception.code, "resource_limit")
 
     def test_malformed_empty_mismatched_and_ambiguous_inputs_fail(self):
         for extension in ("csv", "tsv", "xlsx", "json", "parquet", "xml"):
@@ -434,6 +515,17 @@ class ParsingTests(unittest.TestCase):
             with self.assertRaises(ParsingError) as context:
                 parse("deep.json", b'{"a":{"b":{"c":1}}}')
         self.assertEqual(context.exception.code, "resource_limit")
+
+    def test_json_depth_is_rejected_before_document_materialization(self):
+        payload = b'{"a":{"b":{"c":1}}}'
+        with (
+            patch.dict(os.environ, {"MAX_JSON_DEPTH": "2"}),
+            patch("app.parsing.json.loads") as loads,
+        ):
+            with self.assertRaises(ParsingError) as context:
+                parse("deep.json", payload)
+        self.assertEqual(context.exception.code, "resource_limit")
+        loads.assert_not_called()
 
     def test_json_memory_estimate_rejects_before_reading_or_decoding(self):
         payload = b'{"records":[]}' + b" " * (16 * 1024)

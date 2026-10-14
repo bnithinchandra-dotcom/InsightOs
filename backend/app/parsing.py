@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from io import TextIOWrapper
 from typing import BinaryIO
+from xml.parsers.expat import ExpatError
 
 from defusedxml import ElementTree as SafeElementTree
 from defusedxml.common import DefusedXmlException
@@ -14,7 +15,7 @@ from openpyxl.styles.numbers import is_datetime
 from openpyxl.utils.exceptions import InvalidFileException
 import pyarrow as pa
 import pyarrow.parquet as pq
-from xml.etree.ElementTree import ParseError, TreeBuilder
+from xml.etree.ElementTree import ParseError
 
 from app.profiling import DatasetProfiler, MISSING
 
@@ -209,7 +210,9 @@ def _read_json(
                 "resource_limit",
                 "The JSON document exceeds the configured decoded-memory estimate.",
             )
+        _check_json_source_depth(encoded, limits.max_json_depth)
         text = encoded.decode("utf-8-sig")
+        del encoded
         if not text.strip():
             _fail("empty_file", "The uploaded JSON file is empty.")
 
@@ -232,6 +235,7 @@ def _read_json(
                 "The JSON document contains a non-standard numeric value.",
             ),
         )
+        del text
     except ParsingError:
         raise
     except UnicodeDecodeError:
@@ -342,6 +346,32 @@ def _check_json_depth(document, max_depth: int) -> None:
             pending.extend((child, depth + 1) for child in value)
 
 
+def _check_json_source_depth(encoded: bytes, max_depth: int) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for token in encoded:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif token == ord("\\"):
+                escaped = True
+            elif token == ord('"'):
+                in_string = False
+            continue
+        if token == ord('"'):
+            in_string = True
+        elif token in (ord("{"), ord("[")):
+            depth += 1
+            if depth > max_depth:
+                _fail(
+                    "resource_limit",
+                    "The JSON document exceeds the configured nesting limit.",
+                )
+        elif token in (ord("}"), ord("]")):
+            depth -= 1
+
+
 def _read_delimited(
     filename: str,
     stream: BinaryIO,
@@ -367,7 +397,7 @@ def _read_delimited(
         )
     if sample.startswith(b"<"):
         try:
-            _parse_xml_tree(stream, limits)
+            _feed_xml_parser(stream, _XmlDocumentValidator(limits), limits)
         except ParsingError as error:
             if error.code != "malformed_xml":
                 raise
@@ -676,36 +706,370 @@ def _xml_name(name: str) -> str:
     return name
 
 
-def _xml_depths(root, limits: ParseLimits) -> tuple[dict[int, int], int]:
-    depths = {}
-    stack = [(root, 1)]
-    elements = 0
-    while stack:
-        element, depth = stack.pop()
-        elements += 1
-        if elements > limits.max_xml_elements:
-            _fail("resource_limit", "The XML document exceeds the configured element limit.")
-        if depth > limits.max_xml_depth:
+@dataclass(frozen=True)
+class _XmlStructure:
+    parent_path: tuple[str, ...]
+    record_tag: str
+    record_count: int
+    container_attributes: list[dict]
+    element_count: int
+    source_size_bytes: int
+
+
+@dataclass
+class _XmlScanFrame:
+    tag: str
+    attributes: dict[str, str]
+    child_counts: dict[str, int] = field(default_factory=dict)
+    child_count: int = 0
+    text_nonwhite: bool = False
+    post_child_text_nonwhite: bool = False
+    last_child_ended: bool = False
+
+
+@dataclass
+class _XmlNode:
+    tag: str
+    attrib: dict[str, str]
+    text: str = ""
+    tail: str = ""
+    children: list[_XmlNode] = field(default_factory=list)
+
+    def __iter__(self):
+        return iter(self.children)
+
+
+@dataclass
+class _XmlBuildFrame:
+    tag: str
+    node: _XmlNode | None
+    is_record: bool = False
+    last_child_ended: bool = False
+
+
+class _XmlScanner:
+    def __init__(self, limits: ParseLimits):
+        self.limits = limits
+        self.stack: list[_XmlScanFrame] = []
+        self.element_count = 0
+        self.candidates: list[_XmlStructure] = []
+
+    def start(self, tag, attributes):
+        depth = len(self.stack) + 1
+        if depth > self.limits.max_xml_depth:
             _fail("resource_limit", "The XML document exceeds the configured nesting limit.")
-        depths[id(element)] = depth
-        stack.extend((child, depth + 1) for child in reversed(list(element)))
-    return depths, elements
+        if self.element_count >= self.limits.max_xml_elements:
+            _fail("resource_limit", "The XML document exceeds the configured element limit.")
+        if self.stack:
+            parent = self.stack[-1]
+            parent.child_count += 1
+            parent.child_counts[tag] = parent.child_counts.get(tag, 0) + 1
+            if parent.child_counts[tag] > self.limits.max_rows:
+                _fail("resource_limit", "The XML document exceeds the configured row limit.")
+            parent.last_child_ended = False
+        self.element_count += 1
+        self.stack.append(_XmlScanFrame(tag, dict(attributes)))
+        return None
+
+    def data(self, data):
+        if not self.stack or not data.strip():
+            return
+        frame = self.stack[-1]
+        if frame.last_child_ended:
+            frame.post_child_text_nonwhite = True
+        else:
+            frame.text_nonwhite = True
+
+    def end(self, _tag):
+        frame = self.stack.pop()
+        repeated_tags = [
+            tag for tag, count in frame.child_counts.items() if count > 1
+        ]
+        if repeated_tags:
+            parent_path = tuple(item.tag for item in self.stack) + (frame.tag,)
+            attributes = [
+                {
+                    "element": _xml_name(item.tag),
+                    "attributes": dict(item.attributes),
+                }
+                for item in (*self.stack, frame)
+            ]
+            for record_tag in repeated_tags:
+                record_count = frame.child_counts[record_tag]
+                if frame.child_count != record_count:
+                    _fail(
+                        "ambiguous_xml_records",
+                        "The record container has unrelated sibling elements; record selection is ambiguous.",
+                    )
+                if frame.text_nonwhite or frame.post_child_text_nonwhite:
+                    _fail(
+                        "unsupported_xml_structure",
+                        "Non-record text outside the selected record group is unsupported.",
+                    )
+                for ancestor in self.stack:
+                    if ancestor.child_count != 1:
+                        _fail(
+                            "ambiguous_xml_records",
+                            "The record group is mixed with unrelated XML structure.",
+                        )
+                    if ancestor.text_nonwhite or ancestor.post_child_text_nonwhite:
+                        _fail(
+                            "unsupported_xml_structure",
+                            "Non-record text outside the selected record group is unsupported.",
+                        )
+                self.candidates.append(
+                    _XmlStructure(
+                        parent_path,
+                        record_tag,
+                        record_count,
+                        attributes,
+                        self.element_count,
+                        0,
+                    )
+                )
+        if self.stack:
+            self.stack[-1].last_child_ended = True
+        return None
+
+    def close(self):
+        return None
 
 
-def _xml_candidates(root, depths: dict[int, int]):
-    candidates = []
-    for parent in root.iter():
-        grouped = {}
-        for child in list(parent):
-            grouped.setdefault(child.tag, []).append(child)
-        parent_depth = depths[id(parent)]
-        for tag, children in grouped.items():
-            if len(children) > 1:
-                candidates.append((parent_depth, parent, tag, children))
-    return candidates
+class _XmlDocumentValidator:
+    def __init__(self, limits: ParseLimits):
+        self.limits = limits
+        self.depth = 0
+        self.element_count = 0
+
+    def start(self, _tag, _attributes):
+        self.depth += 1
+        self.element_count += 1
+        if self.depth > self.limits.max_xml_depth:
+            _fail("resource_limit", "The XML document exceeds the configured nesting limit.")
+        if self.element_count > self.limits.max_xml_elements:
+            _fail("resource_limit", "The XML document exceeds the configured element limit.")
+        return None
+
+    def end(self, _tag):
+        self.depth -= 1
+        return None
+
+    def data(self, _data):
+        return None
+
+    def close(self):
+        return None
 
 
-def _flatten_xml_record(record) -> dict[str, str]:
+class _XmlRecordBuilder:
+    def __init__(self, limits: ParseLimits, structure: _XmlStructure):
+        self.limits = limits
+        self.structure = structure
+        self.stack: list[_XmlBuildFrame] = []
+        self.path: list[str] = []
+        self.element_count = 0
+        self.record_count = 0
+        self.records: list[dict[str, str]] = []
+
+    def start(self, tag, attributes):
+        depth = len(self.stack) + 1
+        if depth > self.limits.max_xml_depth:
+            _fail("resource_limit", "The XML document exceeds the configured nesting limit.")
+        if self.element_count >= self.limits.max_xml_elements:
+            _fail("resource_limit", "The XML document exceeds the configured element limit.")
+        self.element_count += 1
+
+        parent_node = self.stack[-1].node if self.stack else None
+        if self.stack:
+            self.stack[-1].last_child_ended = False
+        is_record = (
+            parent_node is None
+            and tuple(self.path) == self.structure.parent_path
+            and tag == self.structure.record_tag
+        )
+        node = None
+        if parent_node is not None or is_record:
+            node = _XmlNode(tag, dict(attributes))
+            if parent_node is not None:
+                parent_node.children.append(node)
+        self.path.append(tag)
+        self.stack.append(_XmlBuildFrame(tag, node, is_record))
+        return None
+
+    def data(self, data):
+        if not self.stack:
+            return
+        frame = self.stack[-1]
+        if frame.node is None:
+            return
+        if frame.last_child_ended and frame.node.children:
+            frame.node.children[-1].tail += data
+        else:
+            frame.node.text += data
+
+    def end(self, _tag):
+        frame = self.stack.pop()
+        self.path.pop()
+        if frame.is_record:
+            values = _flatten_xml_record(frame.node, self.limits.max_columns)
+            if len(values) > self.limits.max_columns:
+                _fail("resource_limit", "The XML document exceeds the configured column limit.")
+            self.record_count += 1
+            if self.record_count > self.limits.max_rows:
+                _fail("resource_limit", "The XML document exceeds the configured row limit.")
+            self.records.append(values)
+        if self.stack:
+            self.stack[-1].last_child_ended = True
+        return None
+
+    def close(self):
+        return None
+
+    def take_records(self) -> list[dict[str, str]]:
+        records, self.records = self.records, []
+        return records
+
+
+def _feed_xml_parser(
+    stream: BinaryIO,
+    target,
+    limits: ParseLimits,
+) -> int:
+    stream.seek(0)
+    parser = SafeElementTree.DefusedXMLParser(
+        target=target,
+        forbid_dtd=True,
+        forbid_entities=True,
+        forbid_external=True,
+    )
+    source_size_bytes = 0
+    try:
+        while chunk := stream.read(64 * 1024):
+            if not isinstance(chunk, bytes):
+                _fail("malformed_xml", "The XML source must be a binary stream.")
+            source_size_bytes += len(chunk)
+            if source_size_bytes > limits.max_xml_file_bytes:
+                _fail("resource_limit", "The XML document exceeds the configured file-size limit.")
+            parser.feed(chunk)
+        parser.close()
+    except ParsingError:
+        raise
+    except (
+        DefusedXmlException,
+        ExpatError,
+        ParseError,
+        OSError,
+        ValueError,
+        TypeError,
+    ):
+        _fail(
+            "malformed_xml",
+            "The XML document is malformed or contains forbidden declarations.",
+        )
+    return source_size_bytes
+
+
+def _scan_xml(stream: BinaryIO, limits: ParseLimits) -> _XmlStructure:
+    scanner = _XmlScanner(limits)
+    source_size_bytes = _feed_xml_parser(stream, scanner, limits)
+    if len(scanner.candidates) != 1:
+        if not scanner.candidates:
+            _fail(
+                "unsupported_xml_structure",
+                "No repeated sibling elements were found to serve as tabular records.",
+            )
+        _fail(
+            "ambiguous_xml_records",
+            "Multiple repeated XML element groups could represent records.",
+        )
+    structure = scanner.candidates[0]
+    if structure.record_count > limits.max_rows:
+        _fail("resource_limit", "The XML document exceeds the configured row limit.")
+    return _XmlStructure(
+        structure.parent_path,
+        structure.record_tag,
+        structure.record_count,
+        structure.container_attributes,
+        scanner.element_count,
+        source_size_bytes,
+    )
+
+
+def _stream_xml_records(
+    stream: BinaryIO,
+    limits: ParseLimits,
+    structure: _XmlStructure,
+):
+    builder = _XmlRecordBuilder(limits, structure)
+    source_size_bytes = 0
+    stream.seek(0)
+    parser = SafeElementTree.DefusedXMLParser(
+        target=builder,
+        forbid_dtd=True,
+        forbid_entities=True,
+        forbid_external=True,
+    )
+    try:
+        while chunk := stream.read(64 * 1024):
+            if not isinstance(chunk, bytes):
+                _fail("malformed_xml", "The XML source must be a binary stream.")
+            source_size_bytes += len(chunk)
+            if source_size_bytes > limits.max_xml_file_bytes:
+                _fail("resource_limit", "The XML document exceeds the configured file-size limit.")
+            parser.feed(chunk)
+            yield from builder.take_records()
+        parser.close()
+        yield from builder.take_records()
+    except ParsingError:
+        raise
+    except (
+        DefusedXmlException,
+        ExpatError,
+        ParseError,
+        OSError,
+        ValueError,
+        TypeError,
+    ):
+        _fail(
+            "malformed_xml",
+            "The XML document is malformed or contains forbidden declarations.",
+        )
+    if (
+        source_size_bytes != structure.source_size_bytes
+        or builder.element_count != structure.element_count
+        or builder.record_count != structure.record_count
+    ):
+        _fail("malformed_xml", "The XML source changed while it was being parsed.")
+
+
+def _iter_xml_records(
+    stream: BinaryIO,
+    limits: ParseLimits,
+    expected_record_path: str | None = None,
+    expected_record_tag: str | None = None,
+):
+    structure = _scan_xml(stream, limits)
+    record_path = "/" + "/".join(
+        (*structure.parent_path, _xml_name(structure.record_tag))
+    )
+    if (
+        expected_record_path is not None
+        and (
+            expected_record_path != record_path
+            or expected_record_tag != _xml_name(structure.record_tag)
+        )
+    ):
+        _fail(
+            "source_metadata_mismatch",
+            "The XML record selection no longer matches its validated parsing metadata.",
+        )
+    yield from _stream_xml_records(stream, limits, structure)
+
+
+def _flatten_xml_record(
+    record,
+    max_columns: int | None = None,
+) -> dict[str, str]:
     fields = {}
 
     def add(name: str, value: str) -> None:
@@ -715,6 +1079,8 @@ def _flatten_xml_record(record) -> dict[str, str]:
                 "A record contains repeated nested fields that cannot be represented "
                 "as a single flat row.",
             )
+        if max_columns is not None and len(fields) >= max_columns:
+            _fail("resource_limit", "The XML document exceeds the configured column limit.")
         fields[name] = value
 
     def visit(element, prefix: str) -> None:
@@ -758,187 +1124,53 @@ def _flatten_xml_record(record) -> dict[str, str]:
     return fields
 
 
-class _LimitedTreeBuilder:
-    def __init__(self, limits: ParseLimits):
-        self._builder = TreeBuilder()
-        self._limits = limits
-        self._depth = 0
-        self.element_count = 0
-
-    def start(self, tag, attributes):
-        depth = self._depth + 1
-        if depth > self._limits.max_xml_depth:
-            _fail("resource_limit", "The XML document exceeds the configured nesting limit.")
-        if self.element_count >= self._limits.max_xml_elements:
-            _fail("resource_limit", "The XML document exceeds the configured element limit.")
-        self._depth = depth
-        self.element_count += 1
-        return self._builder.start(tag, attributes)
-
-    def end(self, tag):
-        element = self._builder.end(tag)
-        self._depth -= 1
-        return element
-
-    def data(self, data):
-        self._builder.data(data)
-
-    def comment(self, text):
-        self._builder.comment(text)
-
-    def pi(self, target, text):
-        self._builder.pi(target, text)
-
-    def close(self):
-        return self._builder.close()
-
-
-def _parse_xml_tree(stream: BinaryIO, limits: ParseLimits):
-    stream.seek(0)
-    target = _LimitedTreeBuilder(limits)
-    parser = SafeElementTree.DefusedXMLParser(
-        target=target,
-        forbid_dtd=True,
-        forbid_entities=True,
-        forbid_external=True,
-    )
-    try:
-        root = SafeElementTree.parse(stream, parser=parser).getroot()
-    except ParsingError:
-        raise
-    except (DefusedXmlException, ParseError, OSError, ValueError):
-        _fail("malformed_xml", "The XML document is malformed or contains forbidden declarations.")
-    return root, target.element_count
-
-
 def _read_xml(stream: BinaryIO, file_size: int, limits: ParseLimits) -> ParseResult:
     if file_size > limits.max_xml_file_bytes:
         _fail("resource_limit", "The XML document exceeds the configured file-size limit.")
-    root, element_count = _parse_xml_tree(stream, limits)
-
-    depths, measured_count = _xml_depths(root, limits)
-    if measured_count != element_count:
-        _fail("malformed_xml", "The XML document could not be parsed consistently.")
-    candidates = _xml_candidates(root, depths)
-    if not candidates:
-        _fail(
-            "unsupported_xml_structure",
-            "No repeated sibling elements were found to serve as tabular records.",
-        )
-    if len(candidates) != 1:
-        _fail(
-            "ambiguous_xml_records",
-            "Multiple repeated XML element groups could represent records.",
-        )
-    parent_depth, parent, record_tag, records = candidates[0]
-    if any(child.tag != record_tag for child in list(parent)):
-        _fail(
-            "ambiguous_xml_records",
-            "The record container has unrelated sibling elements; record selection is ambiguous.",
-        )
-    if parent.text and parent.text.strip():
-        _fail(
-            "unsupported_xml_structure",
-            "Non-record text outside the selected record group is unsupported.",
-        )
-    if any(record.tail and record.tail.strip() for record in records):
-        _fail(
-            "unsupported_xml_structure",
-            "Non-record text outside the selected record group is unsupported.",
-        )
-
-    ancestors = []
-    path = []
-    cursor = root
-    path.append(_xml_name(root.tag))
-    while cursor is not parent:
-        children = list(cursor)
-        next_nodes = [
-            child
-            for child in children
-            if child is parent or any(descendant is parent for descendant in child.iter())
-        ]
-        if len(next_nodes) != 1 or len(children) != 1:
-            _fail(
-                "ambiguous_xml_records",
-                "The record group is mixed with unrelated XML structure.",
-            )
-        if cursor.text and cursor.text.strip():
-            _fail(
-                "unsupported_xml_structure",
-                "Non-record text outside the selected record group is unsupported.",
-            )
-        next_node = next_nodes[0]
-        if next_node.tail and next_node.tail.strip():
-            _fail(
-                "unsupported_xml_structure",
-                "Non-record text outside the selected record group is unsupported.",
-            )
-        ancestors.append(
-            {
-                "element": _xml_name(cursor.tag),
-                "attributes": dict(cursor.attrib),
-            }
-        )
-        cursor = next_node
-        path.append(_xml_name(cursor.tag))
-    ancestors.append(
-        {
-            "element": _xml_name(parent.tag),
-            "attributes": dict(parent.attrib),
-        }
-    )
-    if len(path) > parent_depth:
-        _fail("ambiguous_xml_records", "The XML record path could not be determined.")
-
-    if len(records) > limits.max_rows:
-        _fail("resource_limit", "The XML document exceeds the configured row limit.")
-
+    structure = _scan_xml(stream, limits)
     ordered_names = []
     stats_by_name = {}
-    record_rows = []
-    for record in records:
-        values = _flatten_xml_record(record)
-        record_rows.append(values)
+    present_counts: dict[str, int] = {}
+    for values in _stream_xml_records(stream, limits, structure):
         for name in values:
             if name not in stats_by_name:
                 if len(ordered_names) >= limits.max_columns:
                     _fail("resource_limit", "The XML document exceeds the configured column limit.")
                 ordered_names.append(name)
                 stats_by_name[name] = _ColumnStats(name=name, position=len(ordered_names) - 1)
-
+                present_counts[name] = 0
+            stats_by_name[name].observe(values[name], "string")
+            present_counts[name] += 1
     if not ordered_names:
         _fail(
             "unsupported_xml_structure",
             "The repeated XML records contain no attributes or values to form columns.",
         )
-    for values in record_rows:
-        for name in ordered_names:
-            if name not in values:
-                stats_by_name[name].missing_values += 1
-            else:
-                stats_by_name[name].observe(values[name], "string")
+    for name in ordered_names:
+        stats_by_name[name].missing_values = structure.record_count - present_counts[name]
 
     columns = [stats_by_name[name].as_dict() for name in ordered_names]
     profiler = _profile_for_format("xml", limits)
     profile_table = profiler.add_table(None, columns)
-    for values in record_rows:
+    for values in _stream_xml_records(stream, limits, structure):
         profile_table.observe(
             [values[name] if name in values else MISSING for name in ordered_names]
         )
     return ParseResult(
         detected_format="xml",
         columns=columns,
-        row_count=len(records),
+        row_count=structure.record_count,
         metadata={
-            "record_element": _xml_name(record_tag),
-            "record_path": "/" + "/".join(path + [_xml_name(record_tag)]),
-            "container_attributes": ancestors,
+            "record_element": _xml_name(structure.record_tag),
+            "record_path": "/" + "/".join(
+                (*structure.parent_path, _xml_name(structure.record_tag))
+            ),
+            "container_attributes": structure.container_attributes,
             "namespace_representation": "expanded Clark notation {uri}local",
             "nested_representation": "nested leaf paths use /; attributes use /@name",
             "missing_values": "reported separately from empty element values",
-            "elements_scanned": element_count,
-            "source_size_bytes": file_size,
+            "elements_scanned": structure.element_count,
+            "source_size_bytes": structure.source_size_bytes,
         },
         profile_result=profiler.as_dict(),
     )
