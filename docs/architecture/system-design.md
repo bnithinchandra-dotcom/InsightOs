@@ -169,13 +169,37 @@ Persisted artifacts and derived analyses must retain or validate:
 - analysis/ruleset version and canonical configuration identity where a
   result is persisted.
 
-Normalization validates source metadata and checks local and stored artifact
-integrity. Quality analysis keys bind source checksum, normalized-output
-checksums, ruleset/analyzer versions and canonical configuration. EDA validates
-source and normalized provenance before reading the selected table. Preprocessing
-is in-memory and records bounded operation/configuration lineage metadata where
-the transformation changes the table; it does not persist source artifact
-provenance.
+`app.provenance` defines a shared, versioned provenance envelope. Its stable
+operation ID binds the operation/version, canonical configuration hash,
+ordered input/output references, and parent operation IDs; completion time and
+verification status are recorded separately. Normalization independently
+hashes the local source before parsing, and its result metadata includes source,
+configuration, output-object and schema fingerprints. Quality reports include
+the same envelope additively; the established quality-analysis key is
+unchanged, and reports without the optional provenance member remain valid.
+The quality API marks a report verified only after checking the source and
+normalized stored bytes. EDA returns provenance with successful and failed
+results; successful results follow its artifact checksum, schema and row-count
+checks, while failures without completed checks are marked unverifiable.
+Preprocessing returns bounded Arrow IPC fingerprints and ordered step
+provenance in memory. These records are not database history or an
+independently audited lineage log, and in-memory preprocessing outputs have no
+artifact read-back verification. No migration or public API schema change is
+required for these additive fields.
+
+### Internal verification policy
+
+`app.jev` provides bounded, type-specific comparison policies and evidence
+binding. The quality-analysis request path uses it only as a best-effort,
+internal cross-check that a validated report's input references match the
+source and normalized artifacts whose stored bytes were just verified.
+Assessment status and reason codes are server-side log details only; they are
+not added to API responses, reports, provenance, or persisted history. The
+check does not independently verify quality-rule findings or EDA statistics,
+and an unavailable assessment does not invalidate an otherwise validated
+primary result. Corrections default off; the tested correction-policy utility
+has no production caller. Forecasts and semantic interpretations remain
+unverifiable until an approved independent oracle exists.
 
 ### Artifact lifecycle
 
@@ -200,10 +224,10 @@ backend, and the health check does not mutate storage.
 | Foundation/API | **Partial** | FastAPI in `backend/app/main.py`; SQLAlchemy metadata models and Alembic migrations; health and CRUD/upload/normalize/quality routes. | Local Compose only. No authentication or ownership enforcement. Requests perform significant work synchronously. |
 | Ingestion/parsing | **Partial** | `parse_dataset_file` handles CSV, TSV, XLSX, JSON, Parquet, and XML; validates parsing metadata; stores original bytes and deterministic profile. | Upload size defaults to 150 MiB; row/column and format-specific limits exist. CSV/TSV and Parquet are scanned in bounded records/batches. XML uses secure bounded event passes and materializes at most one record tree at a time; parser profiling rereads the source rather than retaining all parsed rows. JSON uses stdlib whole-document decoding with source-byte and pre-decode depth checks (see JSON boundary below). ZIP/folder/database/API sources are not implemented. |
 | Profiling | **Implemented with documented limits** | `DatasetProfiler` computes missing/empty, exact distinct/duplicate counts and numeric/category summaries within operation-specific budgets. | Distinct values default 100,000; numeric values 250,000; duplicate-row fingerprints 250,000. Per-value estimates and a cumulative 16 MiB estimated-retention budget stop hashing/retaining oversized values and mark exact fields unavailable with warnings. Estimates are not measured heap usage. Profile data does not replace artifact-bound analysis. |
-| Normalization | **Partial** | `normalize_file` reparses and validates source, builds normalized Parquet per logical table, validates rows/schema/nulls and stores checksummed objects. | Output defaults to 600 MiB, written in batches. A raw Arrow batch-size estimate is checked before each batch; a write-through reservation enforces the exact resulting temporary Parquet file length, including footer bytes, before writes. Temporary files are removed on success and failure. This is an output-file length cap, not a process-memory or filesystem-allocation quota. |
-| Quality analysis | **Partial** | API validates normalized artifacts, downloads verified local copies, runs deterministic registered rules, and persists versioned provenance-bound reports. | 600 MiB normalized-input cap, 4 MiB rule-tracking memory cap, shared comparison budget, bounded findings/examples/report serialization. `RuleBudget` delegates its counters to `ExecutionBudget` while preserving quality-specific units and exhaustion semantics. Real PostgreSQL advisory locking and MinIO integration are not established by unit tests in this checkout. |
-| Preprocessing | **Partial** | `DEFAULT_TRANSFORMATION_REGISTRY` and `orchestrate_preprocessing` run explicit DA/BA transforms on Arrow tables; business-semantic operations require explicit approvals. | Input cap 64 MiB Arrow buffers, 1,000,000 rows, 256 columns. Python-string estimates are checked before the two whole-column `to_pylist` paths and share the byte ceiling across selected columns/chunks. This is not streaming or a process-wide memory bound. Output is in memory; no API/persistence. |
-| EDA | **Partial** | `analyze_normalized_file` performs univariate, bivariate and multivariate deterministic analysis on a selected verified normalized table. | Defaults/caps include 1,000,000 rows, 600 MiB selected-column scan metadata, 250,000 numeric values, 50,000 categories, 250,000 grouped values, 50,000 contingency cells, 4,000,000 pairwise work units, 128 MiB estimated decoded strings, and configured result serialization up to 1 MiB. EDA remains service-level; no API/history/UI. |
+| Normalization | **Partial** | `normalize_file` hashes and reparses the source, builds normalized Parquet per logical table, validates rows/schema/nulls and stores checksummed objects. | Output defaults to 600 MiB, written in batches. A raw Arrow batch-size estimate is checked before each batch; a write-through reservation enforces the exact resulting temporary Parquet file length, including footer bytes, before writes. Result metadata includes versioned source/configuration/output provenance. Temporary files are removed on success and failure. This is an output-file length cap, not a process-memory or filesystem-allocation quota. |
+| Quality analysis | **Partial** | API validates normalized artifacts, downloads verified local copies, runs deterministic registered rules, and persists versioned provenance-bound reports. | 600 MiB normalized-input cap, 4 MiB rule-tracking memory cap, shared comparison budget, bounded findings/examples/report serialization. `RuleBudget` delegates its counters to `ExecutionBudget` while preserving quality-specific units and exhaustion semantics. Additive report provenance preserves legacy report validation and the existing deterministic analysis key. Real PostgreSQL advisory locking and MinIO integration are not established by unit tests in this checkout. |
+| Preprocessing | **Partial** | `DEFAULT_TRANSFORMATION_REGISTRY` and `orchestrate_preprocessing` run explicit DA/BA transforms on Arrow tables; business-semantic operations require explicit approvals. | Input cap 64 MiB Arrow buffers, 1,000,000 rows, 256 columns. Python-string estimates are checked before whole-column conversions and share the byte ceiling across selected columns/chunks. Input/output Arrow IPC fingerprints and ordered per-step provenance are returned in memory. This adds bounded full-table passes; it is not streaming or a process-wide memory bound. Output is not persisted; no API. |
+| EDA | **Partial** | `analyze_normalized_file` performs univariate, bivariate and multivariate deterministic analysis on a selected verified normalized table. | Defaults/caps include 1,000,000 rows, 600 MiB selected-column scan metadata, 250,000 numeric values, 50,000 categories, 250,000 grouped values, 50,000 contingency cells, 4,000,000 pairwise work units, 128 MiB estimated decoded strings, and configured result serialization up to 1 MiB. Result provenance is returned but not persisted; no API/history/UI. |
 | Frontend | **Partial** | React shell and system-health view. | API client currently calls only health and system-info; dataset and analysis workflows are not connected. |
 | Worker/queue | **Planned** | Worker starts, checks Redis, and idles. | No queue consumer, task contract, retries, or execution-budget propagation. |
 | Schema modeling, agents, semantic layer, NL analytics, ML, monitoring, governance | **Planned** | Product roadmap only. | No claims of implementation until code and tests establish them. |
@@ -267,7 +291,10 @@ service, builds an isolated MinIO service, applies migrations, and exercises
 upload, source-object verification, normalization/Parquet verification, and
 quality analysis. The job passed on baseline commit
 `3ba1bdce665574fff37259cb2b88d5b2ee1558db`; uncommitted changes still require
-their own CI run before their integration behavior is considered verified.
+their own CI run before their GitHub Actions status is verified. The current
+working-tree changes also passed the migration and data-flow integration test
+against fresh, isolated local PostgreSQL and MinIO containers; that local run
+is not a GitHub Actions result and does not establish deployment-scale behavior.
 Do not run destructive database/storage integration tests against developer
 data or shared services.
 The repository does not currently provide a verified production worker,

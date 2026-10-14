@@ -15,6 +15,7 @@ from app.execution import (
     ExecutionBudgetExceeded,
     estimate_decoded_python_string_bytes,
 )
+from app.provenance import arrow_table_fingerprint, build_provenance, canonical_sha256
 
 from app.quality_catalog import (
     QUALITY_RULE_STATUSES,
@@ -2547,6 +2548,9 @@ class PreprocessingStepResult:
     columns_after: int | None
     affected_columns: tuple[str, ...]
     summary_metadata: dict | list | None = None
+    input_fingerprint: dict | None = None
+    output_fingerprint: dict | None = None
+    provenance: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -2559,6 +2563,7 @@ class PreprocessingResult:
     unexecuted_steps: tuple[str, ...]
     failure_step_id: str | None = None
     error_description: str | None = None
+    provenance: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -2756,6 +2761,69 @@ def _step_summary_metadata(
     return summary
 
 
+def _arrow_provenance_reference(
+    fingerprint: dict,
+    rows: int,
+    columns: int,
+) -> dict:
+    return {
+        "kind": "arrow_table",
+        "sha256": fingerprint["sha256"],
+        "size_bytes": fingerprint["size_bytes"],
+        "schema_sha256": fingerprint["schema_sha256"],
+        "row_count": rows,
+        "column_count": columns,
+    }
+
+
+def _orchestration_provenance(
+    *,
+    plan_sha256: str,
+    status: str,
+    input_table: pa.Table,
+    input_fingerprint: dict,
+    output_table: pa.Table | None,
+    output_fingerprint: dict | None,
+    step_results: list[PreprocessingStepResult],
+) -> dict:
+    return build_provenance(
+        operation_type="preprocessing_orchestration",
+        operation_version="1",
+        configuration_sha256=plan_sha256,
+        status=status,
+        inputs=[
+            _arrow_provenance_reference(
+                input_fingerprint,
+                input_table.num_rows,
+                input_table.num_columns,
+            )
+        ],
+        outputs=(
+            [
+                _arrow_provenance_reference(
+                    output_fingerprint,
+                    output_table.num_rows,
+                    output_table.num_columns,
+                )
+            ]
+            if output_table is not None and output_fingerprint is not None
+            else []
+        ),
+        verification_status="unverifiable",
+        checks=[
+            {"name": "in_memory_arrow_fingerprints", "status": "verified"}
+        ],
+        limitations=[
+            "Preprocessing output remains in memory; no independent artifact read-back or persisted lineage exists."
+        ],
+        parent_operation_ids=[
+            result.provenance["operation_id"]
+            for result in step_results
+            if result.provenance is not None
+        ],
+    )
+
+
 def orchestrate_preprocessing(
     data: pa.Table,
     steps: list[PreprocessingStep] | tuple[PreprocessingStep, ...],
@@ -2944,6 +3012,20 @@ def orchestrate_preprocessing(
         )
 
     execution_order = tuple(step.step.step_id for step in prepared_steps)
+    input_fingerprint = arrow_table_fingerprint(data)
+    plan_sha256 = canonical_sha256(
+        [
+            {
+                "step_id": prepared.step.step_id,
+                "operation_id": prepared.operation.operation_id,
+                "operation_version": prepared.operation.version,
+                "configuration_sha256": _configuration_fingerprint(
+                    prepared.configuration
+                ),
+            }
+            for prepared in prepared_steps
+        ]
+    )
     if not prepared_steps:
         return PreprocessingResult(
             status="completed",
@@ -2952,11 +3034,22 @@ def orchestrate_preprocessing(
             execution_order=(),
             completed_steps=(),
             unexecuted_steps=(),
+            provenance=_orchestration_provenance(
+                plan_sha256=plan_sha256,
+                status="completed",
+                input_table=data,
+                input_fingerprint=input_fingerprint,
+                output_table=data,
+                output_fingerprint=input_fingerprint,
+                step_results=[],
+            ),
         )
 
     working = data
+    working_fingerprint = input_fingerprint
     results = []
     completed_steps = []
+    previous_operation_id = None
     for index, prepared in enumerate(prepared_steps):
         step = prepared.step
         before_rows = working.num_rows
@@ -2983,6 +3076,7 @@ def orchestrate_preprocessing(
                 )
             _validate_table(output, prepared.operation)
             _validate_orchestration_table(output)
+            output_fingerprint = arrow_table_fingerprint(output)
             summary_metadata = _step_summary_metadata(
                 working,
                 output,
@@ -2990,6 +3084,32 @@ def orchestrate_preprocessing(
                 prepared.configuration,
             )
         except Exception as error:
+            failed_provenance = build_provenance(
+                operation_type=f"transformation:{prepared.operation.operation_id}",
+                operation_version=prepared.operation.version,
+                configuration_sha256=_configuration_fingerprint(
+                    prepared.configuration
+                ),
+                status="failed",
+                inputs=[
+                    _arrow_provenance_reference(
+                        working_fingerprint,
+                        working.num_rows,
+                        working.num_columns,
+                    )
+                ],
+                outputs=[],
+                verification_status="unverifiable",
+                checks=[],
+                limitations=[
+                    "The failed transformation produced no published output table."
+                ],
+                parent_operation_ids=(
+                    [previous_operation_id]
+                    if previous_operation_id is not None
+                    else []
+                ),
+            )
             results.append(
                 PreprocessingStepResult(
                     step_id=step.step_id,
@@ -3004,6 +3124,8 @@ def orchestrate_preprocessing(
                     columns_before=before_columns,
                     columns_after=None,
                     affected_columns=prepared.affected_columns,
+                    input_fingerprint=working_fingerprint,
+                    provenance=failed_provenance,
                 )
             )
             unexecuted = prepared_steps[index + 1 :]
@@ -3037,8 +3159,53 @@ def orchestrate_preprocessing(
                     phase,
                     step.operation_id,
                 ),
+                provenance=_orchestration_provenance(
+                    plan_sha256=plan_sha256,
+                    status="failed",
+                    input_table=data,
+                    input_fingerprint=input_fingerprint,
+                    output_table=None,
+                    output_fingerprint=None,
+                    step_results=results,
+                ),
             )
 
+        step_provenance = build_provenance(
+            operation_type=f"transformation:{prepared.operation.operation_id}",
+            operation_version=prepared.operation.version,
+            configuration_sha256=_configuration_fingerprint(
+                prepared.configuration
+            ),
+            status="completed",
+            inputs=[
+                _arrow_provenance_reference(
+                    working_fingerprint,
+                    working.num_rows,
+                    working.num_columns,
+                )
+            ],
+            outputs=[
+                _arrow_provenance_reference(
+                    output_fingerprint,
+                    output.num_rows,
+                    output.num_columns,
+                )
+            ],
+            verification_status="unverifiable",
+            checks=[
+                {"name": "input_table_fingerprint", "status": "verified"},
+                {"name": "output_table_fingerprint", "status": "verified"},
+                {"name": "output_schema", "status": "verified"},
+            ],
+            limitations=[
+                "The Arrow output is in memory and has no independent persisted-artifact verification."
+            ],
+            parent_operation_ids=(
+                [previous_operation_id]
+                if previous_operation_id is not None
+                else []
+            ),
+        )
         results.append(
             PreprocessingStepResult(
                 step_id=step.step_id,
@@ -3054,10 +3221,15 @@ def orchestrate_preprocessing(
                 columns_after=output.num_columns,
                 affected_columns=prepared.affected_columns,
                 summary_metadata=summary_metadata,
+                input_fingerprint=working_fingerprint,
+                output_fingerprint=output_fingerprint,
+                provenance=step_provenance,
             )
         )
         completed_steps.append(step.step_id)
         working = output
+        working_fingerprint = output_fingerprint
+        previous_operation_id = step_provenance["operation_id"]
 
     return PreprocessingResult(
         status="completed",
@@ -3066,4 +3238,13 @@ def orchestrate_preprocessing(
         execution_order=execution_order,
         completed_steps=tuple(completed_steps),
         unexecuted_steps=(),
+        provenance=_orchestration_provenance(
+            plan_sha256=plan_sha256,
+            status="completed",
+            input_table=data,
+            input_fingerprint=input_fingerprint,
+            output_table=working,
+            output_fingerprint=working_fingerprint,
+            step_results=results,
+        ),
     )

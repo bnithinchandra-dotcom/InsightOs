@@ -26,6 +26,13 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from urllib3.exceptions import HTTPError
 
 from app.database import SessionLocal
+from app.execution import ExecutionBudget
+from app.jev import (
+    VerificationAssessment,
+    evidence_for,
+    policy_for,
+    verify_claim,
+)
 from app.models import Dataset, DatasetFile, Project
 from app.normalization import (
     NormalizationError,
@@ -33,12 +40,14 @@ from app.normalization import (
     normalize_file,
     validate_normalization_result,
     verify_normalization_result,
+    verify_normalization_result_detailed,
 )
 from app.parsing import (
     ParserConfigurationError,
     ParsingError,
     parse_dataset_file,
 )
+from app.provenance import schema_fingerprint
 from app.quality_analysis import (
     QUALITY_ANALYSIS_CONFIGURATION,
     QualityAnalysisError,
@@ -2028,6 +2037,91 @@ def _quality_analysis_response(
     }
 
 
+def _assess_verified_quality_input_lineage(
+    report: dict,
+    *,
+    dataset_id: int,
+    file_id: int,
+    source_sha256: str,
+    source_size_bytes: int,
+    normalization_result: dict,
+) -> VerificationAssessment:
+    tables = normalization_result["tables"]
+    verified_inputs = [
+        {
+            "kind": "source",
+            "dataset_id": dataset_id,
+            "file_id": file_id,
+            "sha256": source_sha256,
+            "size_bytes": source_size_bytes,
+        },
+        *(
+            {
+                "kind": "normalized_parquet",
+                "table_index": table["table_index"],
+                "sha256": table.get("sha256"),
+                "schema_sha256": (
+                    schema_fingerprint(table["schema"])
+                    if isinstance(table.get("schema"), list)
+                    else None
+                ),
+            }
+            for table in tables
+        ),
+    ]
+    provenance = report.get("provenance")
+    claimed_inputs = provenance.get("inputs") if isinstance(provenance, dict) else None
+    evidence = evidence_for(
+        claimed_inputs,
+        verified_inputs,
+        reference="quality-lineage:verified-object-readback",
+    )
+    budget = ExecutionBudget(
+        {
+            "jev_checks": 1,
+            "jev_evidence_bytes": 16 * 1024,
+        }
+    )
+    return verify_claim(
+        claimed_inputs,
+        evidence,
+        policy_for("schema"),
+        budget=budget,
+    )
+
+
+def _log_internal_quality_lineage_assessment(
+    report: dict,
+    dataset_file: DatasetFile,
+    *,
+    dataset_id: int,
+    file_id: int,
+    normalization_result: dict,
+) -> None:
+    try:
+        assessment = _assess_verified_quality_input_lineage(
+            report,
+            dataset_id=dataset_id,
+            file_id=file_id,
+            source_sha256=dataset_file.checksum,
+            source_size_bytes=dataset_file.file_size_bytes,
+            normalization_result=normalization_result,
+        )
+    except (TypeError, ValueError, OverflowError) as error:
+        logger.warning(
+            "Internal quality lineage assessment unavailable for file %s (%s)",
+            file_id,
+            type(error).__name__,
+        )
+        return
+    if assessment.status != "verified":
+        logger.warning(
+            "Internal quality lineage assessment did not verify for file %s (%s)",
+            file_id,
+            assessment.reason_code,
+        )
+
+
 def _mark_quality_analysis_failed(
     session: Session,
     dataset_id: int,
@@ -2543,14 +2637,15 @@ def analyze_dataset_file_quality(
                     "source_integrity_failed",
                     "Stored source data failed integrity verification.",
                 )
-            if not verify_normalization_result(
+            normalized_verification = verify_normalization_result_detailed(
                 storage,
                 processed_bucket,
                 normalized,
-            ):
+            )
+            if normalized_verification["status"] != "verified":
                 raise QualityAnalysisError(
-                    "normalized_output_integrity_failed",
-                    "Stored normalized output failed integrity verification.",
+                    f"normalized_output_{normalized_verification['status']}",
+                    "Stored normalized output could not be verified as intact.",
                 )
 
             analysis_key, configuration_sha256 = quality_analysis_key(
@@ -2580,6 +2675,13 @@ def analyze_dataset_file_quality(
                 except QualityAnalysisError:
                     pass
                 else:
+                    _log_internal_quality_lineage_assessment(
+                        dataset_file.quality_report,
+                        dataset_file,
+                        dataset_id=dataset_id,
+                        file_id=file_id,
+                        normalization_result=normalized,
+                    )
                     return _quality_analysis_response(
                         dataset_id,
                         file_id,
@@ -2642,6 +2744,7 @@ def analyze_dataset_file_quality(
                 report_started_at,
                 datetime.now(timezone.utc),
                 rule_results=rule_results,
+                verification_status="verified",
             )
             report = validate_quality_report(
                 report,
@@ -2651,6 +2754,13 @@ def analyze_dataset_file_quality(
                 expected_normalized_outputs=normalized_output_provenance(
                     normalized
                 ),
+            )
+            _log_internal_quality_lineage_assessment(
+                report,
+                dataset_file,
+                dataset_id=dataset_id,
+                file_id=file_id,
+                normalization_result=normalized,
             )
 
             dataset_file = session.get(DatasetFile, file_id)

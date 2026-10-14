@@ -421,6 +421,18 @@ class PreprocessingOrchestratorTests(unittest.TestCase):
             [step.status for step in result.steps],
             ["completed", "failed", "not_executed"],
         )
+        self.assertEqual(result.provenance["status"], "failed")
+        self.assertEqual(result.provenance["outputs"], [])
+        self.assertEqual(result.steps[0].provenance["status"], "completed")
+        self.assertEqual(result.steps[1].provenance["status"], "failed")
+        self.assertIsNone(result.steps[1].output_fingerprint)
+        self.assertEqual(
+            result.provenance["parent_operation_ids"],
+            [
+                result.steps[0].provenance["operation_id"],
+                result.steps[1].provenance["operation_id"],
+            ],
+        )
         self.assertEqual(first.events[-1][0], "transform")
         self.assertEqual(failing.events[-1][0], "transform")
         self.assertEqual(later.events, [])
@@ -747,12 +759,38 @@ class PreprocessingOrchestratorTests(unittest.TestCase):
         second = orchestrate_preprocessing(data, [step], **arguments)
         self.assertEqual(first.status, "completed")
         self.assertEqual(first.final_table, second.final_table)
-        self.assertEqual(first.steps, second.steps)
+        self.assertEqual(first.steps[0].operation_id, second.steps[0].operation_id)
+        self.assertEqual(
+            first.steps[0].input_fingerprint,
+            second.steps[0].input_fingerprint,
+        )
+        self.assertEqual(
+            first.steps[0].output_fingerprint,
+            second.steps[0].output_fingerprint,
+        )
+        self.assertEqual(
+            first.provenance["operation_id"],
+            second.provenance["operation_id"],
+        )
+        self.assertEqual(first.provenance["status"], "completed")
+        self.assertEqual(first.provenance["verification"]["status"], "unverifiable")
+        self.assertEqual(
+            first.steps[0].provenance["outputs"][0]["sha256"],
+            first.steps[0].output_fingerprint["sha256"],
+        )
+        self.assertEqual(
+            first.provenance["parent_operation_ids"],
+            [first.steps[0].provenance["operation_id"]],
+        )
 
         empty = orchestrate_preprocessing(data, [])
         self.assertEqual(empty.status, "completed")
         self.assertIs(empty.final_table, data)
         self.assertEqual(empty.execution_order, ())
+        self.assertEqual(
+            empty.provenance["inputs"],
+            empty.provenance["outputs"],
+        )
 
     def test_invalid_input_table_is_rejected(self):
         with self.assertRaisesRegex(PreprocessingOrchestrationError, "PyArrow Table"):

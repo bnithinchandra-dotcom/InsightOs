@@ -143,6 +143,64 @@ class UploadFlowTests(unittest.TestCase):
         Base.metadata.drop_all(self.engine)
         self.engine.dispose()
 
+    def test_internal_jev_binds_quality_input_references_without_raw_audit_values(self):
+        table_schema = [{"name": "amount", "type": "decimal128(10, 2)"}]
+        normalized = {
+            "tables": [
+                {
+                    "table_index": 0,
+                    "sha256": "b" * 64,
+                    "schema": table_schema,
+                }
+            ]
+        }
+        source_sha256 = "a" * 64
+        inputs = [
+            {
+                "kind": "source",
+                "dataset_id": 3,
+                "file_id": 7,
+                "sha256": source_sha256,
+                "size_bytes": 23,
+            },
+            {
+                "kind": "normalized_parquet",
+                "table_index": 0,
+                "sha256": "b" * 64,
+                "schema_sha256": main.schema_fingerprint(table_schema),
+            },
+        ]
+        report = {"provenance": {"inputs": inputs}}
+        assessment = main._assess_verified_quality_input_lineage(
+            report,
+            dataset_id=3,
+            file_id=7,
+            source_sha256=source_sha256,
+            source_size_bytes=23,
+            normalization_result=normalized,
+        )
+        self.assertEqual(assessment.status, "verified")
+        self.assertNotIn("normalized_parquet", str(assessment.audit_record()))
+
+        mismatched_report = {
+            "provenance": {
+                "inputs": [
+                    *inputs[:-1],
+                    {**inputs[-1], "sha256": "c" * 64},
+                ]
+            }
+        }
+        mismatch = main._assess_verified_quality_input_lineage(
+            mismatched_report,
+            dataset_id=3,
+            file_id=7,
+            source_sha256=source_sha256,
+            source_size_bytes=23,
+            normalization_result=normalized,
+        )
+        self.assertEqual(mismatch.status, "failed")
+        self.assertEqual(mismatch.selected_value, mismatched_report["provenance"]["inputs"])
+
     def test_upload_parses_persists_and_preserves_original_bytes(self):
         content = b'"id",name\r\n1,Ada\r\n2,Lin\r\n'
         response = self.client.post(
@@ -424,6 +482,14 @@ class UploadFlowTests(unittest.TestCase):
         )
         self.assertEqual(normalized.status_code, 200, normalized.text)
         normalized_body = normalized.json()
+        normalization_provenance = normalized_body["normalization_result"][
+            "provenance"
+        ]
+        self.assertEqual(normalization_provenance["status"], "completed")
+        self.assertEqual(
+            normalization_provenance["verification"]["status"],
+            "verified",
+        )
         self.assertEqual(
             set(normalized_body),
             {
@@ -446,11 +512,30 @@ class UploadFlowTests(unittest.TestCase):
         profile_before = profile.json()
         storage_before = copy.deepcopy(self.storage.objects)
 
-        first = self.client.post(
-            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
-        )
+        with patch.object(
+            main,
+            "_assess_verified_quality_input_lineage",
+            wraps=main._assess_verified_quality_input_lineage,
+        ) as lineage_assessment:
+            first = self.client.post(
+                f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
+            )
+        lineage_assessment.assert_called_once()
         self.assertEqual(first.status_code, 200, first.text)
         first_body = first.json()
+        self.assertEqual(
+            set(first_body),
+            {
+                "dataset_id",
+                "file_id",
+                "status",
+                "analysis_key",
+                "report_is_current",
+                "quality_report",
+                "error",
+            },
+        )
+        self.assertNotIn("jev", first_body["quality_report"])
         self.assertEqual(
             first_body["status"],
             "Completed",
@@ -458,6 +543,16 @@ class UploadFlowTests(unittest.TestCase):
         )
         self.assertTrue(first_body["report_is_current"])
         self.assertEqual(first_body["quality_report"]["schema_version"], 1)
+        quality_provenance = first_body["quality_report"]["provenance"]
+        self.assertEqual(quality_provenance["status"], "completed")
+        self.assertEqual(
+            quality_provenance["verification"]["status"],
+            "verified",
+        )
+        self.assertEqual(
+            quality_provenance["parent_operation_ids"],
+            [normalization_provenance["operation_id"]],
+        )
         self.assertEqual(len(first_body["quality_report"]["findings"]), 1)
         finding = first_body["quality_report"]["findings"][0]
         self.assertEqual(finding["rule_id"], "generic.missing_value_candidates")
@@ -497,9 +592,15 @@ class UploadFlowTests(unittest.TestCase):
             ],
         )
 
-        repeated = self.client.post(
-            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
-        )
+        with patch.object(
+            main,
+            "_assess_verified_quality_input_lineage",
+            wraps=main._assess_verified_quality_input_lineage,
+        ) as cached_lineage_assessment:
+            repeated = self.client.post(
+                f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/quality-analysis"
+            )
+        cached_lineage_assessment.assert_called_once()
         self.assertEqual(repeated.status_code, 200, repeated.text)
         self.assertEqual(
             repeated.json()["quality_report"],
@@ -604,7 +705,7 @@ class UploadFlowTests(unittest.TestCase):
 
         with patch.object(
             main,
-            "verify_normalization_result",
+            "verify_normalization_result_detailed",
             side_effect=OSError("private source value"),
         ):
             failed = self.client.post(
@@ -909,7 +1010,7 @@ class UploadFlowTests(unittest.TestCase):
         lock_ids = {}
         analyzed = Event()
         allow_analysis_to_finish = Event()
-        original_verify = main.verify_normalization_result
+        original_verify = main.verify_normalization_result_detailed
 
         def acquire(session, connection, _dataset_id, key):
             self.assertIs(session.get_bind(), connection)
@@ -936,7 +1037,7 @@ class UploadFlowTests(unittest.TestCase):
             patch.object(main, "_release_upload_lock", side_effect=release),
             patch.object(
                 main,
-                "verify_normalization_result",
+                "verify_normalization_result_detailed",
                 side_effect=pause_verification,
             ),
             ThreadPoolExecutor(max_workers=1) as executor,

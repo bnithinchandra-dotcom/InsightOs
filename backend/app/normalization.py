@@ -19,6 +19,7 @@ from openpyxl import load_workbook
 from urllib3.exceptions import HTTPError
 
 from app.execution import ExecutionBudget, ExecutionBudgetExceeded
+from app.provenance import build_provenance, schema_fingerprint, validate_provenance
 from app.parsing import (
     MISSING,
     ParserConfigurationError,
@@ -1199,6 +1200,254 @@ def verify_normalization_result(storage, bucket: str, result: dict) -> bool:
     return True
 
 
+def verify_normalization_result_detailed(
+    storage,
+    bucket: str,
+    result: dict,
+) -> dict:
+    """Return explicit read-only object-integrity evidence for normalized outputs."""
+    checks = []
+    limitations = [
+        "This check verifies stored bytes against recorded hashes and sizes; it does not prove business-semantic correctness."
+    ]
+    try:
+        tables = result["tables"]
+        source = result["source"]
+        configuration = result["configuration"]
+        pipeline_version = result["pipeline_version"]
+        source_sha256 = source.get("sha256") if isinstance(source, dict) else None
+        configuration_sha256 = (
+            configuration.get("configuration_sha256")
+            if isinstance(configuration, dict)
+            else None
+        )
+        if (
+            not isinstance(tables, list)
+            or not tables
+            or any(not isinstance(table, dict) for table in tables)
+            or not isinstance(source, dict)
+            or not isinstance(configuration, dict)
+            or not isinstance(pipeline_version, str)
+            or not isinstance(source.get("dataset_id"), int)
+            or isinstance(source.get("dataset_id"), bool)
+            or not isinstance(source.get("file_id"), int)
+            or isinstance(source.get("file_id"), bool)
+            or not isinstance(source_sha256, str)
+            or len(source_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in source_sha256
+            )
+            or not isinstance(source.get("file_size_bytes"), int)
+            or isinstance(source.get("file_size_bytes"), bool)
+            or source["file_size_bytes"] < 0
+            or not isinstance(configuration_sha256, str)
+            or len(configuration_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in configuration_sha256
+            )
+        ):
+            raise ValueError("Normalized table list is invalid.")
+        provenance = result.get("provenance")
+        if provenance is not None:
+            validate_provenance(provenance)
+            expected_inputs = [{
+                "kind": "source",
+                "dataset_id": source["dataset_id"],
+                "file_id": source["file_id"],
+                "sha256": source_sha256,
+                "size_bytes": source["file_size_bytes"],
+            }]
+            expected_outputs = [
+                {
+                    "kind": "normalized_parquet",
+                    "table_index": index,
+                    "object_key": table.get("object_key"),
+                    "sha256": table.get("sha256"),
+                    "size_bytes": table.get("file_size_bytes"),
+                    "schema_sha256": schema_fingerprint(table["schema"]),
+                }
+                for index, table in enumerate(tables)
+            ]
+            if (
+                provenance["verification"]["status"] in {"failed", "stale"}
+                or provenance["operation_type"] != "normalization"
+                or provenance["operation_version"]
+                != pipeline_version
+                or provenance["configuration_sha256"]
+                != configuration_sha256
+                or provenance["status"] != "completed"
+                or provenance["verification"]["status"] != "verified"
+                or provenance["inputs"] != expected_inputs
+                or provenance["outputs"] != expected_outputs
+            ):
+                raise ValueError("Stored normalization provenance is inconsistent.")
+    except (KeyError, TypeError, ValueError):
+        return {
+            "status": "failed",
+            "checks": [{"name": "normalization_metadata", "status": "failed"}],
+            "limitations": limitations,
+        }
+
+    unverifiable = False
+    for index, table in enumerate(tables):
+        if not isinstance(table, dict):
+            checks.append({
+                "name": f"table_{index}_metadata",
+                "status": "failed",
+            })
+            return {
+                "status": "failed",
+                "checks": checks,
+                "limitations": limitations,
+            }
+        row_count = table.get("row_count")
+        column_count = table.get("column_count")
+        schema = table.get("schema")
+        if (
+            table.get("table_index") != index
+            or isinstance(table.get("table_index"), bool)
+            or not isinstance(row_count, int)
+            or isinstance(row_count, bool)
+            or row_count < 0
+            or not isinstance(column_count, int)
+            or isinstance(column_count, bool)
+            or column_count < 0
+            or not isinstance(schema, list)
+            or len(schema) != column_count
+        ):
+            checks.append({
+                "name": f"table_{index}_metadata",
+                "status": "failed",
+            })
+            return {
+                "status": "failed",
+                "checks": checks,
+                "limitations": limitations,
+            }
+        key = table.get("object_key")
+        if key is None:
+            if (
+                table.get("row_count") == 0
+                and table.get("column_count") == 0
+                and table.get("file_size_bytes") == 0
+                and table.get("sha256") is None
+                and table.get("schema") == []
+            ):
+                checks.append({
+                    "name": f"table_{index}_empty_metadata",
+                    "status": "verified",
+                })
+                continue
+            checks.append({
+                "name": f"table_{index}_object_reference",
+                "status": "failed",
+            })
+            return {
+                "status": "failed",
+                "checks": checks,
+                "limitations": limitations,
+            }
+        if not isinstance(key, str) or not key:
+            checks.append({
+                "name": f"table_{index}_object_reference",
+                "status": "failed",
+            })
+            return {
+                "status": "failed",
+                "checks": checks,
+                "limitations": limitations,
+            }
+        size = table.get("file_size_bytes")
+        checksum = table.get("sha256")
+        if (
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or size <= 0
+            or not isinstance(checksum, str)
+            or len(checksum) != 64
+            or any(character not in "0123456789abcdef" for character in checksum)
+        ):
+            checks.append({
+                "name": f"table_{index}_artifact_metadata",
+                "status": "failed",
+            })
+            return {
+                "status": "failed",
+                "checks": checks,
+                "limitations": limitations,
+            }
+        try:
+            stat = storage.stat_object(bucket, key)
+            actual_checksum = (
+                _remote_sha256(storage, bucket, key, size)
+                if stat.size == size
+                else ""
+            )
+        except S3Error as error:
+            state = (
+                "failed"
+                if error.code in {"NoSuchKey", "NoSuchObject"}
+                else "unverifiable"
+            )
+            checks.append({
+                "name": f"table_{index}_stored_bytes",
+                "status": state,
+            })
+            if state == "failed":
+                return {
+                    "status": "failed",
+                    "checks": checks,
+                    "limitations": limitations,
+                }
+            unverifiable = True
+            continue
+        except (MinioException, HTTPError, OSError):
+            checks.append({
+                "name": f"table_{index}_stored_bytes",
+                "status": "unverifiable",
+            })
+            unverifiable = True
+            continue
+        if stat.size != size or actual_checksum != checksum:
+            checks.append({
+                "name": f"table_{index}_stored_bytes",
+                "status": "failed",
+            })
+            return {
+                "status": "failed",
+                "checks": checks,
+                "limitations": limitations,
+            }
+        try:
+            schema_hash = schema_fingerprint(table["schema"])
+        except (KeyError, TypeError, ValueError):
+            checks.append({
+                "name": f"table_{index}_schema_metadata",
+                "status": "failed",
+            })
+            return {
+                "status": "failed",
+                "checks": checks,
+                "limitations": limitations,
+            }
+        checks.append({
+            "name": f"table_{index}_stored_bytes",
+            "status": "verified",
+        })
+        checks.append({
+            "name": f"table_{index}_schema_metadata",
+            "status": "verified",
+            "schema_sha256": schema_hash,
+        })
+    return {
+        "status": "unverifiable" if unverifiable else "verified",
+        "checks": checks,
+        "limitations": limitations,
+    }
+
+
 def validate_normalization_result(
     result: dict,
     parsed_result: dict,
@@ -1373,6 +1622,38 @@ def validate_normalization_result(
             or total_bytes != result.get("output_size_bytes")
         ):
             raise ValueError("Normalized aggregate counts are inconsistent.")
+        provenance = result.get("provenance")
+        if provenance is not None:
+            validate_provenance(provenance)
+            expected_inputs = [{
+                "kind": "source",
+                "dataset_id": dataset_id,
+                "file_id": file_id,
+                "sha256": source_checksum,
+                "size_bytes": source_size,
+            }]
+            expected_outputs = [
+                {
+                    "kind": "normalized_parquet",
+                    "table_index": index,
+                    "object_key": table.get("object_key"),
+                    "sha256": table.get("sha256"),
+                    "size_bytes": table.get("file_size_bytes"),
+                    "schema_sha256": schema_fingerprint(table["schema"]),
+                }
+                for index, table in enumerate(tables)
+            ]
+            if (
+                provenance["operation_type"] != "normalization"
+                or provenance["operation_version"] != NORMALIZATION_PIPELINE_VERSION
+                or provenance["configuration_sha256"]
+                != config["configuration_sha256"]
+                or provenance["status"] != "completed"
+                or provenance["verification"]["status"] != "verified"
+                or provenance["inputs"] != expected_inputs
+                or provenance["outputs"] != expected_outputs
+            ):
+                raise ValueError("Normalization provenance is inconsistent.")
         return json.loads(json.dumps(result, allow_nan=False))
     except (KeyError, TypeError, ValueError, OverflowError) as error:
         raise NormalizationError(
@@ -1395,12 +1676,32 @@ def normalize_file(
     source_path = Path(source_path)
 
     try:
+        source_size = source_path.stat().st_size
+        actual_source_checksum = hashlib.sha256()
+        with source_path.open("rb") as source:
+            hashed_size = 0
+            while chunk := source.read(1024 * 1024):
+                hashed_size += len(chunk)
+                actual_source_checksum.update(chunk)
+        if (
+            source_size <= 0
+            or hashed_size != source_size
+            or not isinstance(source_checksum, str)
+            or len(source_checksum) != 64
+            or actual_source_checksum.hexdigest() != source_checksum
+        ):
+            raise NormalizationError(
+                "source_integrity_failed",
+                "The local source bytes do not match the supplied source checksum.",
+            )
         with source_path.open("rb") as source:
             actual_parsed = parse_dataset_file(
                 source_filename,
                 source,
-                source_path.stat().st_size,
+                source_size,
             ).as_dict()
+    except NormalizationError:
+        raise
     except ParserConfigurationError:
         raise NormalizationError(
             "invalid_configuration",
@@ -1475,17 +1776,53 @@ def normalize_file(
                     "Normalized table row counts do not match the parsed source.",
                 )
 
+            source_metadata = {
+                "dataset_id": dataset_id,
+                "file_id": file_id,
+                "filename": source_filename,
+                "sha256": source_checksum,
+                "file_size_bytes": source_size,
+            }
+            provenance_inputs = [{
+                "kind": "source",
+                "dataset_id": dataset_id,
+                "file_id": file_id,
+                "sha256": source_checksum,
+                "size_bytes": source_size,
+            }]
+            provenance_outputs = [
+                {
+                    "kind": "normalized_parquet",
+                    "table_index": index,
+                    "object_key": table["object_key"],
+                    "sha256": table["sha256"],
+                    "size_bytes": table["file_size_bytes"],
+                    "schema_sha256": schema_fingerprint(table["schema"]),
+                }
+                for index, table in enumerate(tables)
+            ]
+            provenance = build_provenance(
+                operation_type="normalization",
+                operation_version=NORMALIZATION_PIPELINE_VERSION,
+                configuration_sha256=config_hash,
+                status="completed",
+                inputs=provenance_inputs,
+                outputs=provenance_outputs,
+                verification_status="verified",
+                checks=[
+                    {"name": "source_checksum", "status": "verified"},
+                    {"name": "normalized_output_checksum_and_size", "status": "verified"},
+                    {"name": "normalized_schema_and_row_fidelity", "status": "verified"},
+                ],
+                limitations=[
+                    "Recorded provenance binds hashes and metadata; it does not prove business-semantic correctness."
+                ],
+            )
             return {
                 "version": 1,
                 "pipeline_version": NORMALIZATION_PIPELINE_VERSION,
                 "status": "Ready",
-                "source": {
-                    "dataset_id": dataset_id,
-                    "file_id": file_id,
-                    "filename": source_filename,
-                    "sha256": source_checksum,
-                    "file_size_bytes": source_path.stat().st_size,
-                },
+                "source": source_metadata,
                 "configuration": {
                     "compression": compression,
                     "batch_size": batch_size,
@@ -1498,6 +1835,7 @@ def normalize_file(
                 "output_size_bytes": output_bytes,
                 "tables": tables,
                 "validation_status": "passed",
+                "provenance": provenance,
                 "warnings": list(dict.fromkeys(
                     warning for table in tables for warning in table["warnings"]
                 )),

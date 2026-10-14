@@ -57,7 +57,14 @@ version (`univariate-1`, `bivariate-1`, `multivariate-1`). It records source
 identity and artifact checksum, configuration and its canonical SHA-256, UTC
 execution time, requested and analyzed columns, row count, exact/no-sampling
 status, per-column type and status, per-pair summaries, multivariate matrix
-summaries, warnings, and an optional sanitized failure.
+summaries, warnings, an additive versioned provenance envelope, and an
+optional sanitized failure. Successful result provenance links the original
+source and selected normalized table to the normalization operation and records
+the artifact checksum, schema, and row-count checks. Returned storage/Parquet
+failure results carry failed operation status and `unverifiable` verification
+when the required checks did not complete; unavailable source identity remains
+null rather than being represented by a placeholder hash. The provenance is
+returned to the caller, not persisted as analysis history.
 
 Supported Arrow values are integers, floating point, decimals, booleans,
 strings, dates and timestamps. Other Arrow types are reported as
@@ -170,7 +177,9 @@ columns are explicit per-column results rather than silently omitted.
 
 This stage intentionally does not provide time-series analysis, automatic
 column selection, AI-driven planning, an HTTP endpoint, persistent execution
-history or lineage, model artifacts, or cross-session state. Profile
+history or lineage, model artifacts, or cross-session state. Its returned
+provenance is a result-level trace, not an independently audited or persisted
+history. Profile
 statistics are not treated as normalized-artifact statistics.
 
 Deferred or intentionally not yet implemented capabilities include advanced

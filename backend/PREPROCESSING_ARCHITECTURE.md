@@ -228,8 +228,14 @@ by the orchestrator.
 Each step result records its ID, operation ID/version, effective-configuration
 SHA-256, status, before/after row and column counts when available, configured
 affected-column names, and a bounded numeric summary from existing
-transformation lineage where available. Free text and row values are excluded
-from that summary. A completed result exposes the final table. On a runtime
+transformation lineage where available. It also includes SHA-256 fingerprints
+of the input and successful output Arrow tables and a provenance record linking
+the step to its parent operation. The top-level result fingerprints the initial
+input and final output (or records no output on failure), and retains ordered
+step provenance as parent IDs. Fingerprints are computed by streaming Arrow IPC
+serialization into a digest sink rather than retaining a second serialized
+table buffer. Free text and row values are excluded from result metadata. A
+completed result exposes the final table. On a runtime
 step failure, execution stops; the result
 identifies the failed step, retains prior step metadata, marks later steps
 `not_executed`, and has no final table. Arbitrary executor exception messages
@@ -246,8 +252,10 @@ step's output table are checked against the transformation resource limits and
 column-name constraints. No row values are copied into orchestration results;
 affected-column metadata is derived only from configuration. Existing BA
 transformation summaries remain attached by their registered executors to the
-returned table. The orchestrator does not persist additional execution history
-or lineage.
+returned table. Fingerprinting adds a full-table serialization pass at the
+initial input and after each completed step; it does not add another full
+serialized buffer. The provenance is returned in memory only and is not
+persisted as execution history.
 
 ### Fit-context boundary
 
@@ -289,11 +297,13 @@ zero.
 
 These components do not infer business meaning, determine whether an outlier
 is an error, join datasets, or run a complete ingestion workflow. Lineage is
-attached to the returned in-memory PyArrow table; it is not persisted to
-storage by these operations. Callers must retain the operation version,
-configuration, approval, fitted context, and input/output provenance when
-assembling later workflows. No API, database migration, or new dependency is
-introduced.
+attached to the returned in-memory PyArrow table and represented by
+operation/configuration/input/output fingerprints in the result; it is not
+persisted to storage by these operations. The fingerprint proves deterministic
+serialization identity, not semantic correctness or independent artifact
+read-back. Callers must retain the operation version, configuration, approval,
+fitted context, and input/output provenance when assembling later workflows.
+No API, database migration, or new dependency is introduced.
 
 The quality catalog remains unchanged: its transformation descriptions are
 catalog metadata for the quality-rule surface, while executable transformation

@@ -42,6 +42,13 @@ Configuration selects registered rules and supplies each selected rule's
 version and complete configuration. Invalid or unknown options are rejected
 before execution. The canonical configuration, source checksum, normalized
 output checksums, analyzer version, and ruleset version bind the analysis key.
+Newly built reports also carry an additive shared provenance envelope linking
+the source and normalized outputs to the quality operation and, when valid
+normalization provenance is supplied, to its parent operation ID. The quality
+analysis key is unchanged. The API marks report verification `verified` only
+after checking stored source and normalized-object bytes; a standalone report
+builder defaults to `unverifiable` because it has no storage evidence. Legacy
+reports without the optional provenance field remain validatable.
 Exact-row and business-key comparisons preserve deterministic typed value
 semantics. configured business keys must name existing columns and have unique column
 names. Rows with null key values are excluded; empty strings are compared as

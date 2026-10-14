@@ -150,6 +150,15 @@ counts, content fingerprints, object size, and SHA-256 before normalization is
 marked `Ready`. If metadata persistence fails after an output is written, that
 content-addressed object is retained; a retry verifies and reuses it rather
 than risking deletion of a valid output.
+The normalization result includes a versioned provenance envelope binding the
+source checksum/size, effective configuration, and each output object's key,
+checksum, size, and schema fingerprint. `normalize_file` independently hashes
+its local source bytes before reparsing, so direct service callers cannot
+produce a result under a mismatched supplied source checksum. The detailed
+read-only output verifier reports `verified`, `failed`, or `unverifiable`
+checks; byte verification does not establish business-semantic correctness.
+Legacy normalization metadata without this additive envelope remains
+validatable.
 Deleting a dataset removes only objects under that dataset's prefix from both
 the raw and processed buckets. Deletion acquires the same per-file advisory
 locks as normalization and returns a conflict while any file is being
@@ -192,8 +201,10 @@ application-level authentication or project ownership checks; deployments must
 place it behind a trusted network boundary or an authenticating gateway.
 Unit tests use mocked object storage and isolated SQLite databases. The
 separate PostgreSQL/MinIO CI integration job passed on baseline commit
-`3ba1bdce665574fff37259cb2b88d5b2ee1558db`; these uncommitted changes require
-their own CI run before their live-service behavior is considered verified.
+`3ba1bdce665574fff37259cb2b88d5b2ee1558db`. The current working-tree changes
+also passed the migration and upload-to-quality integration test against fresh,
+isolated local PostgreSQL and MinIO containers. This is not a GitHub Actions
+run; the CI result for these uncommitted changes remains unverified.
 
 Database sources such as PostgreSQL and MySQL, live servers, streaming, polling,
 and cloud object storage require separate connector-based ingestion paths.

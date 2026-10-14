@@ -169,6 +169,12 @@ class EDAServiceTests(unittest.TestCase):
         table = pa.table({"x": [1.0, 2.0, 3.0, 4.0], "y": [2.0, 4.0, 6.0, 8.0]})
         result, _ = self.run_eda(table, ["x", "y"], analysis_type="bivariate")
         self.assertEqual(result.analysis_type, "bivariate")
+        self.assertEqual(result.provenance["status"], "completed")
+        self.assertEqual(
+            result.provenance["verification"]["status"],
+            "verified",
+        )
+        self.assertEqual(result.provenance["operation_type"], "eda:bivariate")
         self.assertEqual(result.status, "completed")
         pair = result.pair_results[0]
         self.assertEqual(pair.pair_type, "numeric_numeric")
@@ -954,6 +960,19 @@ class EDAServiceTests(unittest.TestCase):
             )
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.algorithm_version, "bivariate-1")
+        self.assertEqual(result.provenance["status"], "failed")
+        self.assertEqual(
+            result.provenance["verification"]["status"],
+            "unverifiable",
+        )
+        self.assertEqual(
+            result.provenance["inputs"][0]["sha256"],
+            source["source_sha256"],
+        )
+        self.assertEqual(
+            result.provenance["inputs"][0]["size_bytes"],
+            source["source_size_bytes"],
+        )
         self.assertEqual(
             result.multivariate_summary,
             {
@@ -1452,6 +1471,8 @@ class EDAServiceTests(unittest.TestCase):
         second = analyze_normalized_file(**arguments).as_dict()
         first.pop("executed_at")
         second.pop("executed_at")
+        first["provenance"].pop("completed_at")
+        second["provenance"].pop("completed_at")
         self.assertEqual(first, second)
         self.assertEqual(
             self.storage.objects[("processed", object_key)],

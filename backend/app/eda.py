@@ -3,7 +3,7 @@ import json
 import math
 import re
 import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -26,6 +26,7 @@ from app.execution import (
     estimate_decoded_python_string_bytes,
 )
 from app.profiling import _MAX_DISPLAY_VALUE_LENGTH
+from app.provenance import build_provenance, schema_fingerprint, validate_provenance
 from app.quality_analysis import (
     QUALITY_ANALYSIS_CONFIGURATION,
     QualityAnalysisError,
@@ -191,6 +192,7 @@ class EDAResult:
     failure: EDAFailure | None = None
     pair_results: tuple[EDAColumnPairResult, ...] = ()
     multivariate_summary: dict[str, Any] = field(default_factory=dict)
+    provenance: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
@@ -219,6 +221,7 @@ class EDAResult:
             "failure": self.failure.as_dict() if self.failure else None,
             "pair_results": [pair.as_dict() for pair in self.pair_results],
             "multivariate_summary": self.multivariate_summary,
+            "provenance": self.provenance,
         }
 
 
@@ -1668,6 +1671,91 @@ def _failure_summary(configuration: EDAConfiguration) -> dict[str, Any]:
     return {}
 
 
+def _eda_provenance(
+    *,
+    dataset_id: int,
+    file_id: int,
+    source_sha256: str | None,
+    source_size_bytes: int | None,
+    normalization_result: dict,
+    table: dict,
+    schema: pa.Schema | None,
+    configuration: EDAConfiguration,
+    result_status: str,
+    verification_status: str,
+) -> dict[str, Any]:
+    inputs = [
+        {
+            "kind": "source",
+            "dataset_id": dataset_id,
+            "file_id": file_id,
+            "sha256": source_sha256,
+            "size_bytes": source_size_bytes,
+        },
+        {
+            "kind": "normalized_parquet",
+            "dataset_id": dataset_id,
+            "file_id": file_id,
+            "table_index": configuration.table_index,
+            "object_key": table.get("object_key"),
+            "sha256": table.get("sha256"),
+            "size_bytes": table.get("file_size_bytes"),
+            "schema_sha256": (
+                schema_fingerprint(schema)
+                if schema is not None
+                else None
+            ),
+        },
+    ]
+    parents = []
+    normalization_provenance = normalization_result.get("provenance")
+    if isinstance(normalization_provenance, dict):
+        try:
+            validate_provenance(normalization_provenance)
+        except (KeyError, TypeError, ValueError):
+            pass
+        else:
+            parents.append(normalization_provenance["operation_id"])
+    configuration_sha256 = hashlib.sha256(
+        _canonical_json(configuration.as_dict())
+    ).hexdigest()
+    algorithm_version = _algorithm_version_for_analysis(
+        configuration.analysis_type
+    )
+    operation_status = (
+        "completed" if result_status == "completed" else
+        "partial" if result_status == "partially_completed" else
+        "failed"
+    )
+    return build_provenance(
+        operation_type=f"eda:{configuration.analysis_type}",
+        operation_version=algorithm_version,
+        configuration_sha256=configuration_sha256,
+        status=operation_status,
+        inputs=inputs,
+        outputs=(
+            [{
+                "kind": "eda_result",
+                "analysis_type": configuration.analysis_type,
+                "algorithm_version": algorithm_version,
+                "configuration_sha256": configuration_sha256,
+            }]
+            if operation_status != "failed"
+            else []
+        ),
+        verification_status=verification_status,
+        checks=[
+            {"name": "normalized_artifact_checksum", "status": verification_status},
+            {"name": "normalized_schema", "status": verification_status},
+            {"name": "normalized_row_count", "status": verification_status},
+        ],
+        limitations=[
+            "Artifact checksum and schema verification do not establish business-semantic correctness."
+        ],
+        parent_operation_ids=parents,
+    )
+
+
 def _failure_result(
     *,
     dataset_id: int,
@@ -1676,10 +1764,31 @@ def _failure_result(
     artifact_sha256: str | None,
     normalization_version: str | None,
     table_name: str | None,
+    source_sha256: str | None = None,
+    source_size_bytes: int | None = None,
+    normalization_result: dict | None = None,
     code: str,
     message: str,
 ) -> EDAResult:
     encoded = _canonical_json(configuration.as_dict())
+    normalized = normalization_result or {}
+    provenance_table = {
+        "object_key": None,
+        "sha256": artifact_sha256,
+        "file_size_bytes": None,
+    }
+    provenance = _eda_provenance(
+        dataset_id=dataset_id,
+        file_id=file_id,
+        source_sha256=source_sha256,
+        source_size_bytes=source_size_bytes,
+        normalization_result=normalized,
+        table=provenance_table,
+        schema=None,
+        configuration=configuration,
+        result_status="failed",
+        verification_status="unverifiable",
+    )
     return EDAResult(
         schema_version=EDA_RESULT_SCHEMA_VERSION,
         analysis_type=configuration.analysis_type,
@@ -1702,6 +1811,7 @@ def _failure_result(
         columns=(),
         failure=EDAFailure(code, message),
         multivariate_summary=_failure_summary(configuration),
+        provenance=provenance,
     )
 
 
@@ -1850,6 +1960,9 @@ def analyze_normalized_file(
             artifact_sha256=table.get("sha256"),
             normalization_version=normalized.get("pipeline_version"),
             table_name=table.get("table_name"),
+            source_sha256=source_sha256,
+            source_size_bytes=source_size_bytes,
+            normalization_result=normalized,
             code="artifact_analysis_failed",
             message=f"EDA could not safely analyze the normalized artifact ({type(error).__name__}).",
         )
@@ -1935,6 +2048,23 @@ def _analyze_local_parquet(
                 artifact_sha256=table["sha256"],
                 normalization_version=normalization_result["pipeline_version"],
                 table_name=table.get("table_name"),
+            )
+            relationship_result = replace(
+                relationship_result,
+                provenance=_eda_provenance(
+                    dataset_id=dataset_id,
+                    file_id=file_id,
+                    source_sha256=source_sha256,
+                    source_size_bytes=normalization_result["source"][
+                        "file_size_bytes"
+                    ],
+                    normalization_result=normalization_result,
+                    table=table,
+                    schema=schema,
+                    configuration=configuration,
+                    result_status=relationship_result.status,
+                    verification_status="verified",
+                ),
             )
             if len(_canonical_json(relationship_result.as_dict())) > configuration.max_result_bytes:
                 raise EDAError("result_size_limit", "EDA result exceeds the configured serialized size limit.")
@@ -2160,6 +2290,20 @@ def _analyze_local_parquet(
             sampling=None,
             columns=tuple(column_results),
             warnings=tuple(global_warnings),
+            provenance=_eda_provenance(
+                dataset_id=dataset_id,
+                file_id=file_id,
+                source_sha256=source_sha256,
+                source_size_bytes=normalization_result["source"][
+                    "file_size_bytes"
+                ],
+                normalization_result=normalization_result,
+                table=table,
+                schema=schema,
+                configuration=configuration,
+                result_status=status,
+                verification_status="verified",
+            ),
         )
         if len(_canonical_json(result.as_dict())) > configuration.max_result_bytes:
             raise EDAError("result_size_limit", "EDA result exceeds the configured serialized size limit.")
@@ -2174,6 +2318,11 @@ def _analyze_local_parquet(
             artifact_sha256=table.get("sha256"),
             normalization_version=normalization_result.get("pipeline_version"),
             table_name=table.get("table_name"),
+            source_sha256=source_sha256,
+            source_size_bytes=normalization_result.get("source", {}).get(
+                "file_size_bytes"
+            ),
+            normalization_result=normalization_result,
             code="parquet_analysis_failed",
             message=f"EDA could not safely scan the normalized artifact ({type(error).__name__}).",
         )

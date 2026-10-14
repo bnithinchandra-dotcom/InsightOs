@@ -99,6 +99,13 @@ class PostgresMinioFlowTests(unittest.TestCase):
             normalized_body["normalization_result"]["validation_status"],
             "passed",
         )
+        normalization_provenance = normalized_body["normalization_result"][
+            "provenance"
+        ]
+        self.assertEqual(
+            normalization_provenance["verification"]["status"],
+            "verified",
+        )
         self.assertTrue(
             main.verify_normalization_result(
                 self.storage,
@@ -114,6 +121,15 @@ class PostgresMinioFlowTests(unittest.TestCase):
         quality_body = quality.json()
         self.assertEqual(quality_body["status"], "Completed")
         self.assertTrue(quality_body["report_is_current"])
+        quality_provenance = quality_body["quality_report"]["provenance"]
+        self.assertEqual(
+            quality_provenance["verification"]["status"],
+            "verified",
+        )
+        self.assertEqual(
+            quality_provenance["parent_operation_ids"],
+            [normalization_provenance["operation_id"]],
+        )
 
         session = main.SessionLocal()
         try:

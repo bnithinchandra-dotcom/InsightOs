@@ -21,6 +21,7 @@ from app.normalization import (
     _json_load,
     get_normalization_configuration,
     normalize_file,
+    verify_normalization_result_detailed,
 )
 from app.parsing import ParsingError, parse_dataset_file
 
@@ -370,6 +371,67 @@ class NormalizationTests(unittest.TestCase):
                     "processed",
                 )
             self.assertEqual(path.read_bytes(), content)
+
+    def test_direct_normalization_rejects_source_checksum_mismatch_before_writing(self):
+        content = b"value\n1\n"
+        storage = FakeObjectStorage()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source.csv"
+            path.write_bytes(content)
+            parsed = parse_dataset_file(
+                "source.csv",
+                BytesIO(content),
+                len(content),
+            ).as_dict()
+            with self.assertRaises(NormalizationError) as error:
+                normalize_file(
+                    path,
+                    "source.csv",
+                    parsed,
+                    7,
+                    11,
+                    "0" * 64,
+                    storage,
+                    "processed",
+                )
+        self.assertEqual(error.exception.code, "source_integrity_failed")
+        self.assertEqual(storage.put_count, 0)
+
+    def test_detailed_normalization_verification_reports_integrity_and_provenance(self):
+        result, storage = self.normalize("verified.csv", b"value\n1\n")
+        verification = verify_normalization_result_detailed(
+            storage,
+            "processed",
+            result,
+        )
+        self.assertEqual(verification["status"], "verified")
+        self.assertTrue(
+            all(check["status"] == "verified" for check in verification["checks"])
+        )
+        self.assertTrue(verification["limitations"])
+
+        corrupted = dict(result)
+        corrupted["provenance"] = dict(result["provenance"])
+        corrupted["provenance"]["outputs"] = []
+        stale_verification = verify_normalization_result_detailed(
+            storage,
+            "processed",
+            corrupted,
+        )
+        self.assertEqual(stale_verification["status"], "failed")
+        self.assertEqual(
+            stale_verification["checks"],
+            [{"name": "normalization_metadata", "status": "failed"}],
+        )
+
+        malformed = dict(result)
+        malformed["tables"] = ["not-table-metadata"]
+        malformed_verification = verify_normalization_result_detailed(
+            storage,
+            "processed",
+            malformed,
+        )
+        self.assertEqual(malformed_verification["status"], "failed")
 
     def test_output_size_limit_is_enforced(self):
         values = [

@@ -15,6 +15,7 @@ from app.quality_analysis import (
     normalized_summary_totals,
     validate_quality_report,
 )
+from app.provenance import build_provenance
 from app.quality_rules import RuleExecutionResult
 
 
@@ -48,6 +49,12 @@ class QualityAnalysisContractTests(unittest.TestCase):
         )
 
     def validate(self, report):
+        if "provenance" in report:
+            report["provenance"]["status"] = (
+                "completed"
+                if report["completion_status"] == "Completed"
+                else "partial"
+            )
         return validate_quality_report(
             report,
             expected_summary_totals=normalized_summary_totals(
@@ -62,6 +69,92 @@ class QualityAnalysisContractTests(unittest.TestCase):
         self.assertEqual(report["coverage"]["checks"][0]["status"], "Skipped")
         self.assertEqual(report["findings"], [])
         self.assertEqual(report["scores"], [])
+
+    def test_report_provenance_is_additive_verified_and_legacy_compatible(self):
+        now = datetime(2026, 10, 10, tzinfo=timezone.utc)
+        normalization = {
+            "source": {
+                "dataset_id": 7,
+                "file_id": 11,
+                "sha256": self.source_sha256,
+                "file_size_bytes": 123,
+            },
+            "configuration": {"configuration_sha256": "c" * 64},
+            "pipeline_version": "normalization-1",
+            "tables": [
+                {
+                    "table_index": 0,
+                    "sha256": "b" * 64,
+                    "file_size_bytes": 456,
+                    "object_key": "7/11/object.parquet",
+                    "schema": [{"name": "value", "type": "int64"}],
+                    "row_count": 5,
+                    "column_count": 1,
+                }
+            ],
+        }
+        normalization["provenance"] = build_provenance(
+            operation_type="normalization",
+            operation_version="normalization-1",
+            configuration_sha256="c" * 64,
+            status="completed",
+            inputs=[{
+                "kind": "source",
+                "dataset_id": 7,
+                "file_id": 11,
+                "sha256": self.source_sha256,
+                "size_bytes": 123,
+            }],
+            outputs=[{
+                "kind": "normalized_parquet",
+                "table_index": 0,
+                "object_key": "7/11/object.parquet",
+                "sha256": "b" * 64,
+                "size_bytes": 456,
+                "schema_sha256": "d" * 64,
+            }],
+            verification_status="verified",
+            checks=[{"name": "artifact", "status": "verified"}],
+        )
+        analysis_key, configuration_sha256 = quality_analysis_key(
+            self.source_sha256,
+            normalization,
+        )
+        report = build_contract_report(
+            self.source_sha256,
+            normalization,
+            analysis_key,
+            configuration_sha256,
+            now,
+            now + timedelta(seconds=1),
+            verification_status="verified",
+        )
+        self.assertEqual(
+            report["provenance"]["verification"]["status"],
+            "verified",
+        )
+        self.assertEqual(
+            report["provenance"]["parent_operation_ids"],
+            [normalization["provenance"]["operation_id"]],
+        )
+        self.assertEqual(
+            validate_quality_report(
+                report,
+                expected_summary_totals=normalized_summary_totals(
+                    normalization
+                ),
+            ),
+            report,
+        )
+
+        stale = copy.deepcopy(report)
+        stale["provenance"]["verification"]["status"] = "stale"
+        with self.assertRaises(QualityAnalysisError):
+            validate_quality_report(stale)
+
+        legacy = copy.deepcopy(report)
+        del legacy["provenance"]
+        self.assertEqual(validate_quality_report(legacy), legacy)
 
     def test_failed_rule_is_visible_and_keeps_report_partial(self):
         now = datetime(2026, 10, 10, tzinfo=timezone.utc)
@@ -179,6 +272,7 @@ class QualityAnalysisContractTests(unittest.TestCase):
                 configuration_sha256=legacy_configuration_sha256,
                 ruleset_version="1",
             )
+            report.pop("provenance")
             with self.subTest(configuration=configuration):
                 self.assertEqual(self.validate(report), report)
 
@@ -195,6 +289,7 @@ class QualityAnalysisContractTests(unittest.TestCase):
             configuration_sha256=old_configuration_sha256,
             ruleset_version="2",
         )
+        report.pop("provenance")
         self.assertEqual(self.validate(report), report)
 
     def test_pre_constant_column_ruleset_reports_remain_validatable(self):
@@ -210,6 +305,7 @@ class QualityAnalysisContractTests(unittest.TestCase):
             configuration_sha256=old_configuration_sha256,
             ruleset_version="3",
         )
+        report.pop("provenance")
         self.assertEqual(self.validate(report), report)
 
     def test_summary_totals_are_checked_against_normalized_metadata(self):

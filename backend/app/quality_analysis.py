@@ -13,6 +13,11 @@ from app.quality_rules import (
     NUMERIC_OUTLIER_CANDIDATE_RULE,
     RuleExecutionResult,
 )
+from app.provenance import (
+    build_provenance,
+    schema_fingerprint,
+    validate_provenance,
+)
 
 
 QUALITY_REPORT_SCHEMA_VERSION = 1
@@ -363,6 +368,8 @@ def build_contract_report(
     started_at: datetime,
     completed_at: datetime,
     rule_results: list[RuleExecutionResult] | None = None,
+    *,
+    verification_status: str = "unverifiable",
 ) -> dict:
     outputs = normalized_output_provenance(normalization_result)
     checks = []
@@ -484,6 +491,58 @@ def build_contract_report(
         classification_counts[finding["classification"]] += 1
         severity_counts[finding["severity"]] += 1
     coverage_status = _expected_completion_status(checks)
+    normalized_tables = normalization_result.get("tables", [])
+    source = normalization_result.get("source", {})
+    provenance_inputs = [
+        {
+            "kind": "source",
+            "dataset_id": source.get("dataset_id"),
+            "file_id": source.get("file_id"),
+            "sha256": source_sha256,
+            "size_bytes": source.get("file_size_bytes"),
+        }
+    ]
+    provenance_inputs.extend(
+        {
+            "kind": "normalized_parquet",
+            "table_index": table["table_index"],
+            "sha256": table.get("sha256"),
+            "schema_sha256": (
+                schema_fingerprint(table["schema"])
+                if isinstance(table.get("schema"), list)
+                else None
+            ),
+        }
+        for table in normalized_tables
+    )
+    parent_operation_ids = []
+    parent_provenance = normalization_result.get("provenance")
+    if isinstance(parent_provenance, dict):
+        try:
+            validate_provenance(parent_provenance)
+        except (KeyError, TypeError, ValueError):
+            pass
+        else:
+            parent_operation_ids.append(parent_provenance["operation_id"])
+    provenance = build_provenance(
+        operation_type="quality_analysis",
+        operation_version=QUALITY_ANALYZER_VERSION,
+        configuration_sha256=configuration_sha256,
+        status="completed" if coverage_status == "Completed" else "partial",
+        inputs=provenance_inputs,
+        outputs=[{"kind": "quality_report", "analysis_key": analysis_key}],
+        verification_status=verification_status,
+        checks=[
+            {"name": "source_checksum", "status": verification_status},
+            {"name": "normalized_output_checksums", "status": verification_status},
+            {"name": "normalized_schema_metadata", "status": verification_status},
+        ],
+        limitations=[
+            "Artifact integrity verification does not establish business-semantic correctness."
+        ],
+        parent_operation_ids=parent_operation_ids,
+        completed_at=completed_at.astimezone(timezone.utc).isoformat(),
+    )
     report = {
         "schema_version": QUALITY_REPORT_SCHEMA_VERSION,
         "analysis": {
@@ -509,6 +568,7 @@ def build_contract_report(
         },
         "findings": findings,
         "scores": [],
+        "provenance": provenance,
     }
     return validate_quality_report(
         report,
@@ -566,7 +626,13 @@ def validate_quality_report(
     expected_normalized_outputs: list[dict] | None = None,
 ) -> dict:
     try:
-        if not isinstance(report, dict) or set(report) != _TOP_LEVEL_KEYS:
+        if (
+            not isinstance(report, dict)
+            or set(report) not in (
+                _TOP_LEVEL_KEYS,
+                _TOP_LEVEL_KEYS | {"provenance"},
+            )
+        ):
             raise ValueError("Invalid report fields.")
         if (
             not _is_int(report["schema_version"])
@@ -658,6 +724,49 @@ def validate_quality_report(
             and outputs != expected_normalized_outputs
         ):
             raise ValueError("Normalized output provenance mismatch.")
+        provenance = report.get("provenance")
+        if provenance is not None:
+            validate_provenance(provenance)
+            expected_operation_status = (
+                "completed"
+                if report["completion_status"] == "Completed"
+                else "partial"
+            )
+            if (
+                provenance["operation_type"] != "quality_analysis"
+                or provenance["operation_version"] != analysis["analyzer_version"]
+                or provenance["configuration_sha256"]
+                != analysis["configuration_sha256"]
+                or provenance["status"] != expected_operation_status
+                or provenance["outputs"]
+                != [{"kind": "quality_report", "analysis_key": analysis["analysis_key"]}]
+            ):
+                raise ValueError("Quality report provenance is inconsistent.")
+            provenance_source = [
+                item
+                for item in provenance["inputs"]
+                if item.get("kind") == "source"
+            ]
+            provenance_outputs = [
+                item
+                for item in provenance["inputs"]
+                if item.get("kind") == "normalized_parquet"
+            ]
+            if (
+                len(provenance_source) != 1
+                or provenance_source[0].get("sha256") != analysis["source_sha256"]
+                or [
+                    {
+                        "table_index": item.get("table_index"),
+                        "sha256": item.get("sha256"),
+                    }
+                    for item in provenance_outputs
+                ]
+                != outputs
+            ):
+                raise ValueError("Quality report input lineage is inconsistent.")
+            if provenance["verification"]["status"] in {"failed", "stale"}:
+                raise ValueError("A failed or stale verification cannot back a quality report.")
 
         summary = report["summary"]
         if not isinstance(summary, dict) or set(summary) != _SUMMARY_KEYS:
