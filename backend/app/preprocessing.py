@@ -10,6 +10,12 @@ from typing import Any, Iterable, Literal, Protocol
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from app.execution import (
+    ExecutionBudget,
+    ExecutionBudgetExceeded,
+    estimate_decoded_python_string_bytes,
+)
+
 from app.quality_catalog import (
     QUALITY_RULE_STATUSES,
     get_quality_rule_catalog_entry,
@@ -540,6 +546,25 @@ def _is_string_type(value_type: pa.DataType) -> bool:
     return pa.types.is_string(value_type) or pa.types.is_large_string(value_type)
 
 
+def _consume_decoded_string_budget(
+    values: pa.Array | pa.ChunkedArray,
+    budget: ExecutionBudget,
+) -> None:
+    try:
+        budget.consume(
+            "decoded_string_bytes",
+            estimate_decoded_python_string_bytes(values),
+        )
+    except ExecutionBudgetExceeded as error:
+        raise TransformationRegistryError(
+            "Transformation decoded string values exceed the configured byte limit."
+        ) from error
+
+
+def _arrow_to_pylist(values: pa.ChunkedArray) -> list:
+    return values.to_pylist()
+
+
 def _is_numeric_type(value_type: pa.DataType) -> bool:
     return pa.types.is_integer(value_type) or pa.types.is_floating(value_type)
 
@@ -822,6 +847,9 @@ class _MissingValueHandling:
             else None
         )
         parameters = {}
+        decoded_values_budget = ExecutionBudget(
+            {"decoded_string_bytes": _MAX_TRANSFORMATION_INPUT_BYTES}
+        )
 
         for index in indices:
             field = table.schema.field(index)
@@ -851,6 +879,7 @@ class _MissingValueHandling:
                     values,
                     field,
                     resolved["empty_strings_as_missing"],
+                    decoded_values_budget,
                 )
                 if not observed:
                     raise TransformationRegistryError(
@@ -983,9 +1012,12 @@ class _MissingValueHandling:
         values: pa.ChunkedArray,
         field: pa.Field,
         empty_strings_as_missing: bool,
+        decoded_values_budget: ExecutionBudget,
     ) -> list[str | bool]:
+        if _is_string_type(field.type):
+            _consume_decoded_string_budget(values, decoded_values_budget)
         observed = []
-        for value in values.to_pylist():
+        for value in _arrow_to_pylist(values):
             if value is None:
                 continue
             if empty_strings_as_missing and _is_string_type(field.type) and value == "":
@@ -1684,7 +1716,12 @@ class _CategoryMapping:
                 "null_value is valid only with the constant null policy."
             )
         field = table.schema.field(index)
-        source_values = table.column(index).to_pylist()
+        source_array = table.column(index)
+        decoded_values_budget = ExecutionBudget(
+            {"decoded_string_bytes": _MAX_TRANSFORMATION_INPUT_BYTES}
+        )
+        _consume_decoded_string_budget(source_array, decoded_values_budget)
+        source_values = _arrow_to_pylist(source_array)
         null_count = sum(value is None for value in source_values)
         unmapped_count = sum(
             value is not None and value not in mapping

@@ -58,12 +58,14 @@ def check_storage() -> tuple[bool, dict[str, str]]:
             secure=getenv("MINIO_SECURE", "false").lower() in {"1", "true", "yes"},
         )
 
+        all_available = True
         for bucket in buckets:
-            if not client.bucket_exists(bucket):
-                client.make_bucket(bucket)
-            buckets[bucket] = "available"
+            if client.bucket_exists(bucket):
+                buckets[bucket] = "available"
+            else:
+                all_available = False
 
-        return True, buckets
+        return all_available, buckets
     except Exception as error:
         logger.warning("Object storage health check failed (%s)", type(error).__name__)
         return False, buckets

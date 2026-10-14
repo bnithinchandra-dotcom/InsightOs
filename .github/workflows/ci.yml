@@ -28,7 +28,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14.3"
           cache: pip
           cache-dependency-path: backend/requirements.txt
 
@@ -42,3 +42,74 @@ jobs:
 
       - name: Run backend tests
         run: python -m unittest discover -s tests -v
+
+      - name: Build backend image
+        run: docker build -f Dockerfile -t insightos-backend:ci .
+
+  backend-integration:
+    name: PostgreSQL and MinIO Integration
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql+psycopg://insightos:integration-password@localhost:5432/insightos_integration
+      MINIO_ENDPOINT: 127.0.0.1:9000
+      MINIO_ACCESS_KEY: integration-access
+      MINIO_SECRET_KEY: integration-secret-key
+      MINIO_SECURE: "false"
+      INSIGHTOS_RUN_INTEGRATION: "1"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: insightos
+          POSTGRES_PASSWORD: integration-password
+          POSTGRES_DB: insightos_integration
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U insightos -d insightos_integration"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14.3"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build isolated MinIO service image
+        run: docker build -f ../infrastructure/docker/minio.Dockerfile -t insightos-minio-integration ..
+
+      - name: Start isolated MinIO service
+        run: |
+          docker run -d --name insightos-minio-integration \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER="$MINIO_ACCESS_KEY" \
+            -e MINIO_ROOT_PASSWORD="$MINIO_SECRET_KEY" \
+            insightos-minio-integration server /data --console-address ":9001"
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/ready; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs insightos-minio-integration
+          exit 1
+
+      - name: Apply database migrations
+        run: alembic upgrade head
+
+      - name: Run real-service data-flow test
+        run: python -m unittest tests.integration.test_postgres_minio -v

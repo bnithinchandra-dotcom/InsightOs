@@ -435,6 +435,19 @@ class ParsingTests(unittest.TestCase):
                 parse("deep.json", b'{"a":{"b":{"c":1}}}')
         self.assertEqual(context.exception.code, "resource_limit")
 
+    def test_json_memory_estimate_rejects_before_reading_or_decoding(self):
+        payload = b'{"records":[]}' + b" " * (16 * 1024)
+        stream = ReadTrackingStream(payload)
+        with (
+            patch.dict(os.environ, {"MAX_JSON_ESTIMATED_DECODED_MB": "1"}),
+            patch("app.parsing.json.loads") as loads,
+        ):
+            with self.assertRaises(ParsingError) as context:
+                parse_dataset_file("large.json", stream, len(payload))
+        self.assertEqual(context.exception.code, "resource_limit")
+        self.assertEqual(stream.bytes_read, 0)
+        loads.assert_not_called()
+
     def test_duplicate_json_keys_are_not_silently_overwritten(self):
         with self.assertRaises(ParsingError) as context:
             parse("duplicate.json", b'[{"key":1,"key":2}]')

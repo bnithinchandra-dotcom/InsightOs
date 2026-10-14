@@ -51,6 +51,7 @@ class ParseLimits:
     max_xml_depth: int
     max_xml_elements: int
     max_json_depth: int
+    max_json_decoded_bytes: int
     max_profile_distinct_values: int
     max_profile_numeric_values: int
     max_profile_duplicate_rows: int
@@ -128,6 +129,11 @@ def get_parse_limits() -> ParseLimits:
         max_xml_depth=_positive_limit("MAX_XML_DEPTH", 64),
         max_xml_elements=_positive_limit("MAX_XML_ELEMENTS", 100_000),
         max_json_depth=_positive_limit("MAX_JSON_DEPTH", 64),
+        max_json_decoded_bytes=(
+            _positive_limit("MAX_JSON_ESTIMATED_DECODED_MB", 256)
+            * 1024
+            * 1024
+        ),
         max_profile_distinct_values=_positive_limit(
             "MAX_PROFILE_DISTINCT_VALUES", 100_000
         ),
@@ -180,10 +186,30 @@ def _merge_json_type(stats: _ColumnStats, value) -> None:
     stats.observed_types.add(_json_physical_type(value))
 
 
-def _read_json(stream: BinaryIO, limits: ParseLimits) -> ParseResult:
+def _read_json(
+    stream: BinaryIO,
+    file_size: int,
+    limits: ParseLimits,
+) -> ParseResult:
+    max_source_bytes = limits.max_json_decoded_bytes // 64
+    if max_source_bytes <= 0:
+        raise ParserConfigurationError(
+            "MAX_JSON_ESTIMATED_DECODED_MB is too small for JSON parsing."
+        )
+    if file_size > max_source_bytes:
+        _fail(
+            "resource_limit",
+            "The JSON document exceeds the configured decoded-memory estimate.",
+        )
     try:
         stream.seek(0)
-        text = stream.read().decode("utf-8-sig")
+        encoded = stream.read(max_source_bytes + 1)
+        if len(encoded) > max_source_bytes:
+            _fail(
+                "resource_limit",
+                "The JSON document exceeds the configured decoded-memory estimate.",
+            )
+        text = encoded.decode("utf-8-sig")
         if not text.strip():
             _fail("empty_file", "The uploaded JSON file is empty.")
 
@@ -929,7 +955,7 @@ def parse_dataset_file(filename: str, stream: BinaryIO, file_size: int) -> Parse
         if detected_format in {"csv", "tsv"}:
             return _read_delimited(filename, stream, file_size, limits)
         if detected_format == "json":
-            return _read_json(stream, limits)
+            return _read_json(stream, file_size, limits)
         if detected_format == "xlsx":
             return _read_xlsx(stream, file_size, limits)
         if detected_format == "parquet":

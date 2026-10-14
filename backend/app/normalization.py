@@ -16,6 +16,7 @@ import pyarrow.parquet as pq
 from openpyxl import load_workbook
 from urllib3.exceptions import HTTPError
 
+from app.execution import ExecutionBudget, ExecutionBudgetExceeded
 from app.parsing import (
     MISSING,
     ParserConfigurationError,
@@ -800,14 +801,21 @@ def _normalize_table(
     expected_empty = [0] * len(arrow_schema)
     row_count = 0
     writer = None
+    output_budget = ExecutionBudget({"normalized_output_bytes": remaining_output_bytes})
 
     try:
         def check_temporary_size() -> None:
-            if output_path.stat().st_size > remaining_output_bytes:
+            current_size = output_path.stat().st_size
+            try:
+                output_budget.consume(
+                    "normalized_output_bytes",
+                    current_size - output_budget.used("normalized_output_bytes"),
+                )
+            except ExecutionBudgetExceeded:
                 raise NormalizationError(
                     "resource_limit",
                     "Normalized output exceeds MAX_NORMALIZED_OUTPUT_MB.",
-                )
+                ) from None
 
         try:
             writer = pq.ParquetWriter(

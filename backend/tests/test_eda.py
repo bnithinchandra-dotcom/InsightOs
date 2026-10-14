@@ -80,6 +80,14 @@ class EDAContractTests(unittest.TestCase):
             ({"selected_columns": ["x"], "max_categories": 101}, "max_categories"),
             ({"selected_columns": ["x"], "max_result_bytes": 2_000_000}, "max_result_bytes"),
             ({"selected_columns": ["x"], "sampling": "random"}, "unsupported fields"),
+            (
+                {
+                    "analysis_type": "bivariate",
+                    "selected_columns": ["x", "y"],
+                    "column_pairs": [1],
+                },
+                "two non-empty",
+            ),
         )
         for configuration, message in cases:
             with self.subTest(configuration=configuration):
@@ -95,6 +103,8 @@ class EDAContractTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(EDAError, "Percentiles"):
             EDAConfiguration(selected_columns=("x",), percentiles=(float("nan"),))
+        with self.assertRaisesRegex(EDAError, "analysis type"):
+            EDAConfiguration(analysis_type=[], selected_columns=("x",))
 
 
 class EDAServiceTests(unittest.TestCase):
@@ -154,6 +164,914 @@ class EDAServiceTests(unittest.TestCase):
             profile_result=source["profile_result"],
         )
         return result, source
+
+    def test_bivariate_numeric_numeric_summary_has_expected_statistics(self):
+        table = pa.table({"x": [1.0, 2.0, 3.0, 4.0], "y": [2.0, 4.0, 6.0, 8.0]})
+        result, _ = self.run_eda(table, ["x", "y"], analysis_type="bivariate")
+        self.assertEqual(result.analysis_type, "bivariate")
+        self.assertEqual(result.status, "completed")
+        pair = result.pair_results[0]
+        self.assertEqual(pair.pair_type, "numeric_numeric")
+        self.assertEqual(pair.valid_observations, 4)
+        self.assertEqual(pair.statistics["pearson_correlation"], 1.0)
+        self.assertEqual(pair.statistics["spearman_rank_correlation"], 1.0)
+        self.assertAlmostEqual(pair.statistics["covariance"], 10.0 / 3.0)
+
+    def test_numeric_relationships_with_extreme_finite_values_are_json_safe(self):
+        result, _ = self.run_eda(
+            pa.table(
+                {
+                    "x": [-1e308, 1e308],
+                    "y": [-1e308, 1e308],
+                }
+            ),
+            ["x", "y"],
+            analysis_type="bivariate",
+        )
+        statistics = result.pair_results[0].statistics
+        self.assertEqual(statistics["pearson_correlation"], 1.0)
+        self.assertEqual(statistics["spearman_rank_correlation"], 1.0)
+        self.assertIsNone(statistics["covariance"])
+        self.assertTrue(any("covariance exceeds" in item for item in statistics["warnings"]))
+        json.dumps(result.as_dict(), allow_nan=False)
+        grouped, _ = self.run_eda(
+            pa.table(
+                {
+                    "value": [-1e308, 1e308],
+                    "category": ["same", "same"],
+                }
+            ),
+            ["value", "category"],
+            analysis_type="bivariate",
+        )
+        group = grouped.pair_results[0].statistics["group_statistics"][0]
+        self.assertEqual((group["mean"], group["median"]), (0.0, 0.0))
+        self.assertIsNone(group["sample_variance_ddof_1"])
+        self.assertTrue(
+            any(
+                "sample variance exceeds binary64" in warning
+                for warning in grouped.pair_results[0].warnings
+            )
+        )
+
+    def test_multivariate_correlation_matrix_is_symmetric_and_bounded(self):
+        table = pa.table({"x": [1.0, 2.0, 3.0, 4.0], "y": [1.0, 2.0, 3.0, 4.0], "z": [4.0, 3.0, 2.0, 1.0]})
+        result, _ = self.run_eda(table, ["x", "y", "z"], analysis_type="multivariate")
+        self.assertEqual(result.analysis_type, "multivariate")
+        self.assertEqual(result.status, "completed")
+        matrix = result.multivariate_summary["correlation_matrix"]
+        self.assertEqual(matrix["x"]["x"], 1.0)
+        self.assertEqual(matrix["y"]["y"], 1.0)
+        self.assertEqual(matrix["z"]["z"], 1.0)
+        self.assertEqual(matrix["x"]["y"], 1.0)
+        self.assertEqual(matrix["y"]["x"], 1.0)
+        self.assertEqual(matrix["x"]["z"], -1.0)
+        self.assertEqual(matrix["z"]["x"], -1.0)
+        summary = result.multivariate_summary
+        self.assertEqual(summary["eligible_features"], 3)
+        self.assertEqual(summary["selected_features"], ["x", "y", "z"])
+        self.assertEqual(summary["feature_count"], 3)
+        self.assertFalse(summary["features_truncated"])
+
+    def test_multivariate_diagonal_is_undefined_when_self_correlation_is_undefined(self):
+        table = pa.table(
+            {
+                "varying": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                "constant": [7.0, 7.0, 7.0, 7.0, 7.0, 7.0],
+                "all_null": pa.array([None] * 6, type=pa.float64()),
+                "mixed": [2.0, None, 6.0, float("nan"), 10.0, float("inf")],
+            }
+        )
+        result, _ = self.run_eda(
+            table,
+            ["varying", "constant", "all_null", "mixed"],
+            analysis_type="multivariate",
+        )
+        summary = result.multivariate_summary
+        matrix = summary["correlation_matrix"]
+        counts = summary["pairwise_valid_counts"]
+
+        self.assertEqual(matrix["varying"]["varying"], 1.0)
+        self.assertIsNone(matrix["constant"]["constant"])
+        self.assertIsNone(matrix["all_null"]["all_null"])
+        self.assertEqual(matrix["mixed"]["mixed"], 1.0)
+        self.assertEqual(counts["varying"]["varying"], 6)
+        self.assertEqual(counts["constant"]["constant"], 6)
+        self.assertEqual(counts["all_null"]["all_null"], 0)
+        self.assertEqual(counts["mixed"]["mixed"], 3)
+        self.assertEqual(matrix["varying"]["mixed"], 1.0)
+        self.assertEqual(matrix["mixed"]["varying"], 1.0)
+        self.assertEqual(counts["varying"]["mixed"], 3)
+        self.assertEqual(counts["mixed"]["varying"], 3)
+        serialized = json.dumps(result.as_dict(), allow_nan=False, sort_keys=True)
+        self.assertIsInstance(json.loads(serialized), dict)
+
+    def test_numeric_categorical_group_statistics_exclude_missing_and_are_ordered(self):
+        table = pa.table(
+            {
+                "value": [1.0, 3.0, 10.0, 14.0, None, 5.0, float("inf"), 8.0],
+                "group": ["b", "b", "a", "a", "a", None, "b", "c"],
+            }
+        )
+        result, _ = self.run_eda(
+            table,
+            ["value", "group"],
+            analysis_type="bivariate",
+        )
+
+        pair = result.pair_results[0]
+        self.assertEqual(pair.pair_type, "numeric_categorical")
+        self.assertEqual(pair.valid_observations, 5)
+        groups = pair.statistics["group_statistics"]
+        self.assertEqual(
+            [group["category"] for group in groups],
+            [["str", "a"], ["str", "b"], ["str", "c"]],
+        )
+        self.assertEqual(
+            [
+                (group["count"], group["mean"], group["median"])
+                for group in groups
+            ],
+            [(2, 12.0, 12.0), (2, 2.0, 2.0), (1, 8.0, 8.0)],
+        )
+
+    def test_numeric_categorical_explicit_pair_supports_both_column_orders(self):
+        table = pa.table(
+            {
+                "group": ["b", "a", "b", "a", "c"],
+                "value": [1.0, 10.0, 3.0, 14.0, 8.0],
+            }
+        )
+        forward, _ = self.run_eda(
+            table,
+            ["value", "group"],
+            analysis_type="bivariate",
+            column_pairs=(("value", "group"),),
+        )
+        reverse, _ = self.run_eda(
+            table,
+            ["value", "group"],
+            analysis_type="bivariate",
+            column_pairs=(("group", "value"),),
+        )
+
+        forward_pair = forward.pair_results[0]
+        reverse_pair = reverse.pair_results[0]
+        self.assertEqual(
+            (forward_pair.left_column, forward_pair.right_column),
+            ("value", "group"),
+        )
+        self.assertEqual(
+            (reverse_pair.left_column, reverse_pair.right_column),
+            ("group", "value"),
+        )
+        self.assertEqual(forward_pair.pair_type, "numeric_categorical")
+        self.assertEqual(reverse_pair.pair_type, "numeric_categorical")
+        self.assertEqual(
+            forward_pair.statistics["group_statistics"],
+            reverse_pair.statistics["group_statistics"],
+        )
+        self.assertEqual(
+            [
+                (group["category"], group["count"], group["mean"], group["median"])
+                for group in reverse_pair.statistics["group_statistics"]
+            ],
+            [
+                (["str", "a"], 2, 12.0, 12.0),
+                (["str", "b"], 2, 2.0, 2.0),
+                (["str", "c"], 1, 8.0, 8.0),
+            ],
+        )
+
+    def test_numeric_categorical_empty_and_singleton_groups(self):
+        singleton_result, _ = self.run_eda(
+            pa.table({"value": [4.0], "group": ["only"]}),
+            ["value", "group"],
+            analysis_type="bivariate",
+        )
+        singleton = singleton_result.pair_results[0]
+        self.assertEqual(singleton.valid_observations, 1)
+        self.assertEqual(singleton.statistics["group_statistics"][0]["count"], 1)
+        self.assertEqual(singleton.statistics["group_statistics"][0]["sample_variance_ddof_1"], 0.0)
+        self.assertEqual(singleton.statistics["group_statistics"][0]["sample_standard_deviation_ddof_1"], 0.0)
+
+        empty_result, _ = self.run_eda(
+            pa.table(
+                {
+                    "value": pa.array([None, float("nan")], type=pa.float64()),
+                    "group": ["a", "b"],
+                }
+            ),
+            ["value", "group"],
+            analysis_type="bivariate",
+        )
+        empty = empty_result.pair_results[0]
+        self.assertEqual(empty.valid_observations, 0)
+        self.assertEqual(empty.statistics["group_statistics"], [])
+
+    def test_numeric_categorical_category_limit_is_deterministic(self):
+        result, _ = self.run_eda(
+            pa.table(
+                {
+                    "value": [1.0, 2.0, 3.0],
+                    "group": ["c", "a", "b"],
+                }
+            ),
+            ["value", "group"],
+            analysis_type="bivariate",
+            max_categories=2,
+        )
+        stats = result.pair_results[0].statistics
+        self.assertEqual(
+            [group["category"] for group in stats["group_statistics"]],
+            [["str", "a"], ["str", "b"]],
+        )
+        self.assertTrue(stats["warnings"])
+
+    def test_categorical_contingency_totals_and_cramers_v(self):
+        # For [[10, 20], [20, 10]], chi-square is 20/3, n is 60,
+        # and Cramer's V is sqrt((20/3) / 60) = 1/3.
+        left = ["A"] * 30 + ["B"] * 30
+        right = ["X"] * 10 + ["Y"] * 20 + ["X"] * 20 + ["Y"] * 10
+        result, _ = self.run_eda(
+            pa.table({"left": left, "right": right}),
+            ["left", "right"],
+            analysis_type="bivariate",
+        )
+
+        stats = result.pair_results[0].statistics
+        self.assertEqual(stats["total_observations"], 60)
+        self.assertEqual(
+            [row["counts"] for row in stats["contingency_table"]],
+            [
+                {'["str","X"]': 10, '["str","Y"]': 20},
+                {'["str","X"]': 20, '["str","Y"]': 10},
+            ],
+        )
+        self.assertEqual(
+            stats["row_totals"],
+            {'["str","A"]': 30, '["str","B"]': 30},
+        )
+        self.assertEqual(
+            stats["column_totals"],
+            {'["str","X"]': 30, '["str","Y"]': 30},
+        )
+        self.assertAlmostEqual(stats["cramers_v"], 1.0 / 3.0)
+
+        perfect, _ = self.run_eda(
+            pa.table(
+                {
+                    "left": ["A"] * 10 + ["B"] * 10,
+                    "right": ["X"] * 10 + ["Y"] * 10,
+                }
+            ),
+            ["left", "right"],
+            analysis_type="bivariate",
+        )
+        self.assertAlmostEqual(
+            perfect.pair_results[0].statistics["cramers_v"],
+            1.0,
+        )
+
+    def test_categorical_contingency_missing_and_degenerate_inputs(self):
+        result, _ = self.run_eda(
+            pa.table(
+                {
+                    "left": ["A", "A", "B", None, "B"],
+                    "right": ["X", None, "Y", "X", "Y"],
+                }
+            ),
+            ["left", "right"],
+            analysis_type="bivariate",
+        )
+        stats = result.pair_results[0].statistics
+        self.assertEqual(stats["total_observations"], 3)
+        self.assertEqual(sum(stats["row_totals"].values()), 3)
+        self.assertEqual(sum(stats["column_totals"].values()), 3)
+
+        degenerate, _ = self.run_eda(
+            pa.table({"left": ["A", "A"], "right": ["X", "Y"]}),
+            ["left", "right"],
+            analysis_type="bivariate",
+        )
+        self.assertIsNone(degenerate.pair_results[0].statistics["cramers_v"])
+
+        all_missing, _ = self.run_eda(
+            pa.table(
+                {
+                    "left": pa.array([None, None], type=pa.string()),
+                    "right": pa.array([None, None], type=pa.string()),
+                }
+            ),
+            ["left", "right"],
+            analysis_type="bivariate",
+        )
+        empty_stats = all_missing.pair_results[0].statistics
+        self.assertEqual(empty_stats["contingency_table"], [])
+        self.assertEqual(empty_stats["total_observations"], 0)
+        self.assertIsNone(empty_stats["cramers_v"])
+
+    def test_categorical_contingency_category_limit_bounds_table_and_totals(self):
+        result, _ = self.run_eda(
+            pa.table(
+                {
+                    "left": ["a", "a", "b", "b", "c", "c"],
+                    "right": ["x", "y", "x", "z", "y", "z"],
+                }
+            ),
+            ["left", "right"],
+            analysis_type="bivariate",
+            max_categories=2,
+        )
+        stats = result.pair_results[0].statistics
+        self.assertLessEqual(len(stats["contingency_table"]), 2)
+        self.assertLessEqual(len(stats["column_totals"]), 2)
+        self.assertEqual(
+            stats["total_observations"],
+            sum(stats["row_totals"].values()),
+        )
+        self.assertEqual(
+            stats["total_observations"],
+            sum(stats["column_totals"].values()),
+        )
+        self.assertTrue(stats["warnings"])
+
+    def test_contingency_truncation_removes_zero_margin_dimensions(self):
+        result, _ = self.run_eda(
+            pa.table(
+                {
+                    "left": ["A", "B", "C"],
+                    "right": ["X", "Z", "Y"],
+                }
+            ),
+            ["left", "right"],
+            analysis_type="bivariate",
+            max_categories=2,
+        )
+        stats = result.pair_results[0].statistics
+        self.assertEqual(
+            [row["left_category"] for row in stats["contingency_table"]],
+            [["str", "A"]],
+        )
+        self.assertEqual(
+            list(stats["contingency_table"][0]["counts"]),
+            ['["str","X"]'],
+        )
+        self.assertEqual(stats["total_observations"], 1)
+        self.assertEqual(stats["excluded_observations"], 2)
+        self.assertEqual(stats["row_totals"], {'["str","A"]': 1})
+        self.assertEqual(stats["column_totals"], {'["str","X"]': 1})
+        self.assertIsNone(stats["cramers_v"])
+
+    def test_long_bivariate_category_labels_are_bounded_and_collision_safe(self):
+        common_prefix = "p" * (eda._MAX_DISPLAY_VALUE_LENGTH + 20)
+        labels = [common_prefix + "first", common_prefix + "second"]
+        grouped, _ = self.run_eda(
+            pa.table({"value": [1.0, 2.0], "category": labels}),
+            ["value", "category"],
+            analysis_type="bivariate",
+        )
+        group_labels = [
+            item["category"][1]
+            for item in grouped.pair_results[0].statistics["group_statistics"]
+        ]
+        self.assertEqual(len(group_labels), 2)
+        self.assertEqual(len(set(group_labels)), 2)
+        self.assertTrue(all(len(label) <= eda._MAX_DISPLAY_VALUE_LENGTH for label in group_labels))
+        self.assertTrue(
+            all(
+                any(
+                    label.endswith(hashlib.sha256(value.encode("utf-8")).hexdigest())
+                    for value in labels
+                )
+                for label in group_labels
+            )
+        )
+
+        contingency, _ = self.run_eda(
+            pa.table({"left": labels, "right": ["x", "y"]}),
+            ["left", "right"],
+            analysis_type="bivariate",
+        )
+        row_labels = [
+            row["left_category"][1]
+            for row in contingency.pair_results[0].statistics["contingency_table"]
+        ]
+        self.assertEqual(len(set(row_labels)), 2)
+        self.assertTrue(all(len(label) <= eda._MAX_DISPLAY_VALUE_LENGTH for label in row_labels))
+
+    def test_pair_configuration_and_execution_limits(self):
+        with self.assertRaisesRegex(EDAError, "max_pairs"):
+            EDAConfiguration(
+                analysis_type="bivariate",
+                selected_columns=("a", "b"),
+                max_pairs=0,
+            )
+        with self.assertRaisesRegex(EDAError, "unique"):
+            EDAConfiguration(
+                analysis_type="bivariate",
+                selected_columns=("a", "b"),
+                column_pairs=(("a", "b"), ("a", "b")),
+            )
+        with self.assertRaisesRegex(EDAError, "two non-empty"):
+            eda_configuration_from_dict(
+                {
+                    "analysis_type": "bivariate",
+                    "selected_columns": ["a", "b"],
+                    "column_pairs": [["a"]],
+                }
+            )
+        with self.assertRaisesRegex(EDAError, "at most"):
+            EDAConfiguration(
+                analysis_type="bivariate",
+                selected_columns=("a", "b", "c"),
+                column_pairs=(("a", "b"), ("b", "c")),
+                max_pairs=1,
+            )
+        many_pairs = tuple(
+            (f"left_{index}", f"right_{index}")
+            for index in range(17)
+        )
+        with self.assertRaisesRegex(EDAError, "at most 32 distinct columns"):
+            EDAConfiguration(
+                analysis_type="bivariate",
+                selected_columns=("selected_left", "selected_right"),
+                column_pairs=many_pairs,
+            )
+
+        table = pa.table(
+            {
+                "a": [1.0, 2.0, 3.0],
+                "b": [2.0, 3.0, 4.0],
+                "c": [3.0, 4.0, 5.0],
+            }
+        )
+        auto_result, _ = self.run_eda(
+            table,
+            ["a", "b", "c"],
+            analysis_type="bivariate",
+            max_pairs=2,
+        )
+        self.assertEqual(len(auto_result.pair_results), 2)
+        self.assertEqual(auto_result.multivariate_summary["eligible_pairs"], 3)
+        self.assertEqual(auto_result.multivariate_summary["analyzed_pairs"], 2)
+        self.assertTrue(auto_result.multivariate_summary["pairs_truncated"])
+        self.assertEqual(len(auto_result.multivariate_summary["warnings"]), 1)
+
+        observed_pair_scan = []
+        original_validate_scan_size = eda._validate_scan_size
+
+        def record_pair_scan(parquet_file, selected_columns):
+            observed_pair_scan.extend(selected_columns)
+            return original_validate_scan_size(parquet_file, selected_columns)
+
+        with patch.object(eda, "_validate_scan_size", side_effect=record_pair_scan):
+            explicit_result, _ = self.run_eda(
+                table,
+                ["a", "b", "c"],
+                analysis_type="bivariate",
+                column_pairs=(("a", "c"),),
+                max_pairs=1,
+            )
+        self.assertEqual(
+            [(pair.left_column, pair.right_column) for pair in explicit_result.pair_results],
+            [("a", "c")],
+        )
+        self.assertEqual(explicit_result.multivariate_summary["pair_count"], 1)
+        self.assertEqual(explicit_result.multivariate_summary["eligible_pairs"], 1)
+        self.assertEqual(explicit_result.multivariate_summary["analyzed_pairs"], 1)
+        self.assertFalse(explicit_result.multivariate_summary["pairs_truncated"])
+        self.assertEqual(observed_pair_scan, ["a", "c"])
+
+        with self.assertRaisesRegex(EDAError, "not present in the table"):
+            self.run_eda(
+                table,
+                ["a", "b"],
+                analysis_type="bivariate",
+                column_pairs=(("a", "unknown"),),
+            )
+
+    def test_multivariate_max_features_bounds_matrix_and_selected_features(self):
+        table = pa.table(
+            {
+                "a": [1.0, 2.0],
+                "b": [2.0, 3.0],
+                "c": [3.0, 4.0],
+                "label": ["x", "y"],
+            }
+        )
+        observed_scan_columns = []
+        original_validate_scan_size = eda._validate_scan_size
+
+        def record_scan_columns(parquet_file, selected_columns):
+            observed_scan_columns.extend(selected_columns)
+            return original_validate_scan_size(parquet_file, selected_columns)
+
+        with patch.object(eda, "_validate_scan_size", side_effect=record_scan_columns):
+            result, _ = self.run_eda(
+                table,
+                ["a", "b", "c", "label"],
+                analysis_type="multivariate",
+                max_features=2,
+            )
+        summary = result.multivariate_summary
+        self.assertEqual(summary["selected_features"], ["a", "b"])
+        self.assertEqual(summary["feature_count"], 2)
+        self.assertEqual(summary["eligible_features"], 3)
+        self.assertTrue(summary["features_truncated"])
+        self.assertEqual(len(summary["warnings"]), 1)
+        self.assertEqual(set(summary["correlation_matrix"]), {"a", "b"})
+        self.assertEqual(set(summary["correlation_matrix"]["a"]), {"a", "b"})
+        self.assertEqual(set(summary["pairwise_valid_counts"]), {"a", "b"})
+        self.assertEqual(observed_scan_columns, ["a", "b"])
+        with self.assertRaisesRegex(EDAError, "max_features"):
+            EDAConfiguration(
+                analysis_type="multivariate",
+                selected_columns=("a", "b"),
+                max_features=0,
+            )
+
+    def test_multivariate_insufficient_feature_summary_reports_numeric_selection(self):
+        result, _ = self.run_eda(
+            pa.table({"metric": [1.0, 2.0], "label": ["a", "b"]}),
+            ["metric", "label"],
+            analysis_type="multivariate",
+        )
+        summary = result.multivariate_summary
+        self.assertEqual(result.status, "partially_completed")
+        self.assertEqual(summary["eligible_features"], 1)
+        self.assertEqual(summary["selected_features"], ["metric"])
+        self.assertEqual(summary["numeric_features"], ["metric"])
+        self.assertEqual(summary["feature_count"], 1)
+        self.assertFalse(summary["features_truncated"])
+
+    def test_dictionary_encoded_string_expansion_is_bounded_before_materialization(self):
+        values = pa.DictionaryArray.from_arrays(
+            pa.array([0] * 2048, type=pa.int16()),
+            pa.array(["z" * 100_000]),
+        )
+        source = self.make_source(
+            pa.table(
+                {
+                    "category": values,
+                    "other": ["group"] * len(values),
+                }
+            )
+        )
+        original_iter_batches = pq.ParquetFile.iter_batches
+        batch_types = []
+
+        def record_dictionary_batches(parquet_file, *args, **kwargs):
+            for batch in original_iter_batches(parquet_file, *args, **kwargs):
+                batch_types.append(batch.column(0).type)
+                yield batch
+
+        with (
+            patch.object(eda, "MAX_EDA_DECODED_VALUE_BYTES", 1024),
+            patch.object(pq.ParquetFile, "iter_batches", record_dictionary_batches),
+            patch.object(
+                eda,
+                "_arrow_to_pylist",
+                side_effect=AssertionError("oversized Arrow values were materialized"),
+            ) as materialize,
+        ):
+            with self.assertRaisesRegex(EDAError, "estimated Python bytes"):
+                analyze_normalized_file(
+                    storage=self.storage,
+                    processed_bucket="processed",
+                    dataset_id=self.dataset_id,
+                    file_id=self.file_id,
+                    file_status="Ready",
+                    normalization_status="Ready",
+                    source_filename="source.parquet",
+                    source_size_bytes=source["source_size_bytes"],
+                    source_sha256=source["source_sha256"],
+                    parsed_result=source["parsed_result"],
+                    normalization_result=source["normalization_result"],
+                    configuration=EDAConfiguration(
+                        analysis_type="bivariate",
+                        selected_columns=("category", "other"),
+                    ),
+                )
+        self.assertTrue(batch_types)
+        self.assertTrue(all(pa.types.is_dictionary(data_type) for data_type in batch_types))
+        materialize.assert_not_called()
+
+    def test_univariate_dictionary_string_expansion_is_bounded_before_materialization(self):
+        values = pa.DictionaryArray.from_arrays(
+            pa.array([0] * 16, type=pa.int16()),
+            pa.array(["z" * 100_000]),
+        )
+        source = self.make_source(pa.table({"category": values}))
+        original_iter_batches = pq.ParquetFile.iter_batches
+        batch_types = []
+
+        def record_dictionary_batches(parquet_file, *args, **kwargs):
+            for batch in original_iter_batches(parquet_file, *args, **kwargs):
+                batch_types.append(batch.column(0).type)
+                yield batch
+
+        with (
+            patch.object(eda, "MAX_EDA_DECODED_VALUE_BYTES", 1024),
+            patch.object(pq.ParquetFile, "iter_batches", record_dictionary_batches),
+            patch.object(
+                eda,
+                "_arrow_to_pylist",
+                side_effect=AssertionError("oversized Arrow values were materialized"),
+            ) as materialize,
+        ):
+            with self.assertRaisesRegex(EDAError, "estimated Python bytes"):
+                analyze_normalized_file(
+                    storage=self.storage,
+                    processed_bucket="processed",
+                    dataset_id=self.dataset_id,
+                    file_id=self.file_id,
+                    file_status="Ready",
+                    normalization_status="Ready",
+                    source_filename="source.parquet",
+                    source_size_bytes=source["source_size_bytes"],
+                    source_sha256=source["source_sha256"],
+                    parsed_result=source["parsed_result"],
+                    normalization_result=source["normalization_result"],
+                    configuration=EDAConfiguration(selected_columns=("category",)),
+                )
+        self.assertTrue(batch_types)
+        self.assertTrue(all(pa.types.is_dictionary(data_type) for data_type in batch_types))
+        materialize.assert_not_called()
+
+    def test_univariate_decoded_value_budget_accumulates_across_batches(self):
+        source = self.make_source(pa.table({"category": ["x"] * 4}))
+        original_materialize = eda._arrow_to_pylist
+        with (
+            patch.object(eda, "MAX_EDA_DECODED_VALUE_BYTES", 300),
+            patch.object(eda, "EDA_BATCH_SIZE", 2),
+            patch.object(
+                eda,
+                "_arrow_to_pylist",
+                wraps=original_materialize,
+            ) as materialize,
+        ):
+            with self.assertRaisesRegex(EDAError, "estimated Python bytes"):
+                analyze_normalized_file(
+                    storage=self.storage,
+                    processed_bucket="processed",
+                    dataset_id=self.dataset_id,
+                    file_id=self.file_id,
+                    file_status="Ready",
+                    normalization_status="Ready",
+                    source_filename="source.parquet",
+                    source_size_bytes=source["source_size_bytes"],
+                    source_sha256=source["source_sha256"],
+                    parsed_result=source["parsed_result"],
+                    normalization_result=source["normalization_result"],
+                    configuration=EDAConfiguration(selected_columns=("category",)),
+                )
+        self.assertEqual(materialize.call_count, 1)
+
+    def test_relationship_scan_and_result_limits_are_enforced(self):
+        table = pa.table(
+            {
+                "left": ["a" * 1024, "b" * 1024],
+                "right": ["x", "y"],
+            }
+        )
+        with patch.object(eda, "MAX_EDA_SCAN_BYTES", 1):
+            with self.assertRaisesRegex(EDAError, "uncompressed scan-size limit"):
+                self.run_eda(
+                    table,
+                    ["left", "right"],
+                    analysis_type="bivariate",
+                )
+        result_table = pa.table(
+            {
+                "left": [f"category-{index:03d}-{'x' * 40}" for index in range(30)],
+                "right": [f"group-{index:03d}-{'y' * 40}" for index in range(30)],
+            }
+        )
+        with self.assertRaisesRegex(EDAError, "serialized size limit"):
+            self.run_eda(
+                result_table,
+                ["left", "right"],
+                analysis_type="bivariate",
+                max_categories=30,
+                max_result_bytes=1024,
+            )
+
+    def test_relationship_batches_stop_on_budget_without_materializing_full_table(self):
+        row_count = eda.EDA_BATCH_SIZE * 3
+        source = self.make_source(
+            pa.table(
+                {
+                    "value": [float(index) for index in range(row_count)],
+                    "label": ["group"] * row_count,
+                }
+            )
+        )
+        observed_batches = []
+        original_iter_batches = pq.ParquetFile.iter_batches
+
+        def record_batches(parquet_file, *args, **kwargs):
+            for batch in original_iter_batches(parquet_file, *args, **kwargs):
+                observed_batches.append(batch.num_rows)
+                yield batch
+
+        with (
+            patch.object(eda, "MAX_EDA_NUMERIC_VALUES", 2),
+            patch.object(pq.ParquetFile, "iter_batches", record_batches),
+            patch.object(eda.pq, "read_table", side_effect=AssertionError("whole-table read")),
+        ):
+            with self.assertRaisesRegex(EDAError, "limited to 2 finite values"):
+                analyze_normalized_file(
+                    storage=self.storage,
+                    processed_bucket="processed",
+                    dataset_id=self.dataset_id,
+                    file_id=self.file_id,
+                    file_status="Ready",
+                    normalization_status="Ready",
+                    source_filename="source.parquet",
+                    source_size_bytes=source["source_size_bytes"],
+                    source_sha256=source["source_sha256"],
+                    parsed_result=source["parsed_result"],
+                    normalization_result=source["normalization_result"],
+                    configuration=EDAConfiguration(
+                        analysis_type="bivariate",
+                        selected_columns=("value", "label"),
+                    ),
+                )
+        self.assertEqual(observed_batches, [eda.EDA_BATCH_SIZE])
+
+    def test_relationship_category_and_cell_limits_apply_during_streaming(self):
+        table = pa.table(
+            {
+                "left": [f"left-{index}" for index in range(8)],
+                "right": [f"right-{index}" for index in range(8)],
+            }
+        )
+        with patch.object(eda, "MAX_EDA_TRACKED_CATEGORIES", 3):
+            with self.assertRaisesRegex(EDAError, "3 distinct category entries"):
+                self.run_eda(table, ["left", "right"], analysis_type="bivariate")
+        with patch.object(eda, "MAX_EDA_CONTINGENCY_CELLS", 2):
+            with self.assertRaisesRegex(EDAError, "non-empty contingency cells"):
+                self.run_eda(table, ["left", "right"], analysis_type="bivariate")
+        numeric_category_table = pa.table(
+            {"value": [1.0, 2.0], "group": ["x", "x"]}
+        )
+        with patch.object(eda, "MAX_EDA_GROUPED_VALUES", 1):
+            with self.assertRaisesRegex(EDAError, "grouped values per request"):
+                self.run_eda(
+                    numeric_category_table,
+                    ["value", "group"],
+                    analysis_type="bivariate",
+                )
+
+    def test_relationship_pairwise_work_budget_is_enforced(self):
+        table = pa.table(
+            {"left": ["a"] * 8, "right": ["b"] * 8}
+        )
+        with patch.object(eda, "MAX_EDA_PAIRWISE_VALUES", 3):
+            with self.assertRaisesRegex(EDAError, "pairwise values per request"):
+                self.run_eda(table, ["left", "right"], analysis_type="bivariate")
+
+    def test_failure_result_uses_analysis_specific_algorithm_version(self):
+        source = self.make_source(pa.table({"x": [1.0], "y": [2.0]}))
+        with patch.object(self.storage, "get_object", side_effect=OSError("storage unavailable")):
+            result = analyze_normalized_file(
+                storage=self.storage,
+                processed_bucket="processed",
+                dataset_id=self.dataset_id,
+                file_id=self.file_id,
+                file_status="Ready",
+                normalization_status="Ready",
+                source_filename="source.parquet",
+                source_size_bytes=source["source_size_bytes"],
+                source_sha256=source["source_sha256"],
+                parsed_result=source["parsed_result"],
+                normalization_result=source["normalization_result"],
+                configuration=EDAConfiguration(
+                    analysis_type="bivariate",
+                    selected_columns=("x", "y"),
+                ),
+            )
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.algorithm_version, "bivariate-1")
+        self.assertEqual(
+            result.multivariate_summary,
+            {
+                "pair_count": 1,
+                "analyzed_pairs": 0,
+                "eligible_pairs": 1,
+                "pairs_truncated": False,
+                "pair_selection_mode": "all_selected_columns",
+                "warnings": [],
+            },
+        )
+
+    def test_failed_multivariate_result_marks_selection_metadata_unavailable(self):
+        source = self.make_source(
+            pa.table({"x": [1.0], "y": [2.0], "label": ["a"]})
+        )
+        with patch.object(self.storage, "get_object", side_effect=OSError("storage unavailable")):
+            result = analyze_normalized_file(
+                storage=self.storage,
+                processed_bucket="processed",
+                dataset_id=self.dataset_id,
+                file_id=self.file_id,
+                file_status="Ready",
+                normalization_status="Ready",
+                source_filename="source.parquet",
+                source_size_bytes=source["source_size_bytes"],
+                source_sha256=source["source_sha256"],
+                parsed_result=source["parsed_result"],
+                normalization_result=source["normalization_result"],
+                configuration=EDAConfiguration(
+                    analysis_type="multivariate",
+                    selected_columns=("x", "y", "label"),
+                    max_features=1,
+                ),
+            )
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(
+            result.multivariate_summary,
+            {
+                "selected_features": None,
+                "numeric_features": None,
+                "feature_count": None,
+                "eligible_features": None,
+                "features_truncated": None,
+                "warnings": [],
+            },
+        )
+
+    def test_relationship_numeric_category_and_row_budgets_are_enforced(self):
+        numeric_table = pa.table({"left": [1.0, 2.0], "right": [2.0, 3.0]})
+        with patch.object(eda, "MAX_EDA_NUMERIC_VALUES", 1):
+            with self.assertRaisesRegex(EDAError, "limited to 1 finite values"):
+                self.run_eda(
+                    numeric_table,
+                    ["left", "right"],
+                    analysis_type="bivariate",
+                )
+
+        category_table = pa.table(
+            {"left": ["a", "b", "c"], "right": ["x", "y", "z"]}
+        )
+        with patch.object(eda, "MAX_EDA_TRACKED_CATEGORIES", 2):
+            with self.assertRaisesRegex(EDAError, "2 distinct category entries"):
+                self.run_eda(
+                    category_table,
+                    ["left", "right"],
+                    analysis_type="bivariate",
+                )
+
+        with patch.object(eda, "MAX_EDA_ROWS", 1):
+            with self.assertRaisesRegex(EDAError, "limited to 1 rows"):
+                self.run_eda(
+                    numeric_table,
+                    ["left", "right"],
+                    analysis_type="bivariate",
+                )
+
+    def test_relationship_failure_cleans_up_downloaded_artifact(self):
+        source = self.make_source(
+            pa.table({"left": ["a" * 1024], "right": ["x"]})
+        )
+        arguments = {
+            "storage": self.storage,
+            "processed_bucket": "processed",
+            "dataset_id": self.dataset_id,
+            "file_id": self.file_id,
+            "file_status": "Ready",
+            "normalization_status": "Ready",
+            "source_filename": "source.parquet",
+            "source_size_bytes": source["source_size_bytes"],
+            "source_sha256": source["source_sha256"],
+            "parsed_result": source["parsed_result"],
+            "normalization_result": source["normalization_result"],
+            "configuration": EDAConfiguration(
+                analysis_type="bivariate",
+                selected_columns=("left", "right"),
+            ),
+        }
+        original = eda.tempfile.NamedTemporaryFile
+        paths = []
+
+        def track_temporary_file(*args, **kwargs):
+            handle = original(*args, **kwargs)
+            paths.append(Path(handle.name))
+            return handle
+
+        with (
+            patch.object(
+                eda.tempfile,
+                "NamedTemporaryFile",
+                side_effect=track_temporary_file,
+            ),
+            patch.object(eda, "MAX_EDA_SCAN_BYTES", 1),
+            self.assertRaisesRegex(EDAError, "uncompressed scan-size limit"),
+        ):
+            analyze_normalized_file(**arguments)
+        self.assertEqual(len(paths), 1)
+        self.assertFalse(paths[0].exists())
 
     def test_numeric_statistics_histogram_percentiles_and_box_plot(self):
         table = pa.table({"metric": [1.0, 2.0, 3.0, 4.0]})

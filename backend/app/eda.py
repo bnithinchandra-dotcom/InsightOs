@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from minio.error import MinioException, S3Error
 from urllib3.exceptions import HTTPError
@@ -18,6 +19,11 @@ from app.normalization import (
     DEFAULT_MAX_OUTPUT_BYTES,
     NormalizationError,
     validate_normalization_result,
+)
+from app.execution import (
+    ExecutionBudget,
+    ExecutionBudgetExceeded,
+    estimate_decoded_python_string_bytes,
 )
 from app.profiling import _MAX_DISPLAY_VALUE_LENGTH
 from app.quality_analysis import (
@@ -33,6 +39,8 @@ from app.quality_analysis import (
 EDA_RESULT_SCHEMA_VERSION = 1
 EDA_ALGORITHM_VERSION = "univariate-1"
 MAX_EDA_COLUMNS = 32
+MAX_EDA_PAIRS = 64
+MAX_EDA_MULTIVARIATE_FEATURES = 16
 MIN_HISTOGRAM_BINS = 2
 MAX_HISTOGRAM_BINS = 100
 MAX_EDA_PERCENTILES = 16
@@ -41,11 +49,24 @@ MAX_EDA_RESULT_BYTES = 1024 * 1024
 DEFAULT_EDA_RESULT_BYTES = 256 * 1024
 MAX_EDA_NUMERIC_VALUES = 250_000
 MAX_EDA_TRACKED_CATEGORIES = 50_000
+MAX_EDA_GROUPED_VALUES = 250_000
+MAX_EDA_CONTINGENCY_CELLS = 50_000
+MAX_EDA_PAIRWISE_VALUES = 4_000_000
+MAX_EDA_DECODED_VALUE_BYTES = 128 * 1024 * 1024
 MAX_EDA_ROWS = 1_000_000
 MAX_EDA_SCAN_BYTES = DEFAULT_MAX_OUTPUT_BYTES
 EDA_BATCH_SIZE = 4096
 _COLUMN_NAME_LIMIT = 256
 _BUCKET_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+_SUPPORTED_ANALYSIS_TYPES = {"univariate", "bivariate", "multivariate"}
+
+
+def _algorithm_version_for_analysis(analysis_type: str) -> str:
+    return {
+        "univariate": "univariate-1",
+        "bivariate": "bivariate-1",
+        "multivariate": "multivariate-1",
+    }.get(analysis_type, EDA_ALGORITHM_VERSION)
 
 
 class EDAError(ValueError):
@@ -61,10 +82,13 @@ class EDAConfiguration:
     analysis_type: str = "univariate"
     table_index: int = 0
     selected_columns: tuple[str, ...] = ()
+    column_pairs: tuple[tuple[str, str], ...] = ()
     histogram_bins: int = 10
     percentiles: tuple[float, ...] = (25.0, 50.0, 75.0)
     max_categories: int = 10
     max_result_bytes: int = DEFAULT_EDA_RESULT_BYTES
+    max_pairs: int = 32
+    max_features: int = 16
 
     def __post_init__(self) -> None:
         _validate_configuration(self)
@@ -75,10 +99,13 @@ class EDAConfiguration:
             "analysis_type": self.analysis_type,
             "table_index": self.table_index,
             "selected_columns": list(self.selected_columns),
+            "column_pairs": [[left, right] for left, right in self.column_pairs],
             "histogram_bins": self.histogram_bins,
             "percentiles": list(self.percentiles),
             "max_categories": self.max_categories,
             "max_result_bytes": self.max_result_bytes,
+            "max_pairs": self.max_pairs,
+            "max_features": self.max_features,
         }
 
 
@@ -120,6 +147,26 @@ class EDAColumnResult:
 
 
 @dataclass(frozen=True)
+class EDAColumnPairResult:
+    left_column: str
+    right_column: str
+    pair_type: str
+    valid_observations: int
+    statistics: dict[str, Any]
+    warnings: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict:
+        return {
+            "left_column": self.left_column,
+            "right_column": self.right_column,
+            "pair_type": self.pair_type,
+            "valid_observations": self.valid_observations,
+            "statistics": self.statistics,
+            "warnings": list(self.warnings),
+        }
+
+
+@dataclass(frozen=True)
 class EDAResult:
     schema_version: int
     analysis_type: str
@@ -142,6 +189,8 @@ class EDAResult:
     columns: tuple[EDAColumnResult, ...]
     warnings: tuple[str, ...] = ()
     failure: EDAFailure | None = None
+    pair_results: tuple[EDAColumnPairResult, ...] = ()
+    multivariate_summary: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
@@ -168,6 +217,8 @@ class EDAResult:
             "columns": [column.as_dict() for column in self.columns],
             "warnings": list(self.warnings),
             "failure": self.failure.as_dict() if self.failure else None,
+            "pair_results": [pair.as_dict() for pair in self.pair_results],
+            "multivariate_summary": self.multivariate_summary,
         }
 
 
@@ -190,8 +241,14 @@ def _validate_configuration(configuration: EDAConfiguration) -> None:
         or configuration.schema_version != EDA_RESULT_SCHEMA_VERSION
     ):
         raise EDAError("unsupported_schema_version", "EDA configuration version is unsupported.")
-    if configuration.analysis_type != "univariate":
-        raise EDAError("unsupported_analysis_type", "Only univariate EDA is supported.")
+    if (
+        not isinstance(configuration.analysis_type, str)
+        or configuration.analysis_type not in _SUPPORTED_ANALYSIS_TYPES
+    ):
+        raise EDAError(
+            "unsupported_analysis_type",
+            "EDA analysis type is unsupported. Supported values are 'univariate', 'bivariate', and 'multivariate'.",
+        )
     if (
         isinstance(configuration.table_index, bool)
         or not isinstance(configuration.table_index, int)
@@ -216,6 +273,30 @@ def _validate_configuration(configuration: EDAConfiguration) -> None:
         )
     if len(columns) != len(set(columns)):
         raise EDAError("duplicate_columns", "EDA selected columns must be unique.")
+    if configuration.analysis_type == "bivariate" and len(columns) < 2:
+        raise EDAError("invalid_selected_columns", "Bivariate EDA requires at least two selected columns.")
+    if configuration.analysis_type == "multivariate" and len(columns) < 2:
+        raise EDAError("invalid_selected_columns", "Multivariate EDA requires at least two selected columns.")
+    if configuration.column_pairs:
+        if configuration.analysis_type != "bivariate":
+            raise EDAError(
+                "invalid_column_pairs",
+                "column_pairs may only be supplied for bivariate analysis.",
+            )
+        if not isinstance(configuration.column_pairs, tuple):
+            raise EDAError("invalid_column_pairs", "column_pairs must be a list of [left, right] pairs.")
+        if len(configuration.column_pairs) > MAX_EDA_PAIRS:
+            raise EDAError("invalid_column_pairs", f"column_pairs may include at most {MAX_EDA_PAIRS} pairs.")
+        for pair in configuration.column_pairs:
+            if not isinstance(pair, tuple) or len(pair) != 2 or not all(isinstance(name, str) and name.strip() for name in pair):
+                raise EDAError("invalid_column_pairs", "Each column pair must contain two non-empty column names.")
+        if len({name for pair in configuration.column_pairs for name in pair}) > MAX_EDA_COLUMNS:
+            raise EDAError(
+                "invalid_column_pairs",
+                f"column_pairs may reference at most {MAX_EDA_COLUMNS} distinct columns.",
+            )
+        if len(set(tuple(pair) for pair in configuration.column_pairs)) != len(configuration.column_pairs):
+            raise EDAError("duplicate_columns", "EDA selected column pairs must be unique.")
     if (
         isinstance(configuration.histogram_bins, bool)
         or not isinstance(configuration.histogram_bins, int)
@@ -264,6 +345,26 @@ def _validate_configuration(configuration: EDAConfiguration) -> None:
             "invalid_result_limit",
             f"max_result_bytes must be between 1024 and {MAX_EDA_RESULT_BYTES}.",
         )
+    if (
+        isinstance(configuration.max_pairs, bool)
+        or not isinstance(configuration.max_pairs, int)
+        or not 1 <= configuration.max_pairs <= MAX_EDA_PAIRS
+    ):
+        raise EDAError("invalid_max_pairs", f"max_pairs must be between 1 and {MAX_EDA_PAIRS}.")
+    if configuration.column_pairs and len(configuration.column_pairs) > configuration.max_pairs:
+        raise EDAError(
+            "invalid_column_pairs",
+            "column_pairs may include at most max_pairs pairs.",
+        )
+    if (
+        isinstance(configuration.max_features, bool)
+        or not isinstance(configuration.max_features, int)
+        or not 1 <= configuration.max_features <= MAX_EDA_MULTIVARIATE_FEATURES
+    ):
+        raise EDAError(
+            "invalid_max_features",
+            f"max_features must be between 1 and {MAX_EDA_MULTIVARIATE_FEATURES}.",
+        )
 
 
 def eda_configuration_from_dict(value: dict) -> EDAConfiguration:
@@ -274,10 +375,13 @@ def eda_configuration_from_dict(value: dict) -> EDAConfiguration:
         "analysis_type",
         "table_index",
         "selected_columns",
+        "column_pairs",
         "histogram_bins",
         "percentiles",
         "max_categories",
         "max_result_bytes",
+        "max_pairs",
+        "max_features",
     }
     if set(value) - allowed:
         raise EDAError("invalid_configuration", "EDA configuration has unsupported fields.")
@@ -288,6 +392,21 @@ def eda_configuration_from_dict(value: dict) -> EDAConfiguration:
         if not isinstance(columns, (list, tuple)):
             raise EDAError("invalid_selected_columns", "selected_columns must be a list.")
         supplied["selected_columns"] = tuple(columns)
+    if "column_pairs" in supplied:
+        pairs = supplied["column_pairs"]
+        if not isinstance(pairs, (list, tuple)):
+            raise EDAError("invalid_column_pairs", "column_pairs must be a list of [left, right] pairs.")
+        if any(
+            not isinstance(pair, (list, tuple))
+            or len(pair) != 2
+            or not all(isinstance(name, str) for name in pair)
+            for pair in pairs
+        ):
+            raise EDAError(
+                "invalid_column_pairs",
+                "Each column pair must contain two non-empty column names.",
+            )
+        supplied["column_pairs"] = tuple(tuple(pair) for pair in pairs)
     if "percentiles" in supplied:
         percentiles = supplied["percentiles"]
         if not isinstance(percentiles, (list, tuple)):
@@ -327,10 +446,170 @@ def _json_number(value: Any) -> int | float | None:
             number = float(value)
         except (OverflowError, ValueError):
             return None
-        return number if math.isfinite(number) else None
+        if not math.isfinite(number):
+            return None
+        if math.isclose(number, round(number), rel_tol=0.0, abs_tol=1e-12):
+            return int(round(number))
+        return number
     if isinstance(value, float):
-        return value if math.isfinite(value) else None
+        if not math.isfinite(value):
+            return None
+        if math.isclose(value, round(value), rel_tol=0.0, abs_tol=1e-12):
+            return int(round(value))
+        return value
     return None
+
+
+def _to_finite_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _pearson_corr(x_values: list[float], y_values: list[float]) -> float | None:
+    if len(x_values) != len(y_values) or len(x_values) < 2:
+        return None
+    centered_x = _scaled_centered_values(x_values)
+    centered_y = _scaled_centered_values(y_values)
+    if centered_x is None or centered_y is None:
+        return None
+    numerator = math.fsum(x * y for x, y in zip(centered_x, centered_y))
+    denominator_x = math.sqrt(math.fsum(x * x for x in centered_x))
+    denominator_y = math.sqrt(math.fsum(y * y for y in centered_y))
+    if denominator_x == 0.0 or denominator_y == 0.0:
+        return None
+    return max(-1.0, min(1.0, numerator / (denominator_x * denominator_y)))
+
+
+def _average_ranks(values: list[float]) -> list[float]:
+    ranked = sorted(enumerate(values), key=lambda item: item[1])
+    result = [0.0] * len(values)
+    position = 0
+    while position < len(ranked):
+        end = position
+        while end + 1 < len(ranked) and ranked[end + 1][1] == ranked[position][1]:
+            end += 1
+        average_rank = (position + 1 + end + 1) / 2.0
+        for index in range(position, end + 1):
+            result[ranked[index][0]] = average_rank
+        position = end + 1
+    return result
+
+
+def _spearman_corr(x_values: list[float], y_values: list[float]) -> float | None:
+    if len(x_values) != len(y_values) or len(x_values) < 2:
+        return None
+    ranks_x = _average_ranks(x_values)
+    ranks_y = _average_ranks(y_values)
+    return _pearson_corr(ranks_x, ranks_y)
+
+
+def _covariance(x_values: list[float], y_values: list[float]) -> float | None:
+    if len(x_values) != len(y_values) or len(x_values) < 2:
+        return None
+    scale_x = max(abs(value) for value in x_values)
+    scale_y = max(abs(value) for value in y_values)
+    if scale_x == 0.0 or scale_y == 0.0:
+        return 0.0
+    centered_x = _scaled_centered_values(x_values, scale_x)
+    centered_y = _scaled_centered_values(y_values, scale_y)
+    if centered_x is None or centered_y is None:
+        return None
+    normalized_covariance = (
+        math.fsum(x * y for x, y in zip(centered_x, centered_y))
+        / (len(x_values) - 1)
+    )
+    return _scaled_product(normalized_covariance, scale_x, scale_y)
+
+
+def _scaled_centered_values(
+    values: list[float],
+    scale: float | None = None,
+) -> list[float] | None:
+    if not values:
+        return None
+    scale = max(abs(value) for value in values) if scale is None else scale
+    if scale == 0.0:
+        return [0.0] * len(values)
+    origin = values[0]
+    deltas = []
+    for value in values:
+        difference = value - origin
+        if math.isfinite(difference):
+            deltas.append(difference / scale)
+        else:
+            deltas.append(value / scale - origin / scale)
+    mean_delta = math.fsum(deltas) / len(deltas)
+    return [delta - mean_delta for delta in deltas]
+
+
+def _scaled_product(value: float, *factors: float) -> float | None:
+    if value == 0.0:
+        return 0.0
+    mantissa, exponent = math.frexp(value)
+    for factor in factors:
+        if factor == 0.0:
+            return 0.0
+        factor_mantissa, factor_exponent = math.frexp(factor)
+        mantissa *= factor_mantissa
+        exponent += factor_exponent
+        mantissa, adjustment = math.frexp(mantissa)
+        exponent += adjustment
+    try:
+        result = math.ldexp(mantissa, exponent)
+    except OverflowError:
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _sample_variance(values: list[float]) -> float | None:
+    if len(values) < 2:
+        return None
+    scale = max(abs(value) for value in values)
+    if scale == 0.0:
+        return 0.0
+    centered = _scaled_centered_values(values, scale)
+    if centered is None:
+        return None
+    normalized_variance = (
+        math.fsum(value * value for value in centered) / (len(values) - 1)
+    )
+    return _scaled_product(normalized_variance, scale, scale)
+
+
+def _safe_mean(values: list[float]) -> float:
+    scale = max((abs(value) for value in values), default=0.0)
+    if scale == 0.0:
+        return 0.0
+    normalized_mean = math.fsum(value / scale for value in values) / len(values)
+    return max(-1.0, min(1.0, normalized_mean)) * scale
+
+
+def _safe_category_key(value: Any) -> str:
+    if value is None:
+        return "__null__"
+    if isinstance(value, str) and len(value) > _MAX_DISPLAY_VALUE_LENGTH:
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+        return json.dumps(
+            ["str-sha256", digest],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    return json.dumps([type(value).__name__, value], ensure_ascii=False, separators=(",", ":"))
+
+
+def _category_identity_and_display(value: Any) -> tuple[str, Any]:
+    key = _safe_category_key(value)
+    if isinstance(value, str) and len(value) > _MAX_DISPLAY_VALUE_LENGTH:
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+        prefix_length = _MAX_DISPLAY_VALUE_LENGTH - len("...#") - len(digest)
+        display_value = value[:prefix_length] + "...#" + digest
+        return key, ["str", display_value]
+    return key, json.loads(key)
 
 
 def _display_category(value: str | bool) -> str | bool:
@@ -380,24 +659,11 @@ def _numeric_statistics(
 
     ordered = sorted(values)
     count = len(ordered)
-    mean = math.fsum(value / count for value in ordered)
+    mean = _safe_mean(ordered)
     minimum, maximum = ordered[0], ordered[-1]
     data_range = maximum - minimum
-    variance_overflow = False
-    if count > 1:
-        try:
-            divisor = math.sqrt(count - 1)
-            variance = math.fsum(
-                ((value - mean) / divisor) ** 2 for value in ordered
-            )
-            if not math.isfinite(variance):
-                variance = None
-                variance_overflow = True
-        except (OverflowError, ValueError):
-            variance = None
-            variance_overflow = True
-    else:
-        variance = None
+    variance = _sample_variance(ordered)
+    variance_overflow = count > 1 and variance is None
     percentiles = {
         str(value): _json_number(_quantile(ordered, value))
         for value in configuration.percentiles
@@ -468,6 +734,729 @@ def _numeric_statistics(
         "box_plot": box_plot,
         "precision": "IEEE-754 binary64",
     }, warnings
+
+
+def _numeric_pair_summary(left_values: list[float], right_values: list[float], left_name: str, right_name: str) -> dict[str, Any]:
+    paired = [
+        (left, right)
+        for left, right in zip(left_values, right_values)
+        if left is not None and right is not None and math.isfinite(left) and math.isfinite(right)
+    ]
+    valid_observations = len(paired)
+    if valid_observations < 2:
+        return {
+            "valid_observations": valid_observations,
+            "pair_type": "numeric_numeric",
+            "pearson_correlation": None,
+            "spearman_rank_correlation": None,
+            "covariance": None,
+            "method": "pairwise_valid_rows_only",
+            "missing_value_policy": "Rows with nulls or non-finite values are excluded.",
+            "undefined_reason": "Insufficient valid observations for a correlation result.",
+            "warnings": ["The pair contains fewer than two valid observations after excluding nulls and non-finite values."],
+        }
+    x_values = [left for left, _ in paired]
+    y_values = [right for _, right in paired]
+    pearson = _pearson_corr(x_values, y_values)
+    spearman = _spearman_corr(x_values, y_values)
+    cov = _covariance(x_values, y_values)
+    warnings = []
+    if all(value == x_values[0] for value in x_values):
+        warnings.append(f"{left_name} is constant; correlation is undefined.")
+    if all(value == y_values[0] for value in y_values):
+        warnings.append(f"{right_name} is constant; correlation is undefined.")
+    if pearson is None or spearman is None:
+        warnings.append("At least one variable has zero variance; the correlation is undefined.")
+    if cov is None:
+        warnings.append("Sample covariance exceeds binary64 limits and is unavailable.")
+    return {
+        "valid_observations": valid_observations,
+        "pair_type": "numeric_numeric",
+        "pearson_correlation": _json_number(pearson),
+        "spearman_rank_correlation": _json_number(spearman),
+        "covariance": _json_number(cov),
+        "method": "pairwise_valid_rows_only",
+        "missing_value_policy": "Rows with nulls or non-finite values are excluded before statistics are calculated.",
+        "undefined_reason": None if pearson is not None else "Zero variance or an insufficient range of valid values.",
+        "warnings": warnings,
+    }
+
+
+def _numeric_categorical_summary_from_groups(
+    grouped: dict[str, list[float]],
+    displays: dict[str, Any],
+    numeric_name: str,
+    category_name: str,
+    max_categories: int,
+) -> dict[str, Any]:
+    ordered_keys = sorted(grouped)
+    observed = []
+    variance_unavailable = False
+    for key in ordered_keys[:max_categories]:
+        values_sorted = sorted(grouped[key])
+        count = len(values_sorted)
+        if count == 0:
+            continue
+        mean = _safe_mean(values_sorted)
+        median = (
+            values_sorted[count // 2]
+            if count % 2
+            else values_sorted[count // 2 - 1] / 2
+            + values_sorted[count // 2] / 2
+        )
+        variance = _sample_variance(values_sorted) if count > 1 else 0.0
+        variance_unavailable = variance_unavailable or (
+            count > 1 and variance is None
+        )
+        standard_deviation = (
+            math.sqrt(variance)
+            if variance is not None and variance >= 0.0
+            else None
+        )
+        observed.append(
+            {
+                "category": displays[key],
+                "count": count,
+                "mean": _json_number(mean),
+                "median": _json_number(median),
+                "minimum": _json_number(min(values_sorted)),
+                "maximum": _json_number(max(values_sorted)),
+                "sample_variance_ddof_1": _json_number(variance),
+                "sample_standard_deviation_ddof_1": _json_number(standard_deviation),
+            }
+        )
+    category_result = {
+        "pair_type": "numeric_categorical",
+        "left_column": numeric_name,
+        "right_column": category_name,
+        "method": "groupwise_numeric_summary_by_category",
+        "missing_value_policy": "Rows with null or non-finite numeric values and missing category values are excluded.",
+        "group_statistics": observed,
+        "warnings": (
+            []
+            if len(ordered_keys) <= max_categories
+            else [
+                f"{category_name} has more than {max_categories} categories; additional categories were omitted."
+            ]
+        )
+        + (
+            ["At least one group sample variance exceeds binary64 limits and is unavailable."]
+            if variance_unavailable
+            else []
+        ),
+    }
+    return category_result
+
+
+def _contingency_summary_from_counts(
+    left_categories: dict[str, Any],
+    right_categories: dict[str, Any],
+    cell_counts: dict[tuple[str, str], int],
+    observed_total: int,
+    left_name: str,
+    right_name: str,
+    max_categories: int,
+) -> dict[str, Any]:
+    left_labels = sorted(left_categories)[:max_categories]
+    right_labels = sorted(right_categories)[:max_categories]
+    selected_left = set(left_labels)
+    selected_right = set(right_labels)
+    selected_cells = {
+        cell: count
+        for cell, count in cell_counts.items()
+        if cell[0] in selected_left and cell[1] in selected_right
+    }
+    row_totals = {}
+    column_totals = {}
+    for (left_key, right_key), count in selected_cells.items():
+        row_totals[left_key] = row_totals.get(left_key, 0) + count
+        column_totals[right_key] = column_totals.get(right_key, 0) + count
+
+    left_labels = [key for key in left_labels if row_totals.get(key, 0) > 0]
+    right_labels = [key for key in right_labels if column_totals.get(key, 0) > 0]
+    selected_left = set(left_labels)
+    selected_right = set(right_labels)
+    row_totals = {key: row_totals[key] for key in left_labels}
+    column_totals = {key: column_totals[key] for key in right_labels}
+    represented_total = sum(row_totals.values())
+
+    data = [
+        {
+            "left_category": left_categories[left_key],
+            "counts": {
+                right_key: cell_counts.get((left_key, right_key), 0)
+                for right_key in right_labels
+            },
+        }
+        for left_key in left_labels
+    ]
+    chi_square = 0.0
+    if represented_total:
+        for left_key in left_labels:
+            for right_key in right_labels:
+                observed = cell_counts.get((left_key, right_key), 0)
+                expected = row_totals[left_key] * column_totals[right_key] / represented_total
+                if expected > 0:
+                    chi_square += ((observed - expected) ** 2) / expected
+
+    cramers_v = None
+    if represented_total and len(left_labels) > 1 and len(right_labels) > 1:
+        denominator = represented_total * (min(len(left_labels), len(right_labels)) - 1)
+        cramers_v = min(1.0, math.sqrt(chi_square / denominator)) if denominator else None
+    warnings = []
+    if len(left_categories) > max_categories or len(right_categories) > max_categories:
+        warnings.append(
+            f"Category cardinality exceeded the bounded contingency-table limit for {left_name} and {right_name}."
+        )
+    if not represented_total:
+        warnings.append("No valid paired category observations remain after excluding missing values.")
+    if represented_total and (len(left_labels) < 2 or len(right_labels) < 2):
+        warnings.append("Cramer's V is undefined because fewer than two represented categories remain on an axis.")
+    return {
+        "pair_type": "categorical_categorical",
+        "left_column": left_name,
+        "right_column": right_name,
+        "contingency_table": data,
+        "total_observations": represented_total,
+        "excluded_observations": observed_total - represented_total,
+        "row_totals": row_totals,
+        "column_totals": column_totals,
+        "cramers_v": _json_number(cramers_v),
+        "warnings": warnings,
+    }
+
+
+def _pair_selection_for_bivariate(configuration: EDAConfiguration) -> list[tuple[str, str]]:
+    if configuration.column_pairs:
+        pairs = list(configuration.column_pairs)
+    else:
+        columns = list(configuration.selected_columns)
+        pairs = []
+        for position, left in enumerate(columns):
+            for right in columns[position + 1 :]:
+                pairs.append((left, right))
+                if len(pairs) >= configuration.max_pairs:
+                    break
+            if len(pairs) >= configuration.max_pairs:
+                break
+    return pairs
+
+
+def _decoded_python_string_bytes(array: pa.Array) -> int:
+    return estimate_decoded_python_string_bytes(array)
+
+
+def _materialize_values(array: pa.Array, budget: ExecutionBudget) -> list[Any]:
+    array_type = array.type
+    if pa.types.is_dictionary(array_type):
+        array_type = array_type.value_type
+    if pa.types.is_string(array_type) or pa.types.is_large_string(array_type):
+        estimated_bytes = _decoded_python_string_bytes(array)
+        try:
+            budget.consume("decoded_value_bytes", estimated_bytes)
+        except ExecutionBudgetExceeded as error:
+            raise EDAError(
+                "decoded_value_size_limit",
+                f"Decoded categorical values exceed the estimated Python bytes limit ({MAX_EDA_DECODED_VALUE_BYTES} bytes).",
+            ) from error
+    return _arrow_to_pylist(array)
+
+
+def _arrow_to_pylist(array: pa.Array) -> list[Any]:
+    return array.to_pylist()
+
+
+def _relationship_analysis(
+    parquet: pq.ParquetFile,
+    schema: pa.Schema,
+    configuration: EDAConfiguration,
+    *,
+    dataset_id: int,
+    file_id: int,
+    artifact_sha256: str | None,
+    normalization_version: str | None,
+    table_name: str | None,
+) -> EDAResult:
+    row_count = parquet.metadata.num_rows
+    budget = ExecutionBudget(
+        {
+            "numeric_values": MAX_EDA_NUMERIC_VALUES,
+            "categories": MAX_EDA_TRACKED_CATEGORIES,
+            "grouped_values": MAX_EDA_GROUPED_VALUES,
+            "contingency_cells": MAX_EDA_CONTINGENCY_CELLS,
+            "pairwise_values": MAX_EDA_PAIRWISE_VALUES,
+            "decoded_value_bytes": MAX_EDA_DECODED_VALUE_BYTES,
+            "serialized_bytes": configuration.max_result_bytes,
+        }
+    )
+    numeric_values: dict[str, dict[int, float]] = {}
+    categories: dict[str, dict[str, Any]] = {}
+    pair_definitions = []
+    read_columns = []
+
+    if configuration.analysis_type == "bivariate":
+        eligible_pairs = (
+            len(configuration.column_pairs)
+            if configuration.column_pairs
+            else len(configuration.selected_columns)
+            * (len(configuration.selected_columns) - 1)
+            // 2
+        )
+        pairs = (
+            list(configuration.column_pairs)
+            if configuration.column_pairs
+            else _pair_selection_for_bivariate(configuration)
+        )
+        for left_name, right_name in pairs:
+            left_kind = _arrow_kind(schema.field(left_name).type)
+            right_kind = _arrow_kind(schema.field(right_name).type)
+            if left_kind == right_kind == "numeric":
+                pair_type = "numeric_numeric"
+            elif (
+                left_kind == "numeric"
+                and right_kind in {"categorical", "boolean"}
+            ) or (
+                right_kind == "numeric"
+                and left_kind in {"categorical", "boolean"}
+            ):
+                pair_type = "numeric_categorical"
+            elif left_kind in {"categorical", "boolean"} and right_kind in {
+                "categorical",
+                "boolean",
+            }:
+                pair_type = "categorical_categorical"
+            else:
+                pair_type = "unsupported"
+            pair_definitions.append((left_name, right_name, pair_type))
+            if pair_type == "numeric_numeric":
+                read_columns.extend((left_name, right_name))
+            elif pair_type == "numeric_categorical":
+                read_columns.extend((left_name, right_name))
+            elif pair_type == "categorical_categorical":
+                read_columns.extend((left_name, right_name))
+    elif configuration.analysis_type == "multivariate":
+        numeric_columns = [
+            name
+            for name in configuration.selected_columns
+            if _arrow_kind(schema.field(name).type) == "numeric"
+        ]
+        features = numeric_columns[: configuration.max_features]
+        features_truncated = len(features) < len(numeric_columns)
+        if len(features) < 2:
+            multivariate_warnings = []
+            if features_truncated:
+                multivariate_warnings.append(
+                    f"Feature selection was limited to max_features={configuration.max_features}; "
+                    f"{len(numeric_columns) - len(features)} eligible numeric features were omitted."
+                )
+            return _make_relationship_result(
+                configuration,
+                dataset_id,
+                file_id,
+                artifact_sha256,
+                normalization_version,
+                table_name,
+                row_count,
+                tuple(features),
+                "partially_completed",
+                {
+                    "selected_features": list(features),
+                    "numeric_features": list(features),
+                    "feature_count": len(features),
+                    "eligible_features": len(numeric_columns),
+                    "features_truncated": features_truncated,
+                    "correlation_matrix": {},
+                    "pairwise_valid_counts": {},
+                    "warnings": multivariate_warnings,
+                },
+                warnings=tuple(
+                    ["Multivariate analysis requires at least two numeric columns."]
+                    + multivariate_warnings
+                ),
+            )
+        read_columns.extend(features)
+    else:
+        raise EDAError("unsupported_analysis_type", "EDA analysis type is unsupported for this table.")
+
+    read_columns = list(dict.fromkeys(read_columns))
+    for name in read_columns:
+        kind = _arrow_kind(schema.field(name).type)
+        if kind == "numeric":
+            numeric_values[name] = {}
+        elif kind in {"categorical", "boolean"}:
+            categories[name] = {}
+
+    grouped_values: dict[tuple[str, str], dict[str, list[float]]] = {}
+    grouped_displays: dict[tuple[str, str], dict[str, Any]] = {}
+    grouped_valid: dict[tuple[str, str], int] = {}
+    contingency_cells: dict[tuple[str, str], dict[tuple[str, str], int]] = {}
+    contingency_valid: dict[tuple[str, str], int] = {}
+    for left_name, right_name, pair_type in pair_definitions:
+        pair = (left_name, right_name)
+        if pair_type == "numeric_categorical":
+            grouped_values[pair] = {}
+            grouped_displays[pair] = {}
+            grouped_valid[pair] = 0
+        elif pair_type == "categorical_categorical":
+            contingency_cells[pair] = {}
+            contingency_valid[pair] = 0
+
+    try:
+        if read_columns:
+            _validate_scan_size(parquet, read_columns)
+            scanned_rows = 0
+            for batch in parquet.iter_batches(
+                batch_size=EDA_BATCH_SIZE,
+                columns=read_columns,
+                use_threads=False,
+            ):
+                batch_start = scanned_rows
+                scanned_rows += batch.num_rows
+                if scanned_rows > MAX_EDA_ROWS:
+                    raise EDAError(
+                        "row_limit",
+                        f"Exact EDA is limited to {MAX_EDA_ROWS} rows per table.",
+                    )
+                batch_category_ids: dict[str, list[str | None]] = {}
+                for index, name in enumerate(read_columns):
+                    kind = _arrow_kind(schema.field(name).type)
+                    values = _materialize_values(batch.column(index), budget)
+                    if kind == "numeric":
+                        stored = numeric_values[name]
+                        for offset, value in enumerate(values):
+                            number = _to_finite_float(value)
+                            if number is None:
+                                continue
+                            _consume_relationship_budget(budget, "numeric_values")
+                            stored[batch_start + offset] = number
+                    elif kind in {"categorical", "boolean"}:
+                        known_categories = categories[name]
+                        category_ids = []
+                        for value in values:
+                            if value is None:
+                                category_ids.append(None)
+                                continue
+                            identity, display = _category_identity_and_display(value)
+                            if identity not in known_categories:
+                                _consume_relationship_budget(budget, "categories")
+                                known_categories[identity] = display
+                            category_ids.append(identity)
+                        batch_category_ids[name] = category_ids
+                    del values
+
+                for left_name, right_name, pair_type in pair_definitions:
+                    pair = (left_name, right_name)
+                    if pair_type == "numeric_categorical":
+                        numeric_name, category_name = (
+                            (left_name, right_name)
+                            if _arrow_kind(schema.field(left_name).type) == "numeric"
+                            else (right_name, left_name)
+                        )
+                        for offset, category_id in enumerate(
+                            batch_category_ids[category_name]
+                        ):
+                            _consume_relationship_budget(budget, "pairwise_values")
+                            number = numeric_values[numeric_name].get(batch_start + offset)
+                            if number is None or category_id is None:
+                                continue
+                            _consume_relationship_budget(budget, "grouped_values")
+                            grouped_valid[pair] += 1
+                            grouped_values[pair].setdefault(category_id, []).append(number)
+                            grouped_displays[pair][category_id] = categories[category_name][category_id]
+                    elif pair_type == "categorical_categorical":
+                        left_ids = batch_category_ids[left_name]
+                        right_ids = batch_category_ids[right_name]
+                        for left_id, right_id in zip(left_ids, right_ids):
+                            _consume_relationship_budget(budget, "pairwise_values")
+                            if left_id is None or right_id is None:
+                                continue
+                            cell = (left_id, right_id)
+                            if cell not in contingency_cells[pair]:
+                                _consume_relationship_budget(budget, "contingency_cells")
+                                contingency_cells[pair][cell] = 0
+                            contingency_cells[pair][cell] += 1
+                            contingency_valid[pair] += 1
+            if scanned_rows != row_count:
+                raise EDAError(
+                    "artifact_metadata_mismatch",
+                    "Parquet scan row count did not match normalization metadata.",
+                )
+
+        if configuration.analysis_type == "bivariate":
+            pair_results = []
+            for left_name, right_name, pair_type in pair_definitions:
+                pair = (left_name, right_name)
+                if pair_type == "numeric_numeric":
+                    paired_left, paired_right = _intersect_numeric_values(
+                        numeric_values[left_name],
+                        numeric_values[right_name],
+                        budget,
+                    )
+                    summary = _numeric_pair_summary(
+                        paired_left,
+                        paired_right,
+                        left_name,
+                        right_name,
+                    )
+                    valid_observations = summary["valid_observations"]
+                elif pair_type == "numeric_categorical":
+                    numeric_name, category_name = (
+                        (left_name, right_name)
+                        if _arrow_kind(schema.field(left_name).type) == "numeric"
+                        else (right_name, left_name)
+                    )
+                    summary = _numeric_categorical_summary_from_groups(
+                        grouped_values[pair],
+                        grouped_displays[pair],
+                        numeric_name,
+                        category_name,
+                        configuration.max_categories,
+                    )
+                    summary["left_column"] = left_name
+                    summary["right_column"] = right_name
+                    summary["numeric_column"] = numeric_name
+                    summary["category_column"] = category_name
+                    valid_observations = grouped_valid[pair]
+                elif pair_type == "categorical_categorical":
+                    summary = _contingency_summary_from_counts(
+                        categories[left_name],
+                        categories[right_name],
+                        contingency_cells[pair],
+                        contingency_valid[pair],
+                        left_name,
+                        right_name,
+                        configuration.max_categories,
+                    )
+                    valid_observations = summary["total_observations"]
+                else:
+                    summary = {
+                        "method": "unsupported_type_combination",
+                        "message": "This pair type is not supported for bivariate analysis.",
+                    }
+                    valid_observations = 0
+                warnings = tuple(summary.get("warnings", ()))
+                pair_result = EDAColumnPairResult(
+                    left_column=left_name,
+                    right_column=right_name,
+                    pair_type=pair_type,
+                    valid_observations=valid_observations,
+                    statistics=summary,
+                    warnings=warnings
+                    or (("Unsupported type combination for this pair.",) if pair_type == "unsupported" else ()),
+                )
+                _consume_relationship_budget(
+                    budget,
+                    "serialized_bytes",
+                    len(_canonical_json(pair_result.as_dict())),
+                )
+                pair_results.append(pair_result)
+            analyzed = tuple(
+                dict.fromkeys(name for pair in pairs for name in pair)
+            )
+            summary = {
+                "pair_count": len(pairs),
+                "analyzed_pairs": len(pair_results),
+                "eligible_pairs": eligible_pairs,
+                "pairs_truncated": len(pairs) < eligible_pairs,
+                "pair_selection_mode": (
+                    "explicit" if configuration.column_pairs else "all_selected_columns"
+                ),
+                "warnings": (
+                    [
+                        f"Automatic pair selection was limited to max_pairs={configuration.max_pairs}; "
+                        f"{eligible_pairs - len(pairs)} eligible pairs were omitted."
+                    ]
+                    if len(pairs) < eligible_pairs
+                    else []
+                ),
+            }
+            result_status = (
+                "completed"
+                if all(pair.pair_type != "unsupported" for pair in pair_results)
+                else "partially_completed"
+            )
+            result = _make_relationship_result(
+                configuration,
+                dataset_id,
+                file_id,
+                artifact_sha256,
+                normalization_version,
+                table_name,
+                row_count,
+                analyzed,
+                result_status,
+                summary,
+                pair_results=tuple(pair_results),
+            )
+        else:
+            features = [name for name in read_columns]
+            matrix = {name: {} for name in features}
+            counts = {name: {} for name in features}
+            for index, left_name in enumerate(features):
+                for right_name in features[index:]:
+                    left_series, right_series = _intersect_numeric_values(
+                        numeric_values[left_name],
+                        numeric_values[right_name],
+                        budget,
+                    )
+                    coefficient = _pearson_corr(left_series, right_series)
+                    count = len(left_series)
+                    matrix[left_name][right_name] = _json_number(coefficient)
+                    counts[left_name][right_name] = count
+                    if left_name != right_name:
+                        matrix[right_name][left_name] = matrix[left_name][right_name]
+                        counts[right_name][left_name] = count
+            summary = {
+                "selected_features": features,
+                "numeric_features": features,
+                "feature_count": len(features),
+                "eligible_features": len(numeric_columns),
+                "features_truncated": features_truncated,
+                "rows_analyzed": row_count,
+                "missing_value_policy": "Rows with nulls or non-finite values are excluded per pair.",
+                "correlation_matrix": matrix,
+                "pairwise_valid_counts": counts,
+                "warnings": (
+                    [
+                        f"Feature selection was limited to max_features={configuration.max_features}; "
+                        f"{len(numeric_columns) - len(features)} eligible numeric features were omitted."
+                    ]
+                    if features_truncated
+                    else []
+                ),
+            }
+            result = _make_relationship_result(
+                configuration,
+                dataset_id,
+                file_id,
+                artifact_sha256,
+                normalization_version,
+                table_name,
+                row_count,
+                tuple(features),
+                "completed",
+                summary,
+            )
+
+        encoded_result = _canonical_json(result.as_dict())
+        if len(encoded_result) > configuration.max_result_bytes:
+            raise EDAError(
+                "result_size_limit",
+                "EDA result exceeds the configured serialized size limit.",
+            )
+        return result
+    except ExecutionBudgetExceeded as error:
+        codes = {
+            "numeric_values": (
+                "numeric_value_limit",
+                f"Exact numeric EDA is limited to {MAX_EDA_NUMERIC_VALUES} finite values per request.",
+            ),
+            "categories": (
+                "category_tracking_limit",
+                f"Exact EDA is limited to {MAX_EDA_TRACKED_CATEGORIES} distinct category entries per request.",
+            ),
+            "grouped_values": (
+                "grouped_value_limit",
+                f"Numeric-categorical EDA is limited to {MAX_EDA_GROUPED_VALUES} grouped values per request.",
+            ),
+            "contingency_cells": (
+                "contingency_cell_limit",
+                f"Categorical EDA is limited to {MAX_EDA_CONTINGENCY_CELLS} non-empty contingency cells per request.",
+            ),
+            "pairwise_values": (
+                "pairwise_work_limit",
+                f"Relationship analysis is limited to {MAX_EDA_PAIRWISE_VALUES} pairwise values per request.",
+            ),
+            "decoded_value_bytes": (
+                "decoded_value_size_limit",
+                f"Decoded categorical values are limited to {MAX_EDA_DECODED_VALUE_BYTES} estimated Python bytes per request.",
+            ),
+            "serialized_bytes": (
+                "result_size_limit",
+                "EDA result exceeds the configured serialized size limit.",
+            ),
+        }
+        code, message = codes[error.resource]
+        raise EDAError(code, message) from error
+
+
+def _consume_relationship_budget(
+    budget: ExecutionBudget,
+    resource: str,
+    amount: int = 1,
+) -> None:
+    budget.consume(resource, amount)
+
+
+def _intersect_numeric_values(
+    left_values: dict[int, float],
+    right_values: dict[int, float],
+    budget: ExecutionBudget,
+) -> tuple[list[float], list[float]]:
+    if len(left_values) <= len(right_values):
+        candidates = left_values.items()
+        other_values = right_values
+        left_is_candidate = True
+    else:
+        candidates = right_values.items()
+        other_values = left_values
+        left_is_candidate = False
+    paired_left = []
+    paired_right = []
+    for row_index, candidate_value in candidates:
+        _consume_relationship_budget(budget, "pairwise_values")
+        other_value = other_values.get(row_index)
+        if other_value is None:
+            continue
+        if left_is_candidate:
+            paired_left.append(candidate_value)
+            paired_right.append(other_value)
+        else:
+            paired_left.append(other_value)
+            paired_right.append(candidate_value)
+    return paired_left, paired_right
+
+
+def _make_relationship_result(
+    configuration: EDAConfiguration,
+    dataset_id: int,
+    file_id: int,
+    artifact_sha256: str | None,
+    normalization_version: str | None,
+    table_name: str | None,
+    row_count: int,
+    analyzed_columns: tuple[str, ...],
+    status: str,
+    summary: dict[str, Any],
+    *,
+    pair_results: tuple[EDAColumnPairResult, ...] = (),
+    warnings: tuple[str, ...] = (),
+) -> EDAResult:
+    encoded_configuration = _canonical_json(configuration.as_dict())
+    return EDAResult(
+        schema_version=EDA_RESULT_SCHEMA_VERSION,
+        analysis_type=configuration.analysis_type,
+        status=status,
+        dataset_id=dataset_id,
+        file_id=file_id,
+        table_index=configuration.table_index,
+        table_name=table_name,
+        artifact_sha256=artifact_sha256,
+        normalization_version=normalization_version,
+        algorithm_version=_algorithm_version_for_analysis(configuration.analysis_type),
+        configuration=configuration.as_dict(),
+        configuration_sha256=hashlib.sha256(encoded_configuration).hexdigest(),
+        executed_at=datetime.now(timezone.utc).isoformat(),
+        requested_columns=configuration.selected_columns,
+        analyzed_columns=analyzed_columns,
+        rows_analyzed=row_count,
+        exact=True,
+        sampling=None,
+        columns=(),
+        warnings=warnings,
+        pair_results=pair_results,
+        multivariate_summary=summary,
+    )
 
 
 def _arrow_kind(data_type: pa.DataType) -> str:
@@ -638,6 +1627,47 @@ def _verified_quality_findings(
         return [], ["Stored quality findings were stale or incompatible and were not reused."]
 
 
+def _failure_summary(configuration: EDAConfiguration) -> dict[str, Any]:
+    if configuration.analysis_type == "bivariate":
+        eligible_pairs = (
+            len(configuration.column_pairs)
+            if configuration.column_pairs
+            else len(configuration.selected_columns)
+            * (len(configuration.selected_columns) - 1)
+            // 2
+        )
+        selected_pairs = min(eligible_pairs, configuration.max_pairs)
+        pairs_truncated = selected_pairs < eligible_pairs
+        warnings = (
+            [
+                f"Automatic pair selection was limited to max_pairs={configuration.max_pairs}; "
+                f"{eligible_pairs - selected_pairs} eligible pairs were omitted."
+            ]
+            if pairs_truncated and not configuration.column_pairs
+            else []
+        )
+        return {
+            "pair_count": selected_pairs,
+            "analyzed_pairs": 0,
+            "eligible_pairs": eligible_pairs,
+            "pairs_truncated": pairs_truncated,
+            "pair_selection_mode": (
+                "explicit" if configuration.column_pairs else "all_selected_columns"
+            ),
+            "warnings": warnings,
+        }
+    if configuration.analysis_type == "multivariate":
+        return {
+            "selected_features": None,
+            "numeric_features": None,
+            "feature_count": None,
+            "eligible_features": None,
+            "features_truncated": None,
+            "warnings": [],
+        }
+    return {}
+
+
 def _failure_result(
     *,
     dataset_id: int,
@@ -660,7 +1690,7 @@ def _failure_result(
         table_name=table_name,
         artifact_sha256=artifact_sha256,
         normalization_version=normalization_version,
-        algorithm_version=EDA_ALGORITHM_VERSION,
+        algorithm_version=_algorithm_version_for_analysis(configuration.analysis_type),
         configuration=configuration.as_dict(),
         configuration_sha256=hashlib.sha256(encoded).hexdigest(),
         executed_at=datetime.now(timezone.utc).isoformat(),
@@ -671,6 +1701,7 @@ def _failure_result(
         sampling=None,
         columns=(),
         failure=EDAFailure(code, message),
+        multivariate_summary=_failure_summary(configuration),
     )
 
 
@@ -876,6 +1907,39 @@ def _analyze_local_parquet(
             if column_indices[-1] < 0:
                 raise EDAError("unknown_column", f"Selected column {name!r} is not in the normalized schema.")
 
+        if configuration.analysis_type != "univariate":
+            if configuration.analysis_type == "bivariate" and configuration.column_pairs:
+                requested_for_relationship = list(dict.fromkeys(
+                    name for pair in configuration.column_pairs for name in pair
+                ))
+                if any(name not in schema.names for name in requested_for_relationship):
+                    raise EDAError(
+                        "unknown_column",
+                        "Selected pair contains a column that is not present in the table.",
+                    )
+            else:
+                requested_for_relationship = list(configuration.selected_columns)
+            if not requested_for_relationship:
+                raise EDAError("unknown_column", "Selected relationship columns are not in the normalized schema.")
+            if parquet.metadata.num_rows > MAX_EDA_ROWS:
+                raise EDAError(
+                    "row_limit",
+                    f"Exact EDA is limited to {MAX_EDA_ROWS} rows per table.",
+                )
+            relationship_result = _relationship_analysis(
+                parquet,
+                schema,
+                configuration,
+                dataset_id=dataset_id,
+                file_id=file_id,
+                artifact_sha256=table["sha256"],
+                normalization_version=normalization_result["pipeline_version"],
+                table_name=table.get("table_name"),
+            )
+            if len(_canonical_json(relationship_result.as_dict())) > configuration.max_result_bytes:
+                raise EDAError("result_size_limit", "EDA result exceeds the configured serialized size limit.")
+            return relationship_result
+
         selected_fields = [schema.field(index) for index in column_indices]
         kinds = [_arrow_kind(field_value.type) for field_value in selected_fields]
         accumulators = [
@@ -889,6 +1953,9 @@ def _analyze_local_parquet(
         accumulator_by_position = dict(zip(supported_positions, accumulators))
         numeric_budget = [MAX_EDA_NUMERIC_VALUES]
         category_budget = [MAX_EDA_TRACKED_CATEGORIES]
+        decoded_value_budget = ExecutionBudget(
+            {"decoded_value_bytes": MAX_EDA_DECODED_VALUE_BYTES}
+        )
         scanned_rows = 0
         if supported_positions:
             _validate_scan_size(
@@ -909,7 +1976,8 @@ def _analyze_local_parquet(
                 for selected_position, accumulator in accumulator_by_position.items():
                     kind = kinds[selected_position]
                     array = batch.column(supported_positions.index(selected_position))
-                    for value in array.to_pylist():
+                    values = _materialize_values(array, decoded_value_budget)
+                    for value in values:
                         _observe_value(
                             accumulator,
                             value,
@@ -917,6 +1985,7 @@ def _analyze_local_parquet(
                             numeric_budget,
                             category_budget,
                         )
+                    del values
             if scanned_rows != table["row_count"]:
                 raise EDAError("artifact_metadata_mismatch", "Parquet scan row count did not match normalization metadata.")
 
@@ -1080,7 +2149,7 @@ def _analyze_local_parquet(
             table_name=table.get("table_name"),
             artifact_sha256=table["sha256"],
             normalization_version=normalization_result["pipeline_version"],
-            algorithm_version=EDA_ALGORITHM_VERSION,
+            algorithm_version=_algorithm_version_for_analysis(configuration.analysis_type),
             configuration=configuration_dict,
             configuration_sha256=hashlib.sha256(encoded_configuration).hexdigest(),
             executed_at=datetime.now(timezone.utc).isoformat(),

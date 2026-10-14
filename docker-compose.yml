@@ -1,5 +1,17 @@
 services:
 
+  minio-init:
+    build:
+      context: ./backend
+    container_name: insightos-minio-init
+    restart: "no"
+    env_file:
+      - .env
+    command: ["python", "-m", "app.storage_init"]
+    depends_on:
+      minio:
+        condition: service_healthy
+
   backend:
     build:
       context: ./backend
@@ -8,7 +20,7 @@ services:
     env_file:
       - .env
     ports:
-      - "${BACKEND_PORT}:8000"
+      - "127.0.0.1:${BACKEND_PORT}:8000"
     volumes:
       - ./backend:/app
     depends_on:
@@ -16,8 +28,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      minio:
-        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
 
   worker:
     build:
@@ -51,7 +63,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     ports:
-      - "${POSTGRES_PORT}:5432"
+      - "127.0.0.1:${POSTGRES_PORT}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -65,7 +77,7 @@ services:
     container_name: insightos-redis
     restart: unless-stopped
     ports:
-      - "${REDIS_PORT}:6379"
+      - "127.0.0.1:${REDIS_PORT}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -85,8 +97,8 @@ services:
       MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - minio_data:/data
     healthcheck:

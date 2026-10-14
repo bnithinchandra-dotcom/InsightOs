@@ -54,7 +54,12 @@ release cannot be guaranteed until the connection or backend process terminates.
 resource limits. `MAX_PROFILE_DISTINCT_VALUES` (default 100,000),
 `MAX_PROFILE_NUMERIC_VALUES` (default 250,000), and
 `MAX_PROFILE_DUPLICATE_ROWS` (default 250,000) bound additional profiling
-memory use.
+memory use. `MAX_JSON_ESTIMATED_DECODED_MB` (default 256 MiB) sets the estimated
+decoded-memory ceiling for JSON parsing. Before reading or decoding the
+document, the parser limits source bytes to 1/64 of that ceiling. This is a
+conservative input-expansion estimate, not an exact Python heap measurement;
+JSON files above the resulting source-byte limit are rejected with
+`resource_limit`.
 
 CSV and TSV use UTF-8 (an optional UTF-8 BOM is accepted), with the first record
 as the header and strict row widths. Their physical type is text; values are

@@ -3,6 +3,7 @@ import json
 import math
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 
 import pyarrow as pa
 
@@ -608,6 +609,53 @@ class DATransformationTests(unittest.TestCase):
         with self.assertRaisesRegex(TransformationRegistryError, "exceeds"):
             executor.transform(table, configuration={"columns": ["category"]})
 
+    def test_most_frequent_rejects_decoded_string_budget_before_list_conversion(self):
+        config = {
+            "columns": ["category"],
+            "strategy": "most_frequent",
+        }
+        table = pa.table({"category": ["a", "b"]})
+        executor = self.executor("da.missing_value_handling", config)
+        with (
+            patch(
+                "app.preprocessing.estimate_decoded_python_string_bytes",
+                return_value=64 * 1024 * 1024 + 1,
+            ),
+            patch(
+                "app.preprocessing._arrow_to_pylist",
+                side_effect=AssertionError("Python values were materialized"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                TransformationRegistryError,
+                "decoded string values",
+            ):
+                executor.fit(table, configuration=config)
+
+    def test_most_frequent_decoded_budget_is_cumulative_across_selected_columns(self):
+        config = {
+            "columns": ["category", "other"],
+            "strategy": "most_frequent",
+        }
+        table = pa.table({"category": ["a"], "other": ["b"]})
+        executor = self.executor("da.missing_value_handling", config)
+        with (
+            patch(
+                "app.preprocessing.estimate_decoded_python_string_bytes",
+                side_effect=[40 * 1024 * 1024, 40 * 1024 * 1024],
+            ),
+            patch(
+                "app.preprocessing._arrow_to_pylist",
+                return_value=["a"],
+            ) as materialize,
+        ):
+            with self.assertRaisesRegex(
+                TransformationRegistryError,
+                "decoded string values",
+            ):
+                executor.fit(table, configuration=config)
+        self.assertEqual(materialize.call_count, 1)
+
     def test_invalid_configuration_and_non_table_inputs_fail_clearly(self):
         executor = self.executor(
             "da.string_normalization",
@@ -965,6 +1013,29 @@ class BABusinessTransformationTests(unittest.TestCase):
             executor = self.executor("ba.category_mapping", policy_config)
             with self.assertRaisesRegex(TransformationRegistryError, error):
                 executor.transform(table, configuration=policy_config)
+
+    def test_category_mapping_rejects_decoded_string_budget_before_list_conversion(self):
+        config = {
+            "column": "category",
+            "mappings": [{"from": "Retail", "to": "Consumer"}],
+        }
+        table = pa.table({"category": ["Retail", "Wholesale"]})
+        executor = self.executor("ba.category_mapping", config)
+        with (
+            patch(
+                "app.preprocessing.estimate_decoded_python_string_bytes",
+                return_value=64 * 1024 * 1024 + 1,
+            ),
+            patch(
+                "app.preprocessing._arrow_to_pylist",
+                side_effect=AssertionError("Python values were materialized"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                TransformationRegistryError,
+                "decoded string values",
+            ):
+                executor.transform(table, configuration=config)
 
     def test_category_mapping_rejects_conflicts_missing_columns_and_types(self):
         table = pa.table({"category": ["Retail", "Retail"], "amount": [1, 2]})

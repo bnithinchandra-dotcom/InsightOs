@@ -25,6 +25,14 @@ values. Nulls are preserved unless a selected missing-value strategy explicitly
 handles them. Non-finite floating-point inputs are rejected by numeric
 operations. Column names must be unique and non-empty.
 
+Transformation inputs are capped at 64 MiB of Arrow buffers, 1,000,000 rows,
+and 256 columns. The most-frequent imputation and category-mapping paths also
+estimate decoded Python string memory before converting selected string
+columns to Python lists; estimates are cumulative across selected columns and
+Arrow chunks and share the 64 MiB input ceiling. This protects those
+materialization sites, but does not impose a process-wide memory limit or make
+the preprocessing API streaming.
+
 | Operation ID | Configuration | Behavior |
 | --- | --- | --- |
 | `da.string_normalization` | `columns`, `trim` (default `false`), `case` (`none`, `lower`, `upper`; default `none`), `empty_strings_as_missing` (default `false`) | Trims surrounding whitespace and/or changes case only on explicitly selected string columns. Empty strings become null only when opted in. It does not remove punctuation or merge semantic labels. Does not require fitting. |
