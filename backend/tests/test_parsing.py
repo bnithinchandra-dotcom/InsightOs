@@ -215,6 +215,19 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(json_table["columns"][0]["numeric_statistics"]["mean"], 5 / 3)
         self.assertEqual(json_table["columns"][1]["empty_value_count"], 1)
 
+        cancellation = parse(
+            "decimal-cancellation.json",
+            b'[{"n":1e28},{"n":1},{"n":-1e28}]',
+        ).profile_result["tables"][0]["columns"][0]["numeric_statistics"]
+        self.assertEqual(cancellation["mean"], 1 / 3)
+        self.assertEqual(cancellation["median"], 1)
+
+        precise_midpoint = parse(
+            "decimal-midpoint.json",
+            b'[{"n":-1e28},{"n":1},{"n":1e28},{"n":2}]',
+        ).profile_result["tables"][0]["columns"][0]["numeric_statistics"]
+        self.assertEqual(precise_midpoint["median"], 1.5)
+
         mixed_numeric = parse(
             "mixed-numeric.json",
             b'[{"n":1},{"n":1.5}]',
@@ -446,6 +459,20 @@ class ParsingTests(unittest.TestCase):
                 with self.assertRaises(ParsingError) as context:
                     parse(filename, content)
                 self.assertEqual(context.exception.code, expected_code)
+
+    def test_delimited_reader_detects_json_and_xml_after_long_whitespace(self):
+        payloads = (
+            ("whitespace.json.csv", b" " * 8192 + b'{"records":[]}'),
+            (
+                "whitespace.xml.csv",
+                b"\n" * 8192 + b"<root><record>one</record></root>",
+            ),
+        )
+        for filename, content in payloads:
+            with self.subTest(filename=filename):
+                with self.assertRaises(ParsingError) as context:
+                    parse(filename, content)
+                self.assertEqual(context.exception.code, "content_mismatch")
 
     def test_xml_rejects_internal_dtd_and_external_entities(self):
         payloads = (

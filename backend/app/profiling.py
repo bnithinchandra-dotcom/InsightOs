@@ -2,7 +2,7 @@ import hashlib
 import json
 import math
 from collections.abc import Sequence
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 
 
 _MISSING = object()
@@ -141,6 +141,18 @@ def _json_number(value: Decimal):
     return converted if math.isfinite(converted) else None
 
 
+def _decimal_addition_precision(values: Sequence[Decimal]) -> int:
+    nonzero = [value for value in values if value]
+    if not nonzero:
+        return 28
+    minimum_exponent = min(value.as_tuple().exponent for value in nonzero)
+    maximum_adjusted = max(value.adjusted() for value in nonzero)
+    return max(
+        28,
+        maximum_adjusted - minimum_exponent + len(str(len(values))) + 2,
+    )
+
+
 class ProfileBudget:
     def __init__(
         self,
@@ -182,6 +194,8 @@ class ColumnProfiler:
         self.non_numeric = 0
         self.numeric_count = 0
         self.numeric_sum = Decimal(0)
+        self.numeric_min_exponent: int | None = None
+        self.numeric_max_adjusted: int | None = None
         self.numeric_min: Decimal | None = None
         self.numeric_max: Decimal | None = None
         self.numeric_values: list[Decimal] | None = []
@@ -244,7 +258,26 @@ class ColumnProfiler:
             return
 
         self.numeric_count += 1
-        self.numeric_sum += number
+        self.numeric_min_exponent = (
+            number.as_tuple().exponent
+            if self.numeric_min_exponent is None
+            else min(self.numeric_min_exponent, number.as_tuple().exponent)
+        )
+        self.numeric_max_adjusted = (
+            number.adjusted()
+            if self.numeric_max_adjusted is None
+            else max(self.numeric_max_adjusted, number.adjusted())
+        )
+        precision = max(
+            28,
+            self.numeric_max_adjusted
+            - self.numeric_min_exponent
+            + len(str(self.numeric_count))
+            + 2,
+        )
+        with localcontext() as context:
+            context.prec = precision
+            self.numeric_sum += number
         self.numeric_min = number if self.numeric_min is None else min(self.numeric_min, number)
         self.numeric_max = number if self.numeric_max is None else max(self.numeric_max, number)
         if self.numeric_values is not None:
@@ -298,7 +331,12 @@ class ColumnProfiler:
         if not number.is_finite():
             return None
         try:
-            return number if math.isfinite(float(number)) else None
+            converted = float(number)
+            return (
+                number
+                if math.isfinite(converted) and (converted != 0 or number == 0)
+                else None
+            )
         except (OverflowError, ValueError):
             return None
 
@@ -342,11 +380,17 @@ class ColumnProfiler:
                 if len(ordered) % 2:
                     median = ordered[middle]
                 else:
-                    median = (ordered[middle - 1] + ordered[middle]) / 2
+                    midpoint_values = [ordered[middle - 1], ordered[middle]]
+                    with localcontext() as context:
+                        context.prec = _decimal_addition_precision(midpoint_values)
+                        median = sum(midpoint_values, Decimal(0)) / 2
+            with localcontext() as context:
+                context.prec = max(40, len(self.numeric_sum.as_tuple().digits) + 2)
+                mean = self.numeric_sum / self.numeric_count
             numeric_statistics = {
                 "minimum": _json_number(self.numeric_min),
                 "maximum": _json_number(self.numeric_max),
-                "mean": _json_number(self.numeric_sum / self.numeric_count),
+                "mean": _json_number(mean),
                 "median": _json_number(median) if median is not None else None,
                 "median_exact": median_exact,
             }

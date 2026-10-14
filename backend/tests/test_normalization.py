@@ -146,6 +146,8 @@ class NormalizationTests(unittest.TestCase):
             ['["null"]', '["missing"]', '["string",""]'],
         )
         self.assertEqual(table_result["null_value_counts"][1], 0)
+        self.assertEqual(table_result["logical_null_value_counts"][1], 2)
+        self.assertEqual(table_result["logical_empty_value_counts"][1], 1)
         encoded = table["nested"].to_pylist()
         self.assertTrue(all(value.startswith("[") for value in encoded))
 

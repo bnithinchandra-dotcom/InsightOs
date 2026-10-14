@@ -312,6 +312,17 @@ class JEVPolicyTests(unittest.TestCase):
         self.assertEqual(matching.status, "verified")
         self.assertEqual(changed.status, "failed")
 
+    def test_schema_values_distinguish_booleans_from_integers_recursively(self):
+        primary = {"required": True, "properties": {"enabled": [True]}}
+        expected = {"required": 1, "properties": {"enabled": [1]}}
+        result = verify_claim(
+            primary,
+            self.evidence(primary, expected),
+            policy_for("schema"),
+        )
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.selected_value, primary)
+
     def test_forecasts_and_semantic_interpretations_are_not_verified_by_agreement(self):
         for value_type in ("forecast", "semantic_interpretation"):
             result = verify_claim(
@@ -385,6 +396,20 @@ class JEVPolicyTests(unittest.TestCase):
                 "verified",
             )
         self.assertEqual(budget.used("jev_checks"), 2)
+
+    def test_malformed_evidence_attempt_consumes_check_budget(self):
+        primary = 1
+        budget = ExecutionBudget({"jev_checks": 1, "jev_evidence_bytes": 1000})
+        malformed = self.evidence(primary, ["x" * 5000])
+        result = verify_claim(
+            primary,
+            malformed,
+            policy_for("count"),
+            budget=budget,
+        )
+        self.assertEqual(result.reason_code, "malformed_evidence")
+        self.assertEqual(budget.used("jev_checks"), 1)
+        self.assertEqual(budget.used("jev_evidence_bytes"), 0)
 
 
 if __name__ == "__main__":

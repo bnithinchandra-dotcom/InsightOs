@@ -265,6 +265,20 @@ def verify_claim(
     the primary value. Correction requires a separate explicit approved policy.
     """
     _validate_policy(policy)
+    if budget is not None:
+        try:
+            budget.consume("jev_checks", 1)
+        except ExecutionBudgetExceeded:
+            return _assessment(
+                policy,
+                "unverifiable",
+                "skipped",
+                "budget_exhausted",
+                None,
+                None,
+                primary_value,
+            )
+
     claim_hash = None
     try:
         claim_hash = value_fingerprint(primary_value)
@@ -322,7 +336,6 @@ def verify_claim(
         )
     if budget is not None:
         try:
-            budget.consume("jev_checks", 1)
             budget.consume("jev_evidence_bytes", evidence_size)
         except ExecutionBudgetExceeded:
             return _assessment(
@@ -458,10 +471,7 @@ def verify_claim(
         )
 
     if policy.value_type in {"identifier", "boolean", "count", "categorical", "schema"}:
-        agrees = type(primary_value) is type(evidence.expected_value) and (
-            _bounded_json_value(primary_value)
-            == _bounded_json_value(expected_value)
-        )
+        agrees = _strictly_equal(primary_value, expected_value)
         difference = Decimal(0) if agrees else None
     else:
         primary_number = _decimal_value(primary_value)
@@ -736,6 +746,22 @@ def _bounded_json_value(
             _bounded_json_value(item, depth + 1, budget) for item in value
         ]
     raise TypeError("Verification value is not safely serializable.")
+
+
+def _strictly_equal(left: Any, right: Any) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, Mapping):
+        return (
+            left.keys() == right.keys()
+            and all(_strictly_equal(left[key], right[key]) for key in left)
+        )
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(
+            _strictly_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    return left == right
 
 
 def _charge_serialization_budget(budget: list[int], estimated_bytes: int) -> None:

@@ -3006,6 +3006,18 @@ def delete_dataset(dataset_id: int):
         if dataset is None:
             raise HTTPException(status_code=404, detail="Dataset not found.")
 
+        if dataset.active_upload_key is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "upload_in_progress",
+                    "message": (
+                        "A file is being uploaded to this dataset; retry "
+                        "dataset deletion after the upload finishes."
+                    ),
+                },
+            )
+
         try:
             file_ids = [
                 row[0]

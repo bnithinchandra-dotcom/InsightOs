@@ -318,6 +318,39 @@ class QualityRuleEngineTests(unittest.TestCase):
         self.assertEqual(finding.denominator_count, 4)
         self.assertIn("depends on the intended use", finding.description)
 
+    def test_missing_rule_counts_tagged_json_source_nulls_and_empty_strings(self):
+        data = {
+            "tables": [
+                {
+                    "table_index": 0,
+                    "table_name": None,
+                    "row_count": 3,
+                    "schema": [{"name": "value", "type": "string"}],
+                    "null_value_counts": [0],
+                    "empty_value_counts": [0],
+                    "logical_null_value_counts": [2],
+                    "logical_empty_value_counts": [1],
+                }
+            ]
+        }
+        result = run_quality_rules(
+            data,
+            configuration=configuration(
+                {
+                    MISSING_VALUE_CANDIDATE_RULE.rule_id: {
+                        "include_empty_strings": True,
+                        "include_null_values": True,
+                    }
+                },
+            ),
+        )[0]
+        self.assertEqual(result.status, "Completed")
+        self.assertEqual(result.findings[0].affected_count, 3)
+        self.assertEqual(
+            result.findings[0].evidence,
+            {"null_count": 2, "empty_string_count": 1},
+        )
+
     def test_default_config_is_explicit_and_execution_is_deterministic(self):
         self.assertEqual(
             tuple(rule.rule_id for rule in DEFAULT_QUALITY_RULES),

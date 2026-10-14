@@ -71,6 +71,13 @@ statistics from the normalized artifact rather than treating the earlier
 profile as artifact-bound statistics. EDA results and preprocessing outputs
 currently have no persisted execution-history lifecycle.
 
+For JSON columns that require reversible tagged text to distinguish a missing
+field from explicit null, normalization metadata retains source-level null and
+empty-string counts separately from physical Parquet null/empty counts. The
+missing-value quality rule combines these non-overlapping counts. Exact
+duplicate-row quality analysis scans verified normalized Parquet directly and
+does not require parser-profile duplicate statistics.
+
 ## Shared execution contract
 
 ### Operation scope and accounting

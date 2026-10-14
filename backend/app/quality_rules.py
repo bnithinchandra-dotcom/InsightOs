@@ -182,16 +182,68 @@ def _missing_value_unsupported_reason(
     if not isinstance(tables, list):
         return "Validated table metadata is unavailable."
     for table in tables:
+        if not isinstance(table, dict):
+            return "Validated per-column null and empty-value counts are unavailable."
+        schema = table.get("schema")
+        row_count = table.get("row_count")
         if (
-            not isinstance(table, dict)
-            or not isinstance(table.get("schema"), list)
-            or not isinstance(table.get("row_count"), int)
-            or isinstance(table.get("row_count"), bool)
-            or table["row_count"] < 0
-            or not isinstance(table.get("null_value_counts"), list)
-            or not isinstance(table.get("empty_value_counts"), list)
-            or len(table["schema"]) != len(table["null_value_counts"])
-            or len(table["schema"]) != len(table["empty_value_counts"])
+            not isinstance(schema, list)
+            or isinstance(row_count, bool)
+            or not isinstance(row_count, int)
+            or row_count < 0
+        ):
+            return "Validated per-column null and empty-value counts are unavailable."
+        null_counts = table.get("null_value_counts")
+        empty_counts = table.get("empty_value_counts")
+        logical_null_counts = table.get(
+            "logical_null_value_counts",
+            [0] * len(schema),
+        )
+        logical_empty_counts = table.get(
+            "logical_empty_value_counts",
+            [0] * len(schema),
+        )
+        if (
+            not isinstance(null_counts, list)
+            or len(schema) != len(null_counts)
+            or any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                for value in null_counts
+            )
+            or not isinstance(empty_counts, list)
+            or len(schema) != len(empty_counts)
+            or any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                for value in empty_counts
+            )
+            or not isinstance(logical_null_counts, list)
+            or len(schema) != len(logical_null_counts)
+            or any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                for value in logical_null_counts
+            )
+            or not isinstance(logical_empty_counts, list)
+            or len(schema) != len(logical_empty_counts)
+            or any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                for value in logical_empty_counts
+            )
+            or any(
+                null_counts[position]
+                + empty_counts[position]
+                + logical_null_counts[position]
+                + logical_empty_counts[position]
+                > row_count
+                for position in range(len(schema))
+            )
         ):
             return "Validated per-column null and empty-value counts are unavailable."
     return None
@@ -212,15 +264,25 @@ def _evaluate_missing_value_candidates(
 ) -> Iterable[RuleFinding]:
     for table in normalization_result["tables"]:
         row_count = table["row_count"]
+        logical_nulls = table.get(
+            "logical_null_value_counts",
+            [0] * len(table["schema"]),
+        )
+        logical_empties = table.get(
+            "logical_empty_value_counts",
+            [0] * len(table["schema"]),
+        )
         for position, field in enumerate(table["schema"]):
             budget.consume_comparisons()
             null_count = (
                 table["null_value_counts"][position]
+                + logical_nulls[position]
                 if configuration["include_null_values"]
                 else 0
             )
             empty_count = (
                 table["empty_value_counts"][position]
+                + logical_empties[position]
                 if configuration["include_empty_strings"]
                 else 0
             )
@@ -255,9 +317,9 @@ def _evaluate_missing_value_candidates(
                 },
                 confidence=1.0,
                 confidence_basis=(
-                    "Counts were validated from the immutable normalized "
-                    "Parquet output; this is not a judgment that the values "
-                    "are invalid."
+                    "Counts were validated from normalized Parquet and "
+                    "reversible JSON-value metadata; this is not a judgment "
+                    "that the values are invalid."
                 ),
                 recommended_investigation=(
                     "Confirm whether null or empty values are permitted for "
@@ -1157,7 +1219,7 @@ def _evaluate_exact_duplicates(
             classification="unusual_candidate",
             title="Exact duplicate row candidates",
             description=(
-                f"The validated profile found {duplicate_count} repeated "
+                f"The normalized-row scan found {duplicate_count} repeated "
                 "complete rows. Repeated rows may be intentional."
             ),
             scope={
@@ -1176,8 +1238,8 @@ def _evaluate_exact_duplicates(
             },
             confidence=1.0,
             confidence_basis=(
-                "The parser profile reports an exact duplicate-row count "
-                "within its configured tracking budget."
+                "Every normalized row was compared using deterministic typed "
+                "fingerprints within the rule's configured resource budgets."
             ),
             recommended_investigation=(
                 "Confirm whether repeated complete rows are expected; do not "
@@ -1191,10 +1253,7 @@ EXACT_DUPLICATE_RULE = QualityRule(
     version="1",
     scope="table",
     severity="info",
-    prerequisites=(
-        "validated_exact_duplicate_profile",
-        "verified_normalized_parquet",
-    ),
+    prerequisites=("verified_normalized_parquet",),
     configuration_defaults={},
     validate_configuration=_empty_rule_configuration,
     unsupported_reason=_exact_duplicates_unsupported,

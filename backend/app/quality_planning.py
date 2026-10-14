@@ -81,7 +81,6 @@ _PREREQUISITE_MISSING_CONTEXT = {
     "per_column_null_and_empty_counts": "per-column null and empty counts",
     "validated_source_type_profile": "validated source type profile",
     "normalized_column_schema": "normalized column schema",
-    "validated_exact_duplicate_profile": "profile with exact duplicate counts",
     "validated_profile_result": "validated column profile",
     "exact_profile_column_cardinality": "exact per-column distinct counts",
     "verified_normalized_parquet": "validated normalized Parquet outputs",
@@ -100,15 +99,6 @@ def _available_prerequisites(
     if isinstance(profile, dict) and isinstance(profile.get("tables"), list):
         available.add("validated_source_type_profile")
         profile_tables = profile["tables"]
-        if profile_tables and all(
-            isinstance(table, dict)
-            and table.get("duplicate_row_count_exact") is True
-            and isinstance(table.get("duplicate_row_count"), int)
-            and not isinstance(table.get("duplicate_row_count"), bool)
-            for table in profile_tables
-        ):
-            available.add("validated_exact_duplicate_profile")
-
     if isinstance(normalized, dict) and isinstance(normalized.get("tables"), list):
         tables = normalized["tables"]
         available.add("validated_normalization_metadata")

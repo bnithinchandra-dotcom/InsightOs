@@ -372,6 +372,24 @@ def _check_json_source_depth(encoded: bytes, max_depth: int) -> None:
             depth -= 1
 
 
+def _read_non_whitespace_prefix(stream: BinaryIO) -> bytes:
+    position = stream.tell()
+    try:
+        first_chunk = True
+        while True:
+            chunk = stream.read(4096)
+            if not chunk:
+                return b""
+            if first_chunk:
+                chunk = chunk.lstrip(b"\xef\xbb\xbf")
+                first_chunk = False
+            chunk = chunk.lstrip(b" \t\r\n")
+            if chunk:
+                return chunk[:4096]
+    finally:
+        stream.seek(position)
+
+
 def _read_delimited(
     filename: str,
     stream: BinaryIO,
@@ -379,10 +397,7 @@ def _read_delimited(
     limits: ParseLimits,
 ) -> ParseResult:
     delimiter = "\t" if filename.lower().endswith(".tsv") else ","
-    stream.seek(0)
-    signature = stream.read(4096)
-    stream.seek(0)
-    sample = signature.lstrip(b"\xef\xbb\xbf \t\r\n")
+    sample = _read_non_whitespace_prefix(stream)
     likely_json = sample.startswith(b'{"') or sample.startswith(b"[{")
     if sample.startswith((b"{", b"[")) and not likely_json:
         try:
@@ -408,7 +423,7 @@ def _read_delimited(
             )
         finally:
             stream.seek(0)
-    if b"\x00" in signature:
+    if b"\x00" in sample:
         _fail("content_mismatch", "The delimited-text file contains binary data.")
 
     text_stream = TextIOWrapper(stream, encoding="utf-8-sig", errors="strict", newline="")

@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 import pyarrow as pa
@@ -635,6 +636,29 @@ class PreprocessingOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.failure_step_id, "too_wide")
         self.assertIn("limit", result.error_description)
+        self.assertIsNone(result.final_table)
+
+    def test_input_resource_limits_are_checked_before_executor_dispatch(self):
+        executor = FixtureExecutor()
+        operation, _ = fixture_operation("da.fixture_1", executor)
+        operation = replace(
+            operation,
+            resource_limits={
+                **operation.resource_limits,
+                "max_rows": 1,
+            },
+        )
+        registry = TransformationRegistry(((operation, executor),))
+        step = PreprocessingStep("oversized_input", "da.fixture_1", {"value": 1})
+        result = orchestrate_preprocessing(
+            pa.table({"value": [1, 2]}),
+            [step],
+            approvals=approvals_for([step], registry),
+            registry=registry,
+        )
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.failure_step_id, "oversized_input")
+        self.assertEqual(executor.events, [])
         self.assertIsNone(result.final_table)
 
     def test_global_output_row_column_and_byte_limits_are_enforced(self):

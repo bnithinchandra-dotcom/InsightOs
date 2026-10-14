@@ -902,6 +902,8 @@ def _normalize_table(
     expected_digest = hashlib.sha256()
     expected_nulls = [0] * len(arrow_schema)
     expected_empty = [0] * len(arrow_schema)
+    logical_null_counts = [0] * len(arrow_schema)
+    logical_empty_counts = [0] * len(arrow_schema)
     row_count = 0
     writer = None
     output_budget = ExecutionBudget({"normalized_output_bytes": remaining_output_bytes})
@@ -922,6 +924,14 @@ def _normalize_table(
                             "invalid_source",
                             "A source row no longer matches its parsed column count.",
                         )
+                    if detected_format == "json":
+                        for index, value in enumerate(row):
+                            if encodings[index] != "tagged_json":
+                                continue
+                            if value is MISSING or value is None:
+                                logical_null_counts[index] += 1
+                            elif value == "":
+                                logical_empty_counts[index] += 1
                     current_rows.append(
                         [
                             _convert(value, encodings[index])
@@ -1017,6 +1027,8 @@ def _normalize_table(
             "column_count": validation["column_count"],
             "null_value_counts": validation["null_value_counts"],
             "empty_value_counts": validation["empty_value_counts"],
+            "logical_null_value_counts": logical_null_counts,
+            "logical_empty_value_counts": logical_empty_counts,
             "rows_sha256": validation["rows_sha256"],
             "validation_status": "passed",
             "warnings": warnings,
@@ -1565,6 +1577,14 @@ def validate_normalization_result(
                 raise ValueError("Normalized table metadata is inconsistent.")
             null_counts = table["null_value_counts"]
             empty_counts = table["empty_value_counts"]
+            logical_null_counts = table.get(
+                "logical_null_value_counts",
+                [0] * len(columns),
+            )
+            logical_empty_counts = table.get(
+                "logical_empty_value_counts",
+                [0] * len(columns),
+            )
             if (
                 not isinstance(null_counts, list)
                 or len(null_counts) != len(columns)
@@ -1581,6 +1601,30 @@ def validate_normalization_result(
                     or isinstance(value, bool)
                     or value < 0
                     for value in empty_counts
+                )
+                or not isinstance(logical_null_counts, list)
+                or len(logical_null_counts) != len(columns)
+                or any(
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 0
+                    for value in logical_null_counts
+                )
+                or not isinstance(logical_empty_counts, list)
+                or len(logical_empty_counts) != len(columns)
+                or any(
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 0
+                    for value in logical_empty_counts
+                )
+                or any(
+                    null_counts[position]
+                    + empty_counts[position]
+                    + logical_null_counts[position]
+                    + logical_empty_counts[position]
+                    > rows
+                    for position in range(len(columns))
                 )
             ):
                 raise ValueError("Normalized value counts are invalid.")
@@ -1739,6 +1783,8 @@ def normalize_file(
                             "column_count": 0,
                             "null_value_counts": [],
                             "empty_value_counts": [],
+                            "logical_null_value_counts": [],
+                            "logical_empty_value_counts": [],
                             "validation_status": "passed",
                             "warnings": [
                                 "Empty worksheet has no columns; its identity is retained in normalization metadata without a Parquet object."

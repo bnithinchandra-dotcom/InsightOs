@@ -1840,6 +1840,23 @@ class UploadFlowTests(unittest.TestCase):
         session.close()
         self.assertEqual(self.storage.objects, objects_before)
 
+    def test_dataset_deletion_conflicts_with_active_upload(self):
+        session = self.session_factory()
+        dataset = session.get(Dataset, self.dataset_id)
+        dataset.active_upload_key = "active-upload-key"
+        session.commit()
+        session.close()
+        original_objects = dict(self.storage.objects)
+
+        response = self.client.delete(f"/api/v1/datasets/{self.dataset_id}")
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "upload_in_progress")
+        self.assertEqual(self.storage.objects, original_objects)
+        session = self.session_factory()
+        self.assertIsNotNone(session.get(Dataset, self.dataset_id))
+        session.close()
+
     def test_dataset_deletion_conflicts_with_active_normalization(self):
         upload = self.client.post(
             f"/api/v1/datasets/{self.dataset_id}/files",

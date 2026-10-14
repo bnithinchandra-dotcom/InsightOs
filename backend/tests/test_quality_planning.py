@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 from app.quality_catalog import QUALITY_RULE_CATALOG_VERSION
 from app.quality_planning import QualityPlanningContext, plan_quality_rules
@@ -86,7 +87,7 @@ class QualityPlanningTests(unittest.TestCase):
         self.assertEqual(first, second)
         response = first.model_dump(mode="json")
         self.assertEqual(response["catalog_version"], QUALITY_RULE_CATALOG_VERSION)
-        self.assertEqual(response["catalog_version"], "3")
+        self.assertEqual(response["catalog_version"], "4")
         self.assertEqual(response["context"]["dataset_id"], 12)
         self.assertTrue(response["context"]["current_quality_report_available"])
         outlier = next(
@@ -104,6 +105,20 @@ class QualityPlanningTests(unittest.TestCase):
         )
         self.assertEqual(constant_columns["planning_status"], "ready")
         self.assertTrue(constant_columns["execution_supported"])
+
+    def test_exact_duplicate_scan_does_not_require_profile_duplicates(self):
+        context = replace(complete_context(), profile_result=None)
+        recommendation = next(
+            item
+            for item in plan_quality_rules(context).recommendations
+            if item.rule_id == "generic.exact_duplicate_rows"
+        )
+        self.assertEqual(recommendation.planning_status, "ready")
+        self.assertTrue(recommendation.execution_supported)
+        self.assertNotIn(
+            "validated exact duplicate profile",
+            recommendation.missing_context,
+        )
 
     def test_missing_normalization_context_blocks_applicable_rules(self):
         context = complete_context()

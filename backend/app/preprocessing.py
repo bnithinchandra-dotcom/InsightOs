@@ -3056,6 +3056,7 @@ def orchestrate_preprocessing(
         before_columns = working.num_columns
         phase = "fit"
         try:
+            _validate_table(working, prepared.operation)
             if prepared.operation.requires_fit:
                 context = prepared.fit_context
             else:
