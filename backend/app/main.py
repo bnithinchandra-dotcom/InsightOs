@@ -33,7 +33,16 @@ from app.jev import (
     policy_for,
     verify_claim,
 )
-from app.models import Dataset, DatasetFile, Project
+from app.models import Dataset, DatasetFile, EDAAnalysis, Project
+from app.eda import (
+    EDAConfiguration,
+    EDAError,
+    EDAResult,
+    analyze_normalized_file,
+    eda_configuration_from_dict,
+    _algorithm_version_for_analysis,
+)
+
 from app.normalization import (
     NormalizationError,
     get_normalization_configuration,
@@ -2310,6 +2319,38 @@ def normalize_dataset_file(dataset_id: int, file_id: int):
         )
 
         try:
+            eda_lock_id = _try_acquire_upload_lock(
+                session,
+                connection,
+                dataset_id,
+                f"eda:{file_id}",
+            )
+        except SQLAlchemyError as error:
+            logger.error(
+                "Could not reserve EDA lock during normalization of file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="EDA concurrency protection is unavailable.",
+            ) from None
+        if eda_lock_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "eda_in_progress",
+                    "message": "EDA is analyzing this file; retry normalization later.",
+                },
+            )
+        cleanup.callback(
+            _release_upload_lock,
+            session,
+            connection,
+            eda_lock_id,
+        )
+
+        try:
             dataset_file = (
                 session.query(DatasetFile)
                 .filter(
@@ -2964,6 +3005,618 @@ def get_dataset_file_quality_analysis(dataset_id: int, file_id: int):
         )
 
 
+def eda_analysis_key(
+    source_sha256: str,
+    table_index: int,
+    table_sha256: str,
+    configuration_sha256: str,
+    algorithm_version: str,
+) -> str:
+    raw = f"{source_sha256}:{table_index}:{table_sha256}:{configuration_sha256}:{algorithm_version}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _assess_verified_eda_input_lineage(
+    provenance: dict,
+    *,
+    dataset_id: int,
+    file_id: int,
+    source_sha256: str,
+    source_size_bytes: int,
+    table: dict,
+    table_index: int,
+    schema: list[dict[str, str]] | None,
+) -> VerificationAssessment:
+    verified_inputs = [
+        {
+            "kind": "source",
+            "dataset_id": dataset_id,
+            "file_id": file_id,
+            "sha256": source_sha256,
+            "size_bytes": source_size_bytes,
+        },
+        {
+            "kind": "normalized_parquet",
+            "dataset_id": dataset_id,
+            "file_id": file_id,
+            "table_index": table_index,
+            "object_key": table.get("object_key"),
+            "sha256": table.get("sha256"),
+            "size_bytes": table.get("file_size_bytes"),
+            "schema_sha256": (
+                schema_fingerprint(schema)
+                if isinstance(schema, list)
+                else None
+            ),
+        },
+    ]
+    claimed_inputs = provenance.get("inputs") if isinstance(provenance, dict) else None
+    evidence = evidence_for(
+        claimed_inputs,
+        verified_inputs,
+        reference="eda-lineage:verified-object-readback",
+    )
+    budget = ExecutionBudget(
+        {
+            "jev_checks": 1,
+            "jev_evidence_bytes": 16 * 1024,
+        }
+    )
+    return verify_claim(
+        claimed_inputs,
+        evidence,
+        policy_for("schema"),
+        budget=budget,
+    )
+
+
+def _log_internal_eda_lineage_assessment(
+    provenance: dict,
+    *,
+    dataset_id: int,
+    file_id: int,
+    source_sha256: str,
+    source_size_bytes: int,
+    table: dict,
+    table_index: int,
+    schema: list[dict[str, str]] | None,
+) -> None:
+    try:
+        assessment = _assess_verified_eda_input_lineage(
+            provenance,
+            dataset_id=dataset_id,
+            file_id=file_id,
+            source_sha256=source_sha256,
+            source_size_bytes=source_size_bytes,
+            table=table,
+            table_index=table_index,
+            schema=schema,
+        )
+    except (TypeError, ValueError, OverflowError) as error:
+        logger.warning(
+            "Internal EDA lineage assessment unavailable for file %s (%s)",
+            file_id,
+            type(error).__name__,
+        )
+        return
+    if assessment.status != "verified":
+        logger.warning(
+            "Internal EDA lineage assessment did not verify for file %s (%s)",
+            file_id,
+            assessment.reason_code,
+        )
+
+
+def _eda_analysis_response(record: EDAAnalysis) -> dict:
+    return {
+        "id": record.id,
+        "dataset_id": record.dataset_id,
+        "file_id": record.file_id,
+        "table_index": record.table_index,
+        "analysis_type": record.analysis_type,
+        "status": record.status,
+        "analysis_key": record.analysis_key,
+        "configuration": record.configuration,
+        "configuration_sha256": record.configuration_sha256,
+        "result": record.result,
+        "provenance": record.provenance,
+        "error": (
+            {
+                "code": record.error_code,
+                "message": record.error_message,
+            }
+            if record.error_code is not None
+            else None
+        ),
+        "started_at": record.started_at.isoformat() if record.started_at else None,
+        "completed_at": record.completed_at.isoformat() if record.completed_at else None,
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+        "updated_at": record.updated_at.isoformat() if record.updated_at else None,
+    }
+
+
+def _eda_analysis_summary(record: EDAAnalysis) -> dict:
+    return {
+        "id": record.id,
+        "dataset_id": record.dataset_id,
+        "file_id": record.file_id,
+        "table_index": record.table_index,
+        "analysis_type": record.analysis_type,
+        "status": record.status,
+        "analysis_key": record.analysis_key,
+        "configuration": record.configuration,
+        "error": (
+            {
+                "code": record.error_code,
+                "message": record.error_message,
+            }
+            if record.error_code is not None
+            else None
+        ),
+        "started_at": record.started_at.isoformat() if record.started_at else None,
+        "completed_at": record.completed_at.isoformat() if record.completed_at else None,
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+        "updated_at": record.updated_at.isoformat() if record.updated_at else None,
+    }
+
+
+@app.post("/api/v1/datasets/{dataset_id}/files/{file_id}/eda")
+def analyze_dataset_file_eda(
+    dataset_id: int,
+    file_id: int,
+    request: dict = Body(default_factory=dict),
+    recompute: bool = False,
+):
+    recompute = recompute or bool(request.get("recompute", False))
+    config_payload = {k: v for k, v in request.items() if k != "recompute"}
+    try:
+        configuration = eda_configuration_from_dict(config_payload)
+    except EDAError as error:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": error.code, "message": error.message},
+        ) from None
+
+    with _pinned_upload_session() as (session, connection), ExitStack() as cleanup:
+        try:
+            dataset = session.get(Dataset, dataset_id)
+            if dataset is None:
+                raise HTTPException(status_code=404, detail="Dataset not found.")
+            dataset_file = (
+                session.query(DatasetFile)
+                .filter(
+                    DatasetFile.id == file_id,
+                    DatasetFile.dataset_id == dataset_id,
+                )
+                .one_or_none()
+            )
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            logger.error(
+                "EDA file lookup failed for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Dataset file could not be checked for EDA.",
+            ) from None
+
+        if dataset_file is None:
+            raise HTTPException(status_code=404, detail="Dataset file not found.")
+        if dataset_file.status != "Ready":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "file_not_ready",
+                    "message": "EDA requires successful file ingestion.",
+                    "status": dataset_file.status,
+                },
+            )
+        if dataset_file.normalization_status != "Ready":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalization_unavailable",
+                    "message": "EDA requires ready normalized output.",
+                    "status": dataset_file.normalization_status,
+                },
+            )
+        if (
+            not dataset_file.checksum
+            or not dataset_file.parsing_result
+            or not isinstance(dataset_file.normalization_result, dict)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "analysis_provenance_unavailable",
+                    "message": "Validated source and normalized metadata are required.",
+                },
+            )
+
+        try:
+            eda_lock_id = _try_acquire_upload_lock(
+                session,
+                connection,
+                dataset_id,
+                f"eda:{file_id}",
+            )
+        except SQLAlchemyError as error:
+            logger.error(
+                "Could not reserve EDA for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="EDA concurrency protection is unavailable.",
+            ) from None
+        if eda_lock_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "eda_in_progress",
+                    "message": "EDA is already in progress for this file.",
+                },
+            )
+        cleanup.callback(_release_upload_lock, session, connection, eda_lock_id)
+
+        try:
+            norm_lock_id = _try_acquire_upload_lock(
+                session,
+                connection,
+                dataset_id,
+                f"normalization:{file_id}",
+            )
+        except SQLAlchemyError as error:
+            logger.error(
+                "Could not check normalization lock for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Normalization concurrency protection is unavailable.",
+            ) from None
+        if norm_lock_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalization_in_progress",
+                    "message": "Normalization is using this file; retry EDA later.",
+                },
+            )
+        cleanup.callback(_release_upload_lock, session, connection, norm_lock_id)
+
+        try:
+            normalized = validate_normalization_result(
+                dataset_file.normalization_result,
+                dataset_file.parsing_result,
+                dataset_file.filename,
+                dataset_file.file_size_bytes,
+                dataset_file.checksum,
+                dataset_id,
+                file_id,
+            )
+        except NormalizationError as error:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalized_output_invalid",
+                    "message": "Stored normalized output metadata failed validation.",
+                },
+            ) from error
+
+        tables = normalized["tables"]
+        if configuration.table_index >= len(tables):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "unknown_table",
+                    "message": "Selected normalized table does not exist.",
+                },
+            )
+        selected_table = tables[configuration.table_index]
+        if not selected_table.get("sha256"):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "artifact_unavailable",
+                    "message": "Selected normalized table has no verified checksum.",
+                },
+            )
+
+        storage = get_storage_client()
+        raw_bucket = getenv("MINIO_RAW_BUCKET", "insightos-raw")
+        processed_bucket = getenv("MINIO_PROCESSED_BUCKET", "insightos-processed")
+
+        if not _verify_stored_object(storage, raw_bucket, dataset_file):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "source_integrity_failed",
+                    "message": "Stored source data failed integrity verification.",
+                },
+            )
+
+        normalized_verification = verify_normalization_result_detailed(
+            storage,
+            processed_bucket,
+            normalized,
+        )
+        if normalized_verification["status"] != "verified":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": f"normalized_output_{normalized_verification['status']}",
+                    "message": "Stored normalized output could not be verified as intact.",
+                },
+            )
+
+        algorithm_version = _algorithm_version_for_analysis(configuration.analysis_type)
+        configuration_dict = configuration.as_dict()
+        configuration_sha256 = hashlib.sha256(
+            json.dumps(
+                configuration_dict,
+                allow_nan=False,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        analysis_key = eda_analysis_key(
+            dataset_file.checksum,
+            configuration.table_index,
+            selected_table["sha256"],
+            configuration_sha256,
+            algorithm_version,
+        )
+
+        existing_record = (
+            session.query(EDAAnalysis)
+            .filter(
+                EDAAnalysis.file_id == file_id,
+                EDAAnalysis.analysis_key == analysis_key,
+            )
+            .one_or_none()
+        )
+
+        if (
+            not recompute
+            and existing_record is not None
+            and existing_record.status in ("Completed", "PartiallyCompleted")
+            and isinstance(existing_record.result, dict)
+        ):
+            _log_internal_eda_lineage_assessment(
+                existing_record.provenance or {},
+                dataset_id=dataset_id,
+                file_id=file_id,
+                source_sha256=dataset_file.checksum,
+                source_size_bytes=dataset_file.file_size_bytes,
+                table=selected_table,
+                table_index=configuration.table_index,
+                schema=selected_table.get("schema"),
+            )
+            return _eda_analysis_response(existing_record)
+
+        started_at = datetime.now(timezone.utc)
+        if existing_record is None:
+            record = EDAAnalysis(
+                dataset_id=dataset_id,
+                file_id=file_id,
+                table_index=configuration.table_index,
+                analysis_type=configuration.analysis_type,
+                analysis_key=analysis_key,
+                status="Running",
+                configuration=configuration_dict,
+                configuration_sha256=configuration_sha256,
+                started_at=started_at,
+            )
+            session.add(record)
+        else:
+            record = existing_record
+            record.status = "Running"
+            record.started_at = started_at
+            record.completed_at = None
+            record.error_code = None
+            record.error_message = None
+            record.result = None
+            record.provenance = None
+        session.commit()
+
+        try:
+            eda_result = analyze_normalized_file(
+                storage=storage,
+                processed_bucket=processed_bucket,
+                dataset_id=dataset_id,
+                file_id=file_id,
+                file_status=dataset_file.status,
+                normalization_status=dataset_file.normalization_status,
+                source_filename=dataset_file.filename,
+                source_size_bytes=dataset_file.file_size_bytes,
+                source_sha256=dataset_file.checksum,
+                parsed_result=dataset_file.parsing_result,
+                normalization_result=normalized,
+                configuration=configuration,
+                profile_result=dataset_file.profile_result,
+                quality_report=dataset_file.quality_report,
+            )
+        except EDAError as error:
+            record.status = "Failed"
+            record.error_code = error.code
+            record.error_message = error.message
+            record.completed_at = datetime.now(timezone.utc)
+            session.commit()
+            status_code = (
+                422
+                if error.code in ("row_limit", "result_size_limit", "artifact_size_limit")
+                else 400
+            )
+            raise HTTPException(
+                status_code=status_code,
+                detail={"code": error.code, "message": error.message},
+            ) from None
+        except Exception as error:
+            record.status = "Failed"
+            record.error_code = "analysis_failed"
+            record.error_message = "EDA analysis failed unexpectedly."
+            record.completed_at = datetime.now(timezone.utc)
+            session.commit()
+            logger.error(
+                "EDA analysis execution failed for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "analysis_failed",
+                    "message": "EDA analysis failed unexpectedly.",
+                },
+            ) from None
+
+        result_dict = eda_result.as_dict()
+        if eda_result.status == "failed":
+            record.status = "Failed"
+            record.error_code = (
+                eda_result.failure.code
+                if eda_result.failure
+                else "analysis_failed"
+            )
+            record.error_message = (
+                eda_result.failure.message
+                if eda_result.failure
+                else "EDA analysis failed."
+            )
+        elif eda_result.status == "partially_completed":
+            record.status = "PartiallyCompleted"
+            record.error_code = None
+            record.error_message = None
+        else:
+            record.status = "Completed"
+            record.error_code = None
+            record.error_message = None
+
+        record.result = result_dict
+        record.provenance = eda_result.provenance
+        record.completed_at = datetime.now(timezone.utc)
+        session.commit()
+
+        if record.status != "Failed":
+            _log_internal_eda_lineage_assessment(
+                record.provenance or {},
+                dataset_id=dataset_id,
+                file_id=file_id,
+                source_sha256=dataset_file.checksum,
+                source_size_bytes=dataset_file.file_size_bytes,
+                table=selected_table,
+                table_index=configuration.table_index,
+                schema=selected_table.get("schema"),
+            )
+
+        return _eda_analysis_response(record)
+
+
+@app.get("/api/v1/datasets/{dataset_id}/files/{file_id}/eda")
+def list_dataset_file_eda_analyses(
+    dataset_id: int,
+    file_id: int,
+    limit: int = 50,
+    offset: int = 0,
+    analysis_type: str | None = None,
+    table_index: int | None = None,
+):
+    if limit < 1 or limit > 100:
+        raise HTTPException(
+            status_code=422,
+            detail="limit must be between 1 and 100.",
+        )
+    if offset < 0:
+        raise HTTPException(
+            status_code=422,
+            detail="offset must be greater than or equal to 0.",
+        )
+    with SessionLocal() as session:
+        dataset = session.get(Dataset, dataset_id)
+        if dataset is None:
+            raise HTTPException(status_code=404, detail="Dataset not found.")
+        dataset_file = (
+            session.query(DatasetFile)
+            .filter(
+                DatasetFile.id == file_id,
+                DatasetFile.dataset_id == dataset_id,
+            )
+            .one_or_none()
+        )
+        if dataset_file is None:
+            raise HTTPException(status_code=404, detail="Dataset file not found.")
+
+        query = session.query(EDAAnalysis).filter(
+            EDAAnalysis.dataset_id == dataset_id,
+            EDAAnalysis.file_id == file_id,
+        )
+        if analysis_type is not None:
+            query = query.filter(EDAAnalysis.analysis_type == analysis_type)
+        if table_index is not None:
+            query = query.filter(EDAAnalysis.table_index == table_index)
+
+        total = query.count()
+        records = (
+            query.order_by(EDAAnalysis.id.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        return {
+            "dataset_id": dataset_id,
+            "file_id": file_id,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "items": [_eda_analysis_summary(record) for record in records],
+        }
+
+
+@app.get("/api/v1/datasets/{dataset_id}/files/{file_id}/eda/{analysis_id}")
+def get_dataset_file_eda_analysis(
+    dataset_id: int,
+    file_id: int,
+    analysis_id: int,
+):
+    with SessionLocal() as session:
+        dataset = session.get(Dataset, dataset_id)
+        if dataset is None:
+            raise HTTPException(status_code=404, detail="Dataset not found.")
+        dataset_file = (
+            session.query(DatasetFile)
+            .filter(
+                DatasetFile.id == file_id,
+                DatasetFile.dataset_id == dataset_id,
+            )
+            .one_or_none()
+        )
+        if dataset_file is None:
+            raise HTTPException(status_code=404, detail="Dataset file not found.")
+
+        record = (
+            session.query(EDAAnalysis)
+            .filter(
+                EDAAnalysis.id == analysis_id,
+                EDAAnalysis.dataset_id == dataset_id,
+                EDAAnalysis.file_id == file_id,
+            )
+            .one_or_none()
+        )
+        if record is None:
+            raise HTTPException(status_code=404, detail="EDA analysis not found.")
+
+        return _eda_analysis_response(record)
+
+
+
 def _remove_dataset_objects(storage, bucket: str, dataset_id: int) -> list:
     if not storage.bucket_exists(bucket):
         return []
@@ -3029,7 +3682,7 @@ def delete_dataset(dataset_id: int):
                 )
             ]
             for file_id in file_ids:
-                for operation in ("normalization", "quality-analysis"):
+                for operation in ("normalization", "quality-analysis", "eda"):
                     lock_id = _try_acquire_upload_lock(
                         session,
                         connection,
@@ -3044,6 +3697,17 @@ def delete_dataset(dataset_id: int):
                                     "code": "quality_analysis_in_progress",
                                     "message": (
                                         "A dataset file is being analyzed; retry "
+                                        "dataset deletion after it finishes."
+                                    ),
+                                },
+                            )
+                        if operation == "eda":
+                            raise HTTPException(
+                                status_code=409,
+                                detail={
+                                    "code": "eda_in_progress",
+                                    "message": (
+                                        "A dataset file is undergoing EDA; retry "
                                         "dataset deletion after it finishes."
                                     ),
                                 },

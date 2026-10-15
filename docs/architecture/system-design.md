@@ -25,9 +25,9 @@ supported targets.
 
 The current Compose development stack contains FastAPI, PostgreSQL, Redis,
 MinIO, a React shell outside Compose, and a worker process. The worker connects
-to Redis and idles; it does not consume jobs. Upload, normalization, and quality
-analysis execute synchronously in API requests. Preprocessing and EDA are
-Python-library/service entry points and are not wired into the API or UI.
+to Redis and idles; it does not consume jobs. Upload, normalization, quality analysis, and EDA execute synchronously in
+API requests. Preprocessing is a Python-library entry point and is not wired into
+the API or UI; UI integration for data analysis workflows remains planned.
 
 Compose-published API and infrastructure ports bind to `127.0.0.1`. The API
 does not implement authentication, authorization, or project ownership checks.
@@ -59,16 +59,20 @@ Client upload
   -> checksum/schema/count validation and normalization metadata in PostgreSQL
   -> quality rules scan verified temporary Parquet copies; report in PostgreSQL
 
+API callers
+  -> EDA on selected, verified normalized Parquet; execution records and bounded
+     results persisted in PostgreSQL
+
 Library callers
   -> preprocessing on caller-supplied Arrow tables; output remains in memory
-  -> EDA on selected, verified normalized Parquet; typed result returned to caller
 ```
 
 The uploaded object remains the source of truth. Normalization does not
 overwrite it. Quality analysis and EDA use normalized output only after
 normalization metadata and artifact checksums have been verified. EDA recomputes
 statistics from the normalized artifact rather than treating the earlier
-profile as artifact-bound statistics. EDA results and preprocessing outputs
+profile as artifact-bound statistics. EDA results are persisted in `eda_analyses`
+execution records with version 1 provenance envelopes. Preprocessing outputs
 currently have no persisted execution-history lifecycle.
 
 For JSON columns that require reversible tagged text to distinguish a missing
@@ -234,7 +238,7 @@ backend, and the health check does not mutate storage.
 | Normalization | **Partial** | `normalize_file` hashes and reparses the source, builds normalized Parquet per logical table, validates rows/schema/nulls and stores checksummed objects. | Output defaults to 600 MiB, written in batches. A raw Arrow batch-size estimate is checked before each batch; a write-through reservation enforces the exact resulting temporary Parquet file length, including footer bytes, before writes. Result metadata includes versioned source/configuration/output provenance. Temporary files are removed on success and failure. This is an output-file length cap, not a process-memory or filesystem-allocation quota. |
 | Quality analysis | **Partial** | API validates normalized artifacts, downloads verified local copies, runs deterministic registered rules, and persists versioned provenance-bound reports. | 600 MiB normalized-input cap, 4 MiB rule-tracking memory cap, shared comparison budget, bounded findings/examples/report serialization. `RuleBudget` delegates its counters to `ExecutionBudget` while preserving quality-specific units and exhaustion semantics. Additive report provenance preserves legacy report validation and the existing deterministic analysis key. Real PostgreSQL advisory locking and MinIO integration are not established by unit tests in this checkout. |
 | Preprocessing | **Partial** | `DEFAULT_TRANSFORMATION_REGISTRY` and `orchestrate_preprocessing` run explicit DA/BA transforms on Arrow tables; business-semantic operations require explicit approvals. | Input cap 64 MiB Arrow buffers, 1,000,000 rows, 256 columns. Python-string estimates are checked before whole-column conversions and share the byte ceiling across selected columns/chunks. Input/output Arrow IPC fingerprints and ordered per-step provenance are returned in memory. This adds bounded full-table passes; it is not streaming or a process-wide memory bound. Output is not persisted; no API. |
-| EDA | **Partial** | `analyze_normalized_file` performs univariate, bivariate and multivariate deterministic analysis on a selected verified normalized table. | Defaults/caps include 1,000,000 rows, 600 MiB selected-column scan metadata, 250,000 numeric values, 50,000 categories, 250,000 grouped values, 50,000 contingency cells, 4,000,000 pairwise work units, 128 MiB estimated decoded strings, and configured result serialization up to 1 MiB. Result provenance is returned but not persisted; no API/history/UI. |
+| EDA | **Partial** | FastAPI routes in `backend/app/main.py` (`POST /api/v1/datasets/{dataset_id}/files/{file_id}/eda`, `GET .../eda`, `GET .../eda/{analysis_id}`); deterministic univariate, bivariate, and multivariate analysis of verified normalized Parquet; PostgreSQL persistence in `eda_analyses` with idempotency, version 1 provenance envelope, and backend-only JEV lineage verification. | Defaults/caps include 1,000,000 rows, 600 MiB selected-column scan metadata, 250,000 numeric values, 50,000 categories, 250,000 grouped values, 50,000 contingency cells, 4,000,000 pairwise work units, 128 MiB estimated decoded strings, and configured result serialization up to 1 MiB. Result records are persisted with bounded pagination (limit 1-100); UI integration remains planned. |
 | Frontend | **Partial** | React shell and system-health view. | API client currently calls only health and system-info; dataset and analysis workflows are not connected. |
 | Worker/queue | **Planned** | Worker starts, checks Redis, and idles. | No queue consumer, task contract, retries, or execution-budget propagation. |
 | Schema modeling, agents, semantic layer, NL analytics, ML, monitoring, governance | **Planned** | Product roadmap only. | No claims of implementation until code and tests establish them. |
@@ -316,7 +320,7 @@ authentication boundary, or remote deployment profile.
 | Ingestion and storage | **Partial** |
 | Profiling, normalization, quality | **Partial** |
 | Preprocessing | **Partial; in-memory library** |
-| EDA | **Partial; service-level library** |
+| EDA (Stage 3.7 API & persistence) | **Partial; API and PostgreSQL persistence implemented, UI planned** |
 | Model/schema design, semantic layer, agents, NL-BI, ML, monitoring, governance, production deployment | **Planned** |
 
 The historical phase sequence is retained in the root README. Stage completion

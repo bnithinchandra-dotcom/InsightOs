@@ -140,6 +140,46 @@ class PostgresMinioFlowTests(unittest.TestCase):
         finally:
             session.close()
 
+        eda_response = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/eda",
+            json={
+                "analysis_type": "univariate",
+                "table_index": 0,
+                "selected_columns": ["code", "value"],
+            },
+        )
+        self.assertEqual(eda_response.status_code, 200, eda_response.text)
+        eda_body = eda_response.json()
+        self.assertEqual(eda_body["status"], "Completed")
+        self.assertEqual(eda_body["analysis_type"], "univariate")
+        eda_id = eda_body["id"]
+        eda_provenance = eda_body["provenance"]
+        self.assertEqual(
+            eda_provenance["parent_operation_ids"],
+            [normalization_provenance["operation_id"]],
+        )
+
+        eda_get = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/eda/{eda_id}"
+        )
+        self.assertEqual(eda_get.status_code, 200, eda_get.text)
+        self.assertEqual(eda_get.json()["id"], eda_id)
+
+        eda_list = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/eda"
+        )
+        self.assertEqual(eda_list.status_code, 200, eda_list.text)
+        self.assertEqual(eda_list.json()["total"], 1)
+        self.assertEqual(eda_list.json()["items"][0]["id"], eda_id)
+
+        session = main.SessionLocal()
+        try:
+            eda_record = session.get(main.EDAAnalysis, eda_id)
+            self.assertIsNotNone(eda_record)
+            self.assertEqual(eda_record.status, "Completed")
+        finally:
+            session.close()
+
 
 if __name__ == "__main__":
     unittest.main()

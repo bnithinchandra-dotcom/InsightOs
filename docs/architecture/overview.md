@@ -15,11 +15,10 @@ FastAPI API ---- PostgreSQL metadata
     |             Redis connectivity (no job consumer)
     +----------- MinIO raw and normalized artifacts
     |
-    +-- synchronous upload, normalization, and quality-analysis requests
+    +-- synchronous upload, normalization, quality-analysis, and EDA requests
 
 Python libraries:
     Arrow preprocessing (in-memory)
-    EDA over verified normalized Parquet (service-level)
 ```
 
 The Compose development ports bind to localhost. The API has no

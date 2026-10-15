@@ -21,8 +21,9 @@ the [system architecture](docs/architecture/system-design.md).
   approval gates and bounded in-memory lineage metadata; no API or persisted
   transformation output.
 - **EDA:** deterministic univariate, bivariate, and multivariate analysis of
-  verified normalized Parquet, exposed as a Python service; no HTTP endpoint or
-  persisted analysis history.
+  verified normalized Parquet, exposed through FastAPI endpoints (`POST /api/v1/datasets/{dataset_id}/files/{file_id}/eda`,
+  `GET .../eda`, `GET .../eda/{analysis_id}`) with execution persistence in PostgreSQL;
+  UI integration remains planned.
 - **Frontend:** a React application shell that currently displays health and
   system information; data workflows are not wired into the UI.
 - **Worker:** a Redis connectivity process only. It does not consume or execute
@@ -56,7 +57,7 @@ is a short navigation document. Operation contracts remain in:
 | 2. Ingestion and storage | Partial | Six file formats and raw-object lifecycle; ZIP, folders, database sources, and asynchronous ingestion are not implemented. |
 | 3. Profiling and quality | Partial | Profiles, normalization, and deterministic quality rules/reports exist; broader interactive workflows remain planned. |
 | 3.6. Preprocessing | Partial | Arrow-table transformation registry and orchestration exist as a library; no persisted or API workflow. |
-| EDA | Partial | Bivariate/multivariate and univariate EDA services exist; no API, UI, or execution-history persistence. |
+| 3.7. EDA API and persistence | Partial | Deterministic univariate, bivariate, and multivariate EDA API routes with PostgreSQL execution records, idempotency, and version 1 provenance; frontend integration remains planned. |
 | 4-13. Modeling, agents, BI, ML, monitoring, governance, production | Planned | Do not treat roadmap descriptions as implemented capabilities. |
 
 ## Python versions
