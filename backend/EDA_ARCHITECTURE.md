@@ -188,7 +188,7 @@ execution history in PostgreSQL:
   Validates resource ownership within the local-workspace model, rejects
   missing files (404), unready normalization (409), deletion conflicts (409),
   concurrent in-progress executions on the same file (409 `eda_in_progress`),
-  and malformed configurations (422).
+  and malformed configurations (400).
   Returns HTTP 200 with the full persisted analysis record and bounded payload.
 - `GET /api/v1/datasets/{dataset_id}/files/{file_id}/eda`
   Lists persisted analyses with bounded pagination (`limit` 1–100, default 20;
@@ -204,7 +204,8 @@ execution history in PostgreSQL:
 - `id`: integer primary key (`autoincrement`).
 - `dataset_id`, `file_id`: non-null integer foreign keys referencing `datasets(id)`
   and `dataset_files(id)` with cascading delete.
-- `status`: non-null string (`Running`, `Completed`, `Failed`).
+- `status`: non-null string constrained to `Requested`, `Running`, `Completed`,
+  `PartiallyCompleted`, or `Failed`.
 - `analysis_type`: non-null string (`univariate`, `bivariate`, `multivariate`).
 - `table_index`: non-null integer.
 - `analysis_key`: non-null string (64-character hex SHA-256) binding the normalized
@@ -213,10 +214,12 @@ execution history in PostgreSQL:
 - `result`: nullable JSON dictionary containing the bounded `EDAResult`.
 - `provenance`: nullable JSON dictionary holding the version 1 provenance envelope.
 - `error_code`, `error_message`: nullable strings holding sanitized failure codes.
-- `created_at`, `updated_at`, `completed_at`: non-null UTC timestamps.
+- `created_at`, `updated_at`: non-null timestamps.
+- `started_at`, `completed_at`: nullable timestamps; `completed_at` is unset
+  until execution finishes.
 - Constraints: `uq_eda_analyses_file_key` on `(file_id, analysis_key)` prevents
-  conflicting concurrent successful records. Indexes on `(file_id, status)` and
-  `(dataset_id, file_id)` optimize listing queries.
+  duplicate analysis keys for a file. Separate indexes on `dataset_id`,
+  `file_id`, and `analysis_key` support lookup and listing queries.
 
 ### Idempotency and Cache Replay
 
