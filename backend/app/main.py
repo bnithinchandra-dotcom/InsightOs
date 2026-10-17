@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import logging
@@ -5,6 +6,7 @@ import math
 import os
 import re
 import tempfile
+from pathlib import Path
 from threading import Lock
 from typing import Literal
 import unicodedata
@@ -14,11 +16,13 @@ from email.message import Message
 from os import getenv
 
 from fastapi import Body, FastAPI, File, Header, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from minio import Minio
 from minio.deleteobjects import DeleteObject
 from minio.error import MinioException, S3Error
 from pydantic import BaseModel, Field
+import pyarrow as pa
+import pyarrow.parquet as pq
 import sqlalchemy as sa
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -33,7 +37,13 @@ from app.jev import (
     policy_for,
     verify_claim,
 )
-from app.models import Dataset, DatasetFile, EDAAnalysis, Project
+from app.models import (
+    Dataset,
+    DatasetFile,
+    EDAAnalysis,
+    PreprocessingExecution,
+    Project,
+)
 from app.eda import (
     EDAConfiguration,
     EDAError,
@@ -44,6 +54,7 @@ from app.eda import (
 )
 
 from app.normalization import (
+    DEFAULT_MAX_OUTPUT_BYTES,
     NormalizationError,
     get_normalization_configuration,
     normalize_file,
@@ -55,6 +66,19 @@ from app.parsing import (
     ParserConfigurationError,
     ParsingError,
     parse_dataset_file,
+)
+from app.preprocessing import (
+    DEFAULT_TRANSFORMATION_REGISTRY,
+    PreprocessingApproval,
+    PreprocessingOrchestrationError,
+    PreprocessingResult,
+    PreprocessingStep,
+    TransformationOperation,
+    TransformationRegistryError,
+    arrow_table_fingerprint,
+    canonical_sha256,
+    orchestrate_preprocessing,
+    _validate_orchestration_table,
 )
 from app.provenance import schema_fingerprint
 from app.quality_analysis import (
@@ -2351,6 +2375,38 @@ def normalize_dataset_file(dataset_id: int, file_id: int):
         )
 
         try:
+            preprocessing_lock_id = _try_acquire_upload_lock(
+                session,
+                connection,
+                dataset_id,
+                f"preprocessing:{file_id}",
+            )
+        except SQLAlchemyError as error:
+            logger.error(
+                "Could not reserve preprocessing lock during normalization of file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Preprocessing concurrency protection is unavailable.",
+            ) from None
+        if preprocessing_lock_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "preprocessing_in_progress",
+                    "message": "Preprocessing is analyzing this file; retry normalization later.",
+                },
+            )
+        cleanup.callback(
+            _release_upload_lock,
+            session,
+            connection,
+            preprocessing_lock_id,
+        )
+
+        try:
             dataset_file = (
                 session.query(DatasetFile)
                 .filter(
@@ -3616,6 +3672,1082 @@ def get_dataset_file_eda_analysis(
         return _eda_analysis_response(record)
 
 
+# =============================================================================
+# Stage 3.8: Preprocessing Execution, Derived Artifacts, and Provenance
+# =============================================================================
+
+def _validate_preprocessing_step(step_dict: Any) -> PreprocessingStep:
+    if not isinstance(step_dict, dict):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_plan", "message": "Each preprocessing step must be an object."},
+        )
+    allowed = {"step_id", "operation_id", "configuration", "fit_context"}
+    if set(step_dict) - allowed:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_configuration", "message": "Preprocessing step has unsupported fields."},
+        )
+    step_id = step_dict.get("step_id")
+    if not isinstance(step_id, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", step_id):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_step_id", "message": "Step ID must be 1-64 alphanumeric, dash, or underscore characters."},
+        )
+    operation_id = step_dict.get("operation_id")
+    if not isinstance(operation_id, str) or not operation_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_operation_id", "message": "Operation ID must be a non-empty string."},
+        )
+    config = step_dict.get("configuration")
+    if config is not None and not isinstance(config, dict):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_configuration", "message": "Step configuration must be an object."},
+        )
+    fit_context = step_dict.get("fit_context")
+    if fit_context is not None and not isinstance(fit_context, dict):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_fit_context", "message": "Fitted context must be an object."},
+        )
+    return PreprocessingStep(
+        step_id=step_id,
+        operation_id=operation_id,
+        configuration=config,
+        fit_context=fit_context,
+    )
+
+
+def _validate_preprocessing_approval(approval_dict: Any) -> PreprocessingApproval:
+    if not isinstance(approval_dict, dict):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_approval", "message": "Each approval record must be an object."},
+        )
+    allowed = {"step_id", "operation_id", "configuration", "approved_approvals"}
+    if set(approval_dict) - allowed:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_configuration", "message": "Preprocessing approval has unsupported fields."},
+        )
+    step_id = approval_dict.get("step_id")
+    if not isinstance(step_id, str) or not step_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_step_id", "message": "Approval step ID must be a non-empty string."},
+        )
+    operation_id = approval_dict.get("operation_id")
+    if not isinstance(operation_id, str) or not operation_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_operation_id", "message": "Approval operation ID must be a non-empty string."},
+        )
+    config = approval_dict.get("configuration")
+    if config is not None and not isinstance(config, dict):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_configuration", "message": "Approval configuration must be an object."},
+        )
+    tokens = approval_dict.get("approved_approvals", ())
+    if not isinstance(tokens, (list, tuple)) or not all(isinstance(t, str) for t in tokens):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_approvals", "message": "Approved approvals must be a list of string tokens."},
+        )
+    return PreprocessingApproval(
+        step_id=step_id,
+        operation_id=operation_id,
+        configuration=config,
+        approved_approvals=tuple(tokens),
+    )
+
+
+def _preprocessing_plan_sha256(raw_steps: list[dict], raw_approvals: list[dict]) -> str:
+    canonical = {
+        "steps": [
+            {
+                "step_id": s["step_id"],
+                "operation_id": s["operation_id"],
+                "configuration": s.get("configuration") or {},
+                "has_fit_context": bool(s.get("fit_context")),
+            }
+            for s in raw_steps
+        ],
+        "approvals": [
+            {
+                "step_id": a["step_id"],
+                "operation_id": a["operation_id"],
+                "configuration": a.get("configuration") or {},
+                "approved_approvals": sorted(a.get("approved_approvals") or []),
+            }
+            for a in raw_approvals
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(
+            canonical,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _preprocessing_execution_key(
+    source_sha256: str,
+    table_index: int,
+    normalized_table_sha256: str,
+    plan_sha256: str,
+    engine_version: str = "1",
+) -> str:
+    raw = f"{source_sha256}:{table_index}:{normalized_table_sha256}:{plan_sha256}:{engine_version}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _preprocessing_execution_response(record: PreprocessingExecution) -> dict:
+    return {
+        "id": record.id,
+        "dataset_id": record.dataset_id,
+        "file_id": record.file_id,
+        "table_index": record.table_index,
+        "execution_key": record.execution_key,
+        "status": record.status,
+        "plan": record.plan,
+        "artifact": (
+            {
+                "storage_key": record.artifact_storage_key,
+                "sha256": record.artifact_sha256,
+                "size_bytes": record.artifact_size_bytes,
+                "rows": record.artifact_rows,
+                "columns": record.artifact_columns,
+            }
+            if record.artifact_storage_key is not None
+            else None
+        ),
+        "result_summary": record.result_summary,
+        "provenance": record.provenance,
+        "error": (
+            {
+                "code": record.error_code,
+                "message": record.error_message,
+            }
+            if record.error_code is not None
+            else None
+        ),
+        "started_at": record.started_at.isoformat() if record.started_at else None,
+        "completed_at": record.completed_at.isoformat() if record.completed_at else None,
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+        "updated_at": record.updated_at.isoformat() if record.updated_at else None,
+    }
+
+
+def _preprocessing_summary_response(record: PreprocessingExecution) -> dict:
+    return {
+        "id": record.id,
+        "dataset_id": record.dataset_id,
+        "file_id": record.file_id,
+        "table_index": record.table_index,
+        "execution_key": record.execution_key,
+        "status": record.status,
+        "artifact": (
+            {
+                "storage_key": record.artifact_storage_key,
+                "sha256": record.artifact_sha256,
+                "size_bytes": record.artifact_size_bytes,
+                "rows": record.artifact_rows,
+                "columns": record.artifact_columns,
+            }
+            if record.artifact_storage_key is not None
+            else None
+        ),
+        "error": (
+            {
+                "code": record.error_code,
+                "message": record.error_message,
+            }
+            if record.error_code is not None
+            else None
+        ),
+        "started_at": record.started_at.isoformat() if record.started_at else None,
+        "completed_at": record.completed_at.isoformat() if record.completed_at else None,
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+    }
+
+
+def _preprocessing_result_summary(result: PreprocessingResult) -> dict:
+    return {
+        "status": result.status,
+        "execution_order": list(result.execution_order),
+        "completed_steps": list(result.completed_steps),
+        "unexecuted_steps": list(result.unexecuted_steps),
+        "failure_step_id": result.failure_step_id,
+        "error_description": result.error_description,
+        "steps": [
+            {
+                "step_id": step.step_id,
+                "operation_id": step.operation_id,
+                "operation_version": step.operation_version,
+                "configuration_sha256": step.configuration_sha256,
+                "status": step.status,
+                "rows_before": step.rows_before,
+                "rows_after": step.rows_after,
+                "columns_before": step.columns_before,
+                "columns_after": step.columns_after,
+                "affected_columns": list(step.affected_columns),
+                "summary_metadata": step.summary_metadata,
+            }
+            for step in result.steps
+        ],
+    }
+
+
+def _assess_verified_preprocessing_lineage(
+    provenance: dict,
+    *,
+    dataset_id: int,
+    file_id: int,
+    source_sha256: str,
+    source_size_bytes: int,
+    table: dict,
+    table_index: int,
+    schema: list[dict[str, str]] | None,
+) -> VerificationAssessment:
+    verified_inputs = [
+        {
+            "kind": "source",
+            "dataset_id": dataset_id,
+            "file_id": file_id,
+            "sha256": source_sha256,
+            "size_bytes": source_size_bytes,
+        },
+        {
+            "kind": "normalized_parquet",
+            "dataset_id": dataset_id,
+            "file_id": file_id,
+            "table_index": table_index,
+            "object_key": table.get("object_key"),
+            "sha256": table.get("sha256"),
+            "size_bytes": table.get("file_size_bytes"),
+            "schema_sha256": (
+                schema_fingerprint(schema)
+                if isinstance(schema, list)
+                else None
+            ),
+        },
+    ]
+    claimed_inputs = provenance.get("inputs") if isinstance(provenance, dict) else None
+    evidence = evidence_for(
+        claimed_inputs,
+        verified_inputs,
+        reference="preprocessing-lineage:verified-object-readback",
+    )
+    budget = ExecutionBudget(
+        {
+            "jev_checks": 1,
+            "jev_evidence_bytes": 16 * 1024,
+        }
+    )
+    return verify_claim(
+        claimed_inputs,
+        evidence,
+        policy_for("schema"),
+        budget=budget,
+    )
+
+
+def _log_internal_preprocessing_lineage_assessment(
+    provenance: dict,
+    *,
+    dataset_id: int,
+    file_id: int,
+    source_sha256: str,
+    source_size_bytes: int,
+    table: dict,
+    table_index: int,
+    schema: list[dict[str, str]] | None,
+) -> None:
+    try:
+        assessment = _assess_verified_preprocessing_lineage(
+            provenance,
+            dataset_id=dataset_id,
+            file_id=file_id,
+            source_sha256=source_sha256,
+            source_size_bytes=source_size_bytes,
+            table=table,
+            table_index=table_index,
+            schema=schema,
+        )
+    except (TypeError, ValueError, OverflowError) as error:
+        logger.warning(
+            "Internal preprocessing lineage assessment unavailable for file %s (%s)",
+            file_id,
+            type(error).__name__,
+        )
+        return
+    if assessment.status != "verified":
+        logger.warning(
+            "Internal preprocessing lineage assessment did not verify for file %s (%s)",
+            file_id,
+            assessment.reason_code,
+        )
+
+
+@app.get("/api/v1/preprocessing/operations")
+def list_preprocessing_operations():
+    operations = [
+        {
+            "operation_id": op.operation_id,
+            "version": op.version,
+            "category": op.category,
+            "status": op.status,
+            "input_requirements": list(op.input_requirements),
+            "output_requirements": list(op.output_requirements),
+            "prerequisites": list(op.prerequisites),
+            "required_approvals": list(op.required_approvals),
+            "requires_fit": op.requires_fit,
+            "changes_rows": op.changes_rows,
+            "changes_columns": op.changes_columns,
+            "changes_values": op.changes_values,
+            "changes_metadata": op.changes_metadata,
+            "configuration_defaults": op.configuration_defaults,
+            "resource_limits": dict(op.resource_limits) if isinstance(op.resource_limits, dict) else {},
+        }
+        for op in DEFAULT_TRANSFORMATION_REGISTRY.list_operations()
+    ]
+    return {"operations": operations, "total": len(operations)}
+
+
+@app.post("/api/v1/datasets/{dataset_id}/files/{file_id}/preprocess")
+def preprocess_dataset_file(
+    dataset_id: int,
+    file_id: int,
+    request: dict = Body(default_factory=dict),
+    recompute: bool = False,
+):
+    recompute = recompute or bool(request.get("recompute", False))
+    allowed_keys = {"table_index", "steps", "approvals", "recompute"}
+    if set(request) - allowed_keys:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_configuration",
+                "message": "Preprocessing request has unsupported fields.",
+            },
+        )
+    raw_table_index = request.get("table_index", 0)
+    if not isinstance(raw_table_index, int) or isinstance(raw_table_index, bool) or raw_table_index < 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_table_index",
+                "message": "table_index must be a non-negative integer.",
+            },
+        )
+    table_index = raw_table_index
+
+    raw_steps = request.get("steps")
+    if not isinstance(raw_steps, list):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_plan",
+                "message": "Preprocessing steps must be a list.",
+            },
+        )
+    if len(raw_steps) > 32:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_plan",
+                "message": "Preprocessing plan cannot exceed 32 steps.",
+            },
+        )
+
+    raw_approvals = request.get("approvals", [])
+    if not isinstance(raw_approvals, list):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_approvals",
+                "message": "Preprocessing approvals must be a list.",
+            },
+        )
+    if len(raw_approvals) > 32:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_approvals",
+                "message": "Preprocessing approvals cannot exceed 32 items.",
+            },
+        )
+
+    steps = [_validate_preprocessing_step(s) for s in raw_steps]
+    approvals = [_validate_preprocessing_approval(a) for a in raw_approvals]
+    plan_dict = {"table_index": table_index, "steps": raw_steps, "approvals": raw_approvals}
+    plan_sha256 = _preprocessing_plan_sha256(raw_steps, raw_approvals)
+
+    with _pinned_upload_session() as (session, connection), ExitStack() as cleanup:
+        try:
+            dataset = session.get(Dataset, dataset_id)
+            if dataset is None:
+                raise HTTPException(status_code=404, detail="Dataset not found.")
+            dataset_file = (
+                session.query(DatasetFile)
+                .filter(
+                    DatasetFile.id == file_id,
+                    DatasetFile.dataset_id == dataset_id,
+                )
+                .one_or_none()
+            )
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            logger.error(
+                "Preprocessing file lookup failed for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Dataset file could not be checked for preprocessing.",
+            ) from None
+
+        if dataset_file is None:
+            raise HTTPException(status_code=404, detail="Dataset file not found.")
+        if dataset_file.status != "Ready":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "file_not_ready",
+                    "message": "Preprocessing requires successful file ingestion.",
+                    "status": dataset_file.status,
+                },
+            )
+        if dataset_file.normalization_status != "Ready":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalization_unavailable",
+                    "message": "Preprocessing requires ready normalized output.",
+                    "status": dataset_file.normalization_status,
+                },
+            )
+        if (
+            not dataset_file.checksum
+            or not dataset_file.parsing_result
+            or not isinstance(dataset_file.normalization_result, dict)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "analysis_provenance_unavailable",
+                    "message": "Validated source and normalized metadata are required.",
+                },
+            )
+
+        try:
+            prep_lock_id = _try_acquire_upload_lock(
+                session,
+                connection,
+                dataset_id,
+                f"preprocessing:{file_id}",
+            )
+        except SQLAlchemyError as error:
+            logger.error(
+                "Could not reserve preprocessing lock for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Preprocessing concurrency protection is unavailable.",
+            ) from None
+        if prep_lock_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "preprocessing_in_progress",
+                    "message": "Preprocessing is already in progress for this file.",
+                },
+            )
+        cleanup.callback(_release_upload_lock, session, connection, prep_lock_id)
+
+        try:
+            norm_lock_id = _try_acquire_upload_lock(
+                session,
+                connection,
+                dataset_id,
+                f"normalization:{file_id}",
+            )
+        except SQLAlchemyError as error:
+            logger.error(
+                "Could not check normalization lock for file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Normalization concurrency protection is unavailable.",
+            ) from None
+        if norm_lock_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalization_in_progress",
+                    "message": "Normalization is using this file; retry preprocessing later.",
+                },
+            )
+        cleanup.callback(_release_upload_lock, session, connection, norm_lock_id)
+
+        try:
+            normalized = validate_normalization_result(
+                dataset_file.normalization_result,
+                dataset_file.parsing_result,
+                dataset_file.filename,
+                dataset_file.file_size_bytes,
+                dataset_file.checksum,
+                dataset_id,
+                file_id,
+            )
+        except NormalizationError as error:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalized_output_invalid",
+                    "message": "Stored normalized output metadata failed validation.",
+                },
+            ) from error
+
+        tables = normalized["tables"]
+        if table_index >= len(tables):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "unknown_table",
+                    "message": "Selected normalized table does not exist.",
+                },
+            )
+        selected_table = tables[table_index]
+        if not selected_table.get("sha256"):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "artifact_unavailable",
+                    "message": "Selected normalized table has no verified checksum.",
+                },
+            )
+
+        storage = get_storage_client()
+        raw_bucket = getenv("MINIO_RAW_BUCKET", "insightos-raw")
+        processed_bucket = getenv("MINIO_PROCESSED_BUCKET", "insightos-processed")
+
+        if not _verify_stored_object(storage, raw_bucket, dataset_file):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "source_integrity_failed",
+                    "message": "Stored source data failed integrity verification.",
+                },
+            )
+
+        normalized_verification = verify_normalization_result_detailed(
+            storage,
+            processed_bucket,
+            normalized,
+        )
+        if normalized_verification["status"] != "verified":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": f"normalized_output_{normalized_verification['status']}",
+                    "message": "Stored normalized output could not be verified as intact.",
+                },
+            )
+
+        execution_key = _preprocessing_execution_key(
+            dataset_file.checksum,
+            table_index,
+            selected_table["sha256"],
+            plan_sha256,
+            engine_version="1",
+        )
+
+        existing_record = (
+            session.query(PreprocessingExecution)
+            .filter(
+                PreprocessingExecution.file_id == file_id,
+                PreprocessingExecution.execution_key == execution_key,
+            )
+            .one_or_none()
+        )
+
+        if (
+            not recompute
+            and existing_record is not None
+            and existing_record.status == "Completed"
+            and existing_record.artifact_storage_key
+        ):
+            try:
+                stat = storage.stat_object(processed_bucket, existing_record.artifact_storage_key)
+                if stat.size == existing_record.artifact_size_bytes:
+                    _log_internal_preprocessing_lineage_assessment(
+                        existing_record.provenance or {},
+                        dataset_id=dataset_id,
+                        file_id=file_id,
+                        source_sha256=dataset_file.checksum,
+                        source_size_bytes=dataset_file.file_size_bytes,
+                        table=selected_table,
+                        table_index=table_index,
+                        schema=selected_table.get("schema"),
+                    )
+                    return _preprocessing_execution_response(existing_record)
+            except Exception:
+                pass
+
+        started_at = datetime.now(timezone.utc)
+        if existing_record is None:
+            record = PreprocessingExecution(
+                dataset_id=dataset_id,
+                file_id=file_id,
+                table_index=table_index,
+                execution_key=execution_key,
+                status="Running",
+                plan=plan_dict,
+                plan_sha256=plan_sha256,
+                started_at=started_at,
+            )
+            session.add(record)
+        else:
+            record = existing_record
+            record.status = "Running"
+            record.started_at = started_at
+            record.completed_at = None
+            record.error_code = None
+            record.error_message = None
+            record.artifact_storage_key = None
+            record.artifact_sha256 = None
+            record.artifact_size_bytes = None
+            record.artifact_rows = None
+            record.artifact_columns = None
+            record.result_summary = None
+            record.provenance = None
+        session.commit()
+
+        object_key = selected_table["object_key"]
+        expected_prefix = (
+            f"{dataset_id}/{file_id}/{dataset_file.checksum}/"
+            f"{normalized['configuration']['configuration_sha256']}/"
+            f"table-{table_index:04d}-"
+        )
+        if not object_key.startswith(expected_prefix) or not object_key.endswith(".parquet"):
+            record.status = "Failed"
+            record.error_code = "invalid_storage_boundary"
+            record.error_message = "Normalized artifact key is outside its managed prefix."
+            record.completed_at = datetime.now(timezone.utc)
+            session.commit()
+            raise HTTPException(
+                status_code=409,
+                detail={"code": record.error_code, "message": record.error_message},
+            )
+
+        temp_in_path = None
+        temp_out_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix="insightos-prep-in-",
+                suffix=".parquet",
+                delete=False,
+            ) as in_file:
+                temp_in_path = Path(in_file.name)
+                download_stream = storage.get_object(processed_bucket, object_key)
+                try:
+                    digest = hashlib.sha256()
+                    size = 0
+                    while chunk := download_stream.read(1024 * 1024):
+                        size += len(chunk)
+                        if size > selected_table["file_size_bytes"] or size > DEFAULT_MAX_OUTPUT_BYTES:
+                            raise HTTPException(
+                                status_code=409,
+                                detail={
+                                    "code": "artifact_size_mismatch",
+                                    "message": "Stored normalized artifact exceeded its verified size.",
+                                },
+                            )
+                        digest.update(chunk)
+                        in_file.write(chunk)
+                    in_file.flush()
+                finally:
+                    download_stream.close()
+                    if hasattr(download_stream, "release_conn"):
+                        download_stream.release_conn()
+
+            if size != selected_table["file_size_bytes"] or digest.hexdigest() != selected_table["sha256"]:
+                record.status = "Failed"
+                record.error_code = "artifact_integrity_failed"
+                record.error_message = "Stored normalized artifact failed checksum verification."
+                record.completed_at = datetime.now(timezone.utc)
+                session.commit()
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": record.error_code, "message": record.error_message},
+                )
+
+            try:
+                table_arrow = pq.read_table(str(temp_in_path))
+                _validate_orchestration_table(table_arrow)
+            except PreprocessingOrchestrationError as error:
+                record.status = "Failed"
+                record.error_code = "table_validation_failed"
+                record.error_message = str(error)
+                record.completed_at = datetime.now(timezone.utc)
+                session.commit()
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": record.error_code, "message": record.error_message},
+                ) from error
+
+            try:
+                result = orchestrate_preprocessing(
+                    table_arrow,
+                    steps,
+                    approvals=approvals,
+                    available_prerequisites=(
+                        "explicit_column_selection",
+                        "explicit_business_rule_definition",
+                    ),
+                )
+            except PreprocessingOrchestrationError as error:
+                record.status = "Failed"
+                record.error_code = "invalid_plan"
+                record.error_message = str(error)
+                record.completed_at = datetime.now(timezone.utc)
+                session.commit()
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": record.error_code, "message": record.error_message},
+                ) from error
+
+            if result.status == "completed" and result.final_table is not None:
+                with tempfile.NamedTemporaryFile(
+                    prefix="insightos-prep-out-",
+                    suffix=".parquet",
+                    delete=False,
+                ) as out_file:
+                    temp_out_path = Path(out_file.name)
+                    pq.write_table(result.final_table, str(temp_out_path), compression="snappy")
+
+                out_size = temp_out_path.stat().st_size
+                if out_size > DEFAULT_MAX_OUTPUT_BYTES:
+                    record.status = "Failed"
+                    record.error_code = "derived_artifact_size_exceeded"
+                    record.error_message = "Derived artifact exceeds output size limits."
+                    record.completed_at = datetime.now(timezone.utc)
+                    session.commit()
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"code": record.error_code, "message": record.error_message},
+                    )
+
+                out_digest = hashlib.sha256()
+                with open(temp_out_path, "rb") as f:
+                    while chunk := f.read(1024 * 1024):
+                        out_digest.update(chunk)
+                out_sha256 = out_digest.hexdigest()
+
+                artifact_key = f"{dataset_id}/{file_id}/preprocessing/{record.id}/table-{table_index:04d}-{out_sha256}.parquet"
+
+                with open(temp_out_path, "rb") as f:
+                    storage.put_object(
+                        processed_bucket,
+                        artifact_key,
+                        f,
+                        out_size,
+                        content_type="application/vnd.apache.parquet",
+                        metadata={"x-amz-meta-sha256": out_sha256},
+                    )
+
+                stat = storage.stat_object(processed_bucket, artifact_key)
+                if stat.size != out_size:
+                    raise OSError("Stored artifact size mismatch after upload.")
+
+                provenance = copy.deepcopy(result.provenance) if isinstance(result.provenance, dict) else {}
+                provenance["verification_status"] = "verified"
+                inputs = provenance.get("inputs", [])
+                inputs.insert(
+                    0,
+                    {
+                        "kind": "normalized_parquet",
+                        "dataset_id": dataset_id,
+                        "file_id": file_id,
+                        "table_index": table_index,
+                        "object_key": selected_table.get("object_key"),
+                        "sha256": selected_table.get("sha256"),
+                        "size_bytes": selected_table.get("file_size_bytes"),
+                    },
+                )
+                inputs.insert(
+                    0,
+                    {
+                        "kind": "source",
+                        "dataset_id": dataset_id,
+                        "file_id": file_id,
+                        "sha256": dataset_file.checksum,
+                        "size_bytes": dataset_file.file_size_bytes,
+                    },
+                )
+                provenance["inputs"] = inputs
+
+                outputs = provenance.get("outputs", [])
+                outputs.insert(
+                    0,
+                    {
+                        "kind": "derived_parquet",
+                        "dataset_id": dataset_id,
+                        "file_id": file_id,
+                        "table_index": table_index,
+                        "object_key": artifact_key,
+                        "sha256": out_sha256,
+                        "size_bytes": out_size,
+                        "row_count": result.final_table.num_rows,
+                        "column_count": result.final_table.num_columns,
+                    },
+                )
+                provenance["outputs"] = outputs
+
+                norm_op_id = None
+                if isinstance(normalized.get("provenance"), dict):
+                    norm_op_id = normalized["provenance"].get("operation_id")
+                parent_ops = provenance.get("parent_operation_ids", [])
+                if norm_op_id and norm_op_id not in parent_ops:
+                    parent_ops.insert(0, norm_op_id)
+                provenance["parent_operation_ids"] = parent_ops
+
+                checks = provenance.get("checks", [])
+                checks.extend([
+                    {"name": "input_normalized_parquet_checksum", "status": "verified"},
+                    {"name": "derived_parquet_checksum", "status": "verified"},
+                ])
+                provenance["checks"] = checks
+
+                record.status = "Completed"
+                record.artifact_storage_key = artifact_key
+                record.artifact_sha256 = out_sha256
+                record.artifact_size_bytes = out_size
+                record.artifact_rows = result.final_table.num_rows
+                record.artifact_columns = result.final_table.num_columns
+                record.result_summary = _preprocessing_result_summary(result)
+                record.provenance = provenance
+                record.completed_at = datetime.now(timezone.utc)
+                session.commit()
+
+                _log_internal_preprocessing_lineage_assessment(
+                    provenance,
+                    dataset_id=dataset_id,
+                    file_id=file_id,
+                    source_sha256=dataset_file.checksum,
+                    source_size_bytes=dataset_file.file_size_bytes,
+                    table=selected_table,
+                    table_index=table_index,
+                    schema=selected_table.get("schema"),
+                )
+                return _preprocessing_execution_response(record)
+
+            else:
+                record.status = "Failed"
+                record.error_code = "step_execution_failed"
+                record.error_message = result.error_description
+                record.result_summary = _preprocessing_result_summary(result)
+                record.provenance = result.provenance
+                record.completed_at = datetime.now(timezone.utc)
+                session.commit()
+                return _preprocessing_execution_response(record)
+
+        except (MinioException, HTTPError, OSError) as error:
+            logger.error(
+                "Storage failure during preprocessing of file %s (%s)",
+                file_id,
+                type(error).__name__,
+            )
+            record.status = "Failed"
+            record.error_code = "storage_error"
+            record.error_message = "Storage error during preprocessing artifact transfer."
+            record.completed_at = datetime.now(timezone.utc)
+            session.commit()
+            raise HTTPException(
+                status_code=502,
+                detail="Preprocessing artifact could not be transferred in storage.",
+            ) from None
+        finally:
+            if temp_in_path and temp_in_path.exists():
+                try:
+                    temp_in_path.unlink()
+                except OSError:
+                    pass
+            if temp_out_path and temp_out_path.exists():
+                try:
+                    temp_out_path.unlink()
+                except OSError:
+                    pass
+
+
+@app.get("/api/v1/datasets/{dataset_id}/files/{file_id}/preprocess")
+def list_dataset_file_preprocess_executions(
+    dataset_id: int,
+    file_id: int,
+    limit: int = 20,
+    offset: int = 0,
+    status: str | None = None,
+):
+    if limit < 1 or limit > 100:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_pagination", "message": "Limit must be between 1 and 100."},
+        )
+    if offset < 0:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_pagination", "message": "Offset must be greater than or equal to 0."},
+        )
+    if status is not None and status not in ("Requested", "Running", "Completed", "Failed"):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_status", "message": "Invalid execution status filter."},
+        )
+
+    with SessionLocal() as session:
+        dataset = session.get(Dataset, dataset_id)
+        if dataset is None:
+            raise HTTPException(status_code=404, detail="Dataset not found.")
+        dataset_file = (
+            session.query(DatasetFile)
+            .filter(
+                DatasetFile.id == file_id,
+                DatasetFile.dataset_id == dataset_id,
+            )
+            .one_or_none()
+        )
+        if dataset_file is None:
+            raise HTTPException(status_code=404, detail="Dataset file not found.")
+
+        query = (
+            session.query(PreprocessingExecution)
+            .filter(
+                PreprocessingExecution.dataset_id == dataset_id,
+                PreprocessingExecution.file_id == file_id,
+            )
+        )
+        if status is not None:
+            query = query.filter(PreprocessingExecution.status == status)
+
+        total = query.count()
+        records = (
+            query.order_by(PreprocessingExecution.id.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "items": [_preprocessing_summary_response(record) for record in records],
+        }
+
+
+@app.get("/api/v1/datasets/{dataset_id}/files/{file_id}/preprocess/{execution_id}")
+def get_dataset_file_preprocess_execution(
+    dataset_id: int,
+    file_id: int,
+    execution_id: int,
+):
+    with SessionLocal() as session:
+        dataset = session.get(Dataset, dataset_id)
+        if dataset is None:
+            raise HTTPException(status_code=404, detail="Dataset not found.")
+        dataset_file = (
+            session.query(DatasetFile)
+            .filter(
+                DatasetFile.id == file_id,
+                DatasetFile.dataset_id == dataset_id,
+            )
+            .one_or_none()
+        )
+        if dataset_file is None:
+            raise HTTPException(status_code=404, detail="Dataset file not found.")
+
+        record = (
+            session.query(PreprocessingExecution)
+            .filter(
+                PreprocessingExecution.id == execution_id,
+                PreprocessingExecution.dataset_id == dataset_id,
+                PreprocessingExecution.file_id == file_id,
+            )
+            .one_or_none()
+        )
+        if record is None:
+            raise HTTPException(status_code=404, detail="Preprocessing execution not found.")
+
+        return _preprocessing_execution_response(record)
+
+
+@app.get("/api/v1/datasets/{dataset_id}/files/{file_id}/preprocess/{execution_id}/artifact")
+def download_preprocessed_artifact(
+    dataset_id: int,
+    file_id: int,
+    execution_id: int,
+):
+    with _pinned_upload_session() as (session, connection):
+        record = (
+            session.query(PreprocessingExecution)
+            .filter(
+                PreprocessingExecution.id == execution_id,
+                PreprocessingExecution.dataset_id == dataset_id,
+                PreprocessingExecution.file_id == file_id,
+            )
+            .one_or_none()
+        )
+        if record is None:
+            raise HTTPException(status_code=404, detail="Preprocessing execution not found.")
+        if record.status != "Completed" or not record.artifact_storage_key:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "artifact_unavailable",
+                    "message": "Derived preprocessing artifact is not ready or failed.",
+                },
+            )
+        storage = get_storage_client()
+        processed_bucket = getenv("MINIO_PROCESSED_BUCKET", "insightos-processed")
+        try:
+            stored = storage.get_object(processed_bucket, record.artifact_storage_key)
+        except (MinioException, HTTPError, OSError):
+            raise HTTPException(
+                status_code=502,
+                detail="Could not retrieve derived artifact from storage.",
+            ) from None
+
+        def stream_content():
+            try:
+                while chunk := stored.read(64 * 1024):
+                    yield chunk
+            finally:
+                stored.close()
+                if hasattr(stored, "release_conn"):
+                    stored.release_conn()
+
+        filename = f"preprocessed-table-{record.table_index:04d}-{record.artifact_sha256[:8]}.parquet"
+        return StreamingResponse(
+            stream_content(),
+            media_type="application/vnd.apache.parquet",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(record.artifact_size_bytes or ""),
+            },
+        )
+
+
 
 def _remove_dataset_objects(storage, bucket: str, dataset_id: int) -> list:
     if not storage.bucket_exists(bucket):
@@ -3682,7 +4814,7 @@ def delete_dataset(dataset_id: int):
                 )
             ]
             for file_id in file_ids:
-                for operation in ("normalization", "quality-analysis", "eda"):
+                for operation in ("normalization", "quality-analysis", "eda", "preprocessing"):
                     lock_id = _try_acquire_upload_lock(
                         session,
                         connection,
@@ -3708,6 +4840,17 @@ def delete_dataset(dataset_id: int):
                                     "code": "eda_in_progress",
                                     "message": (
                                         "A dataset file is undergoing EDA; retry "
+                                        "dataset deletion after it finishes."
+                                    ),
+                                },
+                            )
+                        if operation == "preprocessing":
+                            raise HTTPException(
+                                status_code=409,
+                                detail={
+                                    "code": "preprocessing_in_progress",
+                                    "message": (
+                                        "A dataset file is undergoing preprocessing; retry "
                                         "dataset deletion after it finishes."
                                     ),
                                 },
