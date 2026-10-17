@@ -11,11 +11,13 @@ and an `EDAConfiguration`.
 
 Use `eda_configuration_from_dict` to parse configuration data. Configuration
 schema version 1 supports `analysis_type="univariate"`, `"bivariate"`, and
-`"multivariate"`, explicit column-name selection (up to 32 unique columns), an
-explicit normalized-table index, 2–100 numeric histogram bins, up to 16 sorted
-percentiles from 0–100, a 1–100-category output limit, a bounded pair count,
-a bounded multivariate feature count, and a bounded serialized result limit. The
-selected column list is required; the empty default is not an executable
+`"multivariate"`, explicit column-name selection (`selected_columns`, up to 32
+unique columns), an explicit normalized-table index (`table_index`), 2–100
+numeric histogram bins (`histogram_bins`), up to 16 sorted percentiles from
+0–100 (`percentiles`), a 1–100-category output limit (`max_categories`), a
+bounded pair count (`max_pairs`), a bounded multivariate feature count
+(`max_features`), and a bounded serialized result limit (`max_result_bytes`). The
+`selected_columns` list is required; the empty default is not an executable
 configuration. Unsupported fields and invalid values raise `EDAError` with a
 stable code and an actionable, non-data-bearing message.
 
@@ -182,9 +184,35 @@ execution history in PostgreSQL:
 
 - `POST /api/v1/datasets/{dataset_id}/files/{file_id}/eda`
   Executes or retrieves a cached analysis for the verified normalized artifact.
-  Accepts an EDA configuration (`analysis_type`, `table_index`, `columns`,
-  `bins`, `percentiles`, `max_categories`, `max_pairs`, `column_pairs`,
-  `max_features`, `max_serialized_bytes`, and optional `recompute: bool`).
+  Accepts an EDA configuration object with the following canonical fields:
+  - `selected_columns`: non-empty `list[str]` (**required**; 1–32 unique column
+    names for univariate, 2–32 for bivariate/multivariate; empty list rejects
+    with `invalid_selected_columns`).
+  - `analysis_type`: `str` (optional, default `"univariate"`; supports
+    `"univariate"`, `"bivariate"`, `"multivariate"`).
+  - `table_index`: `int` (optional, default `0`; 0-indexed normalized table).
+  - `histogram_bins`: `int` (optional, default `10`; 2–100 equal-width bins).
+  - `percentiles`: `list[float]` (optional, default `[25.0, 50.0, 75.0]`; up to
+    16 strictly increasing percentiles from 0.0 to 100.0).
+  - `max_categories`: `int` (optional, default `10`; 1–100 category groups).
+  - `max_result_bytes`: `int` (optional, default `262144` [256 KiB]; bounds
+    1,024 [1 KiB] to 1,048,576 [1 MiB]).
+  - `column_pairs`: `list[[str, str]]` (optional, default `[]`; explicit pairs
+    for bivariate analysis, bounded by `max_pairs` and at most 64 pairs).
+  - `max_pairs`: `int` (optional, default `32`; 1–64 pairs).
+  - `max_features`: `int` (optional, default `16`; 2–32 numeric features).
+  - `schema_version`: `int` (optional, default `1`).
+  - `recompute`: `bool` (optional, default `false`; accepted in request body or
+    as URL query parameter).
+
+  Validation behavior:
+  Strict field validation is enforced by `eda_configuration_from_dict`. Stale
+  aliases or similarly named fields (such as `columns`, `bins`, or
+  `max_serialized_bytes`) are not accepted and reject with HTTP 400
+  `invalid_configuration` ("EDA configuration has unsupported fields.").
+  Results exceeding `max_result_bytes` (up to 1 MiB) fail with
+  `result_limit_exceeded`.
+
   Validates resource ownership within the local-workspace model, rejects
   missing files (404), unready normalization (409), deletion conflicts (409),
   concurrent in-progress executions on the same file (409 `eda_in_progress`),

@@ -296,6 +296,32 @@ class EDAApiTests(unittest.TestCase):
         self.assertEqual(res.status_code, 400)
         self.assertEqual(res.json()["detail"]["code"], "invalid_configuration")
 
+        # Stale aliases (columns, bins, max_serialized_bytes) are rejected
+        for stale_payload in (
+            {"analysis_type": "univariate", "columns": ["a"]},
+            {"analysis_type": "univariate", "selected_columns": ["a"], "bins": 10},
+            {"analysis_type": "univariate", "selected_columns": ["a"], "max_serialized_bytes": 100_000},
+        ):
+            res = self.client.post(
+                f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/eda",
+                json=stale_payload,
+            )
+            self.assertEqual(res.status_code, 400)
+            self.assertEqual(res.json()["detail"]["code"], "invalid_configuration")
+
+        # Canonical field names (selected_columns, histogram_bins, max_result_bytes) are accepted
+        res = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/eda",
+            json={
+                "analysis_type": "univariate",
+                "selected_columns": ["a"],
+                "histogram_bins": 15,
+                "max_result_bytes": 100_000,
+            },
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()["status"], "Completed")
+
         # Bivariate with 1 column
         res = self.client.post(
             f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/eda",
