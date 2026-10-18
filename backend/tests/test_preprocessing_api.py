@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 import pyarrow as pa
@@ -95,6 +95,13 @@ class PreprocessingApiTests(unittest.TestCase):
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
+
+        def enable_foreign_keys(connection, _record):
+            cursor = connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
+        event.listen(self.engine, "connect", enable_foreign_keys)
         Base.metadata.create_all(self.engine)
         self.session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
         session = self.session_factory()

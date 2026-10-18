@@ -1150,6 +1150,7 @@ class UploadFlowTests(unittest.TestCase):
                     f"normalization:{file_id}",
                     f"quality-analysis:{file_id}",
                     f"eda:{file_id}",
+                    f"preprocessing:{file_id}",
                 },
             )
             with lock_guard:
@@ -1162,13 +1163,15 @@ class UploadFlowTests(unittest.TestCase):
                     else 304
                     if key.startswith("quality-analysis:")
                     else 305
+                    if key.startswith("eda:")
+                    else 306
                 )
                 lock_keys[lock_id] = key
                 return lock_id
 
         def release_lock(session, connection, lock_id):
             self.assertIs(session.get_bind(), connection)
-            self.assertIn(lock_id, {303, 304, 305})
+            self.assertIn(lock_id, {303, 304, 305, 306})
             with lock_guard:
                 held.discard(lock_keys.pop(lock_id))
 
