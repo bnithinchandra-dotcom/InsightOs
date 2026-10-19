@@ -73,6 +73,18 @@ class PostgresMinioFlowTests(unittest.TestCase):
                 cls.client.close()
 
     def test_upload_normalization_and_quality_use_real_postgres_and_minio(self):
+        projects = self.client.get("/api/v1/projects")
+        self.assertEqual(projects.status_code, 200, projects.text)
+        self.assertIn(self.project_id, [item["id"] for item in projects.json()])
+        datasets = self.client.get(
+            f"/api/v1/projects/{self.project_id}/datasets"
+        )
+        self.assertEqual(datasets.status_code, 200, datasets.text)
+        self.assertEqual(
+            [item["id"] for item in datasets.json()],
+            [self.dataset_id],
+        )
+
         source = b"code,value\n001,1.25\n002,2.50\n003,\n"
         uploaded = self.client.post(
             f"/api/v1/datasets/{self.dataset_id}/files",
@@ -81,6 +93,14 @@ class PostgresMinioFlowTests(unittest.TestCase):
         self.assertEqual(uploaded.status_code, 201, uploaded.text)
         file_id = uploaded.json()["file"]["id"]
         storage_key = uploaded.json()["file"]["storage_key"]
+        listed_files = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files"
+        )
+        self.assertEqual(listed_files.status_code, 200, listed_files.text)
+        self.assertEqual(
+            [item["id"] for item in listed_files.json()],
+            [file_id],
+        )
 
         stored = self.storage.get_object(self.raw_bucket, storage_key)
         try:
@@ -172,11 +192,95 @@ class PostgresMinioFlowTests(unittest.TestCase):
         self.assertEqual(eda_list.json()["total"], 1)
         self.assertEqual(eda_list.json()["items"][0]["id"], eda_id)
 
+        schema_response = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/schema-analyses",
+            json={},
+        )
+        self.assertEqual(schema_response.status_code, 200, schema_response.text)
+        schema_body = schema_response.json()
+        self.assertEqual(schema_body["status"], "Completed")
+        self.assertFalse(schema_body["stale"])
+        self.assertEqual(schema_body["result"]["schema"]["table_count"], 1)
+        self.assertEqual(
+            schema_body["provenance"]["operation_type"],
+            "schema_architect",
+        )
+        self.assertEqual(
+            schema_body["provenance"]["verification"]["status"],
+            "verified",
+        )
+        schema_id = schema_body["id"]
+        recomputed = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/schema-analyses",
+            json={"recompute": True},
+        )
+        self.assertEqual(recomputed.status_code, 200, recomputed.text)
+        self.assertEqual(recomputed.json()["id"], schema_id)
+        self.assertEqual(recomputed.json()["status"], "Completed")
+
+        for index in range(10):
+            additional = self.client.post(
+                f"/api/v1/datasets/{self.dataset_id}/schema-analyses",
+                json={"business_context": f"Disposable pagination case {index}"},
+            )
+            self.assertEqual(additional.status_code, 200, additional.text)
+            self.assertEqual(additional.json()["status"], "Completed")
+
+        schema_get = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/schema-analyses/{schema_id}"
+        )
+        self.assertEqual(schema_get.status_code, 200, schema_get.text)
+        self.assertEqual(schema_get.json()["id"], schema_id)
+        self.assertFalse(schema_get.json()["stale"])
+        schema_list = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/schema-analyses?limit=10&offset=0"
+        )
+        self.assertEqual(schema_list.status_code, 200, schema_list.text)
+        self.assertEqual(schema_list.json()["total"], 11)
+        self.assertEqual(len(schema_list.json()["items"]), 10)
+        second_page = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/schema-analyses?limit=10&offset=10"
+        )
+        self.assertEqual(second_page.status_code, 200, second_page.text)
+        self.assertEqual(second_page.json()["total"], 11)
+        self.assertEqual(len(second_page.json()["items"]), 1)
+
+        session = main.SessionLocal()
+        try:
+            file_record = session.get(main.DatasetFile, file_id)
+            file_record.profile_result = {"fixture_change": True}
+            session.commit()
+        finally:
+            session.close()
+        stale_result = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/schema-analyses/{schema_id}"
+        )
+        self.assertEqual(stale_result.status_code, 200, stale_result.text)
+        self.assertTrue(stale_result.json()["stale"])
+        self.assertEqual(stale_result.json()["status"], "Stale")
+
+        missing_analysis = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/schema-analyses/2147483647"
+        )
+        self.assertEqual(missing_analysis.status_code, 404, missing_analysis.text)
+        invalid_selection = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/schema-analyses",
+            json={
+                "files": [
+                    {"file_id": 2147483647, "table_indices": [0]},
+                ],
+            },
+        )
+        self.assertEqual(invalid_selection.status_code, 404, invalid_selection.text)
+
         session = main.SessionLocal()
         try:
             eda_record = session.get(main.EDAAnalysis, eda_id)
             self.assertIsNotNone(eda_record)
             self.assertEqual(eda_record.status, "Completed")
+            schema_record = session.get(main.SchemaAnalysis, schema_id)
+            self.assertIsNotNone(schema_record)
+            self.assertEqual(schema_record.status, "Completed")
         finally:
             session.close()
 

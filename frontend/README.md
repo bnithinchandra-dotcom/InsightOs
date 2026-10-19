@@ -1,5 +1,21 @@
 # React + Vite
 
+## InsightOS frontend checks
+
+Run these commands from the repository root:
+
+```sh
+npm --prefix frontend test
+npm --prefix frontend run lint
+npm --prefix frontend run build
+```
+
+The Schema Architect component tests mock the API boundary. To run the UI
+against a separate local backend without changing the browser API base URL,
+set `VITE_API_PROXY_TARGET` for the Vite process; the development proxy
+forwards `/api` and `/health` to that target. By default it uses
+`http://localhost:8000`.
+
 This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
 
 Currently, two official plugins are available:

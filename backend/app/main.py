@@ -8,7 +8,7 @@ import re
 import tempfile
 from pathlib import Path
 from threading import Lock
-from typing import Literal
+from typing import Any, Literal
 import unicodedata
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from minio import Minio
 from minio.deleteobjects import DeleteObject
 from minio.error import MinioException, S3Error
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr
 import pyarrow as pa
 import pyarrow.parquet as pq
 import sqlalchemy as sa
@@ -43,6 +43,7 @@ from app.models import (
     EDAAnalysis,
     PreprocessingExecution,
     Project,
+    SchemaAnalysis,
 )
 from app.eda import (
     EDAConfiguration,
@@ -81,6 +82,18 @@ from app.preprocessing import (
     _validate_orchestration_table,
 )
 from app.provenance import schema_fingerprint
+from app.provenance import build_provenance, canonical_sha256
+from app.schema_architect import (
+    MAX_COLUMNS_PER_TABLE as MAX_SCHEMA_COLUMNS,
+    MAX_TABLES as MAX_SCHEMA_TABLES,
+    MAX_TOTAL_ARTIFACT_BYTES,
+    MAX_TOTAL_ROWS as MAX_SCHEMA_ROWS,
+    MAX_RESULT_BYTES as MAX_SCHEMA_RESULT_BYTES,
+    SCHEMA_ARCHITECT_VERSION,
+    SchemaAnalysisError,
+    SchemaTableInput,
+    analyze_schema,
+)
 from app.quality_analysis import (
     QUALITY_ANALYSIS_CONFIGURATION,
     QualityAnalysisError,
@@ -242,6 +255,23 @@ class DatasetCreate(BaseModel):
 
 class QualityAnalysisRequest(BaseModel):
     recompute: bool = False
+
+
+class SchemaFileSelection(BaseModel):
+    file_id: StrictInt = Field(gt=0)
+    table_indices: list[StrictInt] | None = Field(default=None, max_length=MAX_SCHEMA_TABLES)
+
+    class Config:
+        extra = "forbid"
+
+
+class SchemaAnalysisRequest(BaseModel):
+    files: list[SchemaFileSelection] | None = Field(default=None, max_length=MAX_SCHEMA_TABLES)
+    business_context: StrictStr | None = Field(default=None, max_length=5000)
+    recompute: StrictBool = False
+
+    class Config:
+        extra = "forbid"
 
 
 class InvalidParsingResultError(ValueError):
@@ -3670,6 +3700,1189 @@ def get_dataset_file_eda_analysis(
             raise HTTPException(status_code=404, detail="EDA analysis not found.")
 
         return _eda_analysis_response(record)
+
+
+# =============================================================================
+# Phase 4: Deterministic Schema Architect
+# =============================================================================
+
+def _schema_input_manifest(
+    dataset_files: list[DatasetFile],
+    selections: list[dict],
+) -> dict:
+    files_by_id = {dataset_file.id: dataset_file for dataset_file in dataset_files}
+    manifest_files = []
+    for selection in selections:
+        dataset_file = files_by_id.get(selection["file_id"])
+        if dataset_file is None:
+            raise SchemaAnalysisError(
+                "source_changed",
+                "A selected dataset file is no longer available.",
+            )
+        normalized = dataset_file.normalization_result
+        if not isinstance(normalized, dict):
+            raise SchemaAnalysisError(
+                "normalization_unavailable",
+                "A selected file has no validated normalized output.",
+            )
+        normalized_tables = normalized.get("tables")
+        if not isinstance(normalized_tables, list):
+            raise SchemaAnalysisError(
+                "normalized_output_invalid",
+                "Stored normalized table metadata is invalid.",
+            )
+        selected_tables = []
+        for table_index in selection["table_indices"]:
+            if (
+                table_index < 0
+                or table_index >= len(normalized_tables)
+                or not isinstance(normalized_tables[table_index], dict)
+            ):
+                raise SchemaAnalysisError(
+                    "invalid_selection",
+                    "A selected normalized table index does not exist.",
+                )
+            table = normalized_tables[table_index]
+            schema = table.get("schema")
+            checksum = table.get("sha256")
+            size = table.get("file_size_bytes")
+            if (
+                not isinstance(schema, list)
+                or not isinstance(checksum, str)
+                or not isinstance(size, int)
+                or isinstance(size, bool)
+            ):
+                raise SchemaAnalysisError(
+                    "normalized_output_invalid",
+                    "Stored normalized table metadata is invalid.",
+                )
+            try:
+                schema_sha256 = schema_fingerprint(schema)
+            except (TypeError, ValueError):
+                raise SchemaAnalysisError(
+                    "normalized_output_invalid",
+                    "Stored normalized table schema metadata is invalid.",
+                ) from None
+            object_key = table.get("object_key")
+            selected_tables.append(
+                {
+                    "table_index": table_index,
+                    "table_name": table.get("table_name"),
+                    "object_identity_sha256": (
+                        hashlib.sha256(object_key.encode("utf-8")).hexdigest()
+                        if isinstance(object_key, str)
+                        else None
+                    ),
+                    "sha256": checksum,
+                    "size_bytes": size,
+                    "schema_sha256": schema_sha256,
+                    "row_count": table.get("row_count"),
+                    "column_count": table.get("column_count"),
+                    "warnings_sha256": canonical_sha256(
+                        table.get("warnings", [])
+                    ),
+                }
+            )
+        manifest_files.append(
+            {
+                "file_id": dataset_file.id,
+                "filename": dataset_file.filename,
+                "status": dataset_file.status,
+                "normalization_status": dataset_file.normalization_status,
+                "source_sha256": dataset_file.checksum,
+                "source_size_bytes": dataset_file.file_size_bytes,
+                "parsing_result_sha256": (
+                    canonical_sha256(dataset_file.parsing_result)
+                    if dataset_file.parsing_result is not None
+                    else None
+                ),
+                "profile_sha256": (
+                    canonical_sha256(dataset_file.profile_result)
+                    if dataset_file.profile_result is not None
+                    else None
+                ),
+                "quality_report_sha256": (
+                    canonical_sha256(dataset_file.quality_report)
+                    if dataset_file.quality_report is not None
+                    else None
+                ),
+                "normalization_configuration_sha256": (
+                    normalized.get("configuration", {}).get(
+                        "configuration_sha256"
+                    )
+                    if isinstance(normalized.get("configuration"), dict)
+                    else None
+                ),
+                "tables": selected_tables,
+            }
+        )
+    return {"files": manifest_files}
+
+
+def _schema_analysis_is_stale(
+    session: Session,
+    record: SchemaAnalysis,
+    current_files: list[DatasetFile] | None = None,
+) -> bool:
+    configuration = record.configuration
+    if not isinstance(configuration, dict):
+        return True
+    selections = configuration.get("files")
+    if not isinstance(selections, list):
+        return True
+    if current_files is None:
+        current_files = (
+            session.query(DatasetFile)
+            .filter(DatasetFile.dataset_id == record.dataset_id)
+            .order_by(DatasetFile.id.asc())
+            .all()
+        )
+    if configuration.get("selection_mode") == "all":
+        if [item.id for item in current_files] != configuration.get(
+            "dataset_file_ids"
+        ):
+            return True
+    try:
+        current_manifest = _schema_input_manifest(current_files, selections)
+    except (SchemaAnalysisError, TypeError, ValueError):
+        return True
+    stored_manifest = configuration.get("input_manifest")
+    return not isinstance(stored_manifest, dict) or current_manifest != stored_manifest
+
+
+def _schema_analysis_response(
+    record: SchemaAnalysis,
+    *,
+    stale: bool,
+    include_result: bool = True,
+) -> dict:
+    return {
+        "id": record.id,
+        "dataset_id": record.dataset_id,
+        "status": "Stale" if stale and record.status == "Completed" else record.status,
+        "stored_status": record.status,
+        "stale": stale,
+        "analysis_key": record.analysis_key,
+        "configuration": record.configuration,
+        "configuration_sha256": record.configuration_sha256,
+        "result": record.result if include_result else None,
+        "provenance": record.provenance,
+        "error": (
+            {"code": record.error_code, "message": record.error_message}
+            if record.error_code is not None
+            else None
+        ),
+        "started_at": record.started_at.isoformat() if record.started_at else None,
+        "completed_at": (
+            record.completed_at.isoformat() if record.completed_at else None
+        ),
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+        "updated_at": record.updated_at.isoformat() if record.updated_at else None,
+    }
+
+
+def _schema_analysis_summary(record: SchemaAnalysis, *, stale: bool) -> dict:
+    return {
+        "id": record.id,
+        "dataset_id": record.dataset_id,
+        "status": "Stale" if stale and record.status == "Completed" else record.status,
+        "stored_status": record.status,
+        "stale": stale,
+        "analysis_key": record.analysis_key,
+        "configuration": record.configuration,
+        "error": (
+            {"code": record.error_code, "message": record.error_message}
+            if record.error_code is not None
+            else None
+        ),
+        "started_at": record.started_at.isoformat() if record.started_at else None,
+        "completed_at": (
+            record.completed_at.isoformat() if record.completed_at else None
+        ),
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+        "updated_at": record.updated_at.isoformat() if record.updated_at else None,
+    }
+
+
+def _schema_quality_warnings(
+    quality_report: dict | None,
+    table_index: int,
+) -> tuple[dict, ...]:
+    if not isinstance(quality_report, dict):
+        return ()
+    findings = quality_report.get("findings")
+    if not isinstance(findings, list):
+        return ()
+    selected = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        scope = finding.get("scope")
+        if isinstance(scope, dict):
+            finding_table_index = scope.get("table_index")
+            if finding_table_index is not None and finding_table_index != table_index:
+                continue
+        selected.append(finding)
+        if len(selected) >= 50:
+            break
+    return tuple(selected)
+
+
+def _schema_input_tables(
+    storage,
+    bucket: str,
+    dataset_files: list[DatasetFile],
+    selections: list[dict],
+    cleanup: ExitStack,
+) -> tuple[list[SchemaTableInput], list[dict]]:
+    files_by_id = {dataset_file.id: dataset_file for dataset_file in dataset_files}
+    tables = []
+    provenance_inputs = []
+    for selection in selections:
+        dataset_file = files_by_id[selection["file_id"]]
+        try:
+            normalized = validate_normalization_result(
+                dataset_file.normalization_result,
+                dataset_file.parsing_result,
+                dataset_file.filename,
+                dataset_file.file_size_bytes,
+                dataset_file.checksum,
+                dataset_file.dataset_id,
+                dataset_file.id,
+            )
+        except NormalizationError:
+            raise SchemaAnalysisError(
+                "normalized_output_invalid",
+                "Stored normalized output metadata failed validation.",
+            ) from None
+
+        provenance_inputs.append(
+            {
+                "kind": "source",
+                "dataset_id": dataset_file.dataset_id,
+                "file_id": dataset_file.id,
+                "sha256": dataset_file.checksum,
+                "size_bytes": dataset_file.file_size_bytes,
+                "profile_sha256": (
+                    canonical_sha256(dataset_file.profile_result)
+                    if dataset_file.profile_result is not None
+                    else None
+                ),
+                "quality_report_sha256": (
+                    canonical_sha256(dataset_file.quality_report)
+                    if dataset_file.quality_report is not None
+                    else None
+                ),
+            }
+        )
+        for table_index in selection["table_indices"]:
+            descriptor = normalized["tables"][table_index]
+            output_size = descriptor["file_size_bytes"]
+            if output_size > DEFAULT_MAX_OUTPUT_BYTES:
+                raise SchemaAnalysisError(
+                    "resource_limit",
+                    "A normalized artifact exceeds the schema-analysis file-size limit.",
+                )
+            object_key = descriptor["object_key"]
+            response = storage.get_object(bucket, object_key)
+            digest = hashlib.sha256()
+            actual_size = 0
+            temporary = tempfile.NamedTemporaryFile(
+                prefix="insightos-schema-",
+                suffix=".parquet",
+                delete=False,
+            )
+            path = Path(temporary.name)
+            cleanup.callback(path.unlink, missing_ok=True)
+            try:
+                with temporary:
+                    while chunk := response.read(1024 * 1024):
+                        actual_size += len(chunk)
+                        if actual_size > output_size or actual_size > DEFAULT_MAX_OUTPUT_BYTES:
+                            raise SchemaAnalysisError(
+                                "normalized_output_invalid",
+                                "A normalized artifact exceeded its recorded size.",
+                            )
+                        digest.update(chunk)
+                        temporary.write(chunk)
+            finally:
+                response.close()
+                release_connection = getattr(response, "release_conn", None)
+                if release_connection is not None:
+                    release_connection()
+            if (
+                actual_size != output_size
+                or digest.hexdigest() != descriptor["sha256"]
+            ):
+                raise SchemaAnalysisError(
+                    "normalized_output_invalid",
+                    "A normalized artifact checksum did not match its metadata.",
+                )
+
+            try:
+                parquet = pq.ParquetFile(path)
+                arrow_schema = parquet.schema_arrow
+                if (
+                    parquet.metadata.num_rows != descriptor["row_count"]
+                    or len(arrow_schema) != descriptor["column_count"]
+                    or schema_fingerprint(arrow_schema)
+                    != schema_fingerprint(descriptor["schema"])
+                ):
+                    parquet.close()
+                    raise SchemaAnalysisError(
+                        "normalized_output_invalid",
+                        "A normalized artifact schema or row count did not match its metadata.",
+                    )
+                parquet.close()
+            except SchemaAnalysisError:
+                raise
+            except (OSError, ValueError, TypeError, pa.ArrowException):
+                raise SchemaAnalysisError(
+                    "normalized_output_invalid",
+                    "A normalized artifact could not be read as Parquet.",
+                ) from None
+
+            def iter_batches(artifact_path=path):
+                reader = pq.ParquetFile(artifact_path)
+                try:
+                    yield from reader.iter_batches(batch_size=1024)
+                finally:
+                    reader.close()
+
+            identity = {
+                "dataset_id": dataset_file.dataset_id,
+                "file_id": dataset_file.id,
+                "filename": dataset_file.filename,
+                "table_index": table_index,
+                "table_name": descriptor.get("table_name"),
+            }
+            source_profile = dataset_file.profile_result
+            profile_tables = (
+                source_profile.get("tables")
+                if isinstance(source_profile, dict)
+                else None
+            )
+            profile_table = None
+            if isinstance(profile_tables, list):
+                profile_table = next(
+                    (
+                        item
+                        for item in profile_tables
+                        if isinstance(item, dict)
+                        and item.get("name") == descriptor.get("table_name")
+                    ),
+                    None,
+                )
+            tables.append(
+                SchemaTableInput(
+                    identity=identity,
+                    schema=arrow_schema,
+                    iter_batches=iter_batches,
+                    source_profile=(
+                        {"tables": [profile_table]}
+                        if profile_table is not None
+                        else None
+                    ),
+                    normalization_warnings=tuple(
+                        value
+                        for value in descriptor.get("warnings", [])
+                        if isinstance(value, str)
+                    ),
+                    quality_warnings=_schema_quality_warnings(
+                        dataset_file.quality_report,
+                        table_index,
+                    ),
+                )
+            )
+            provenance_inputs.append(
+                {
+                    "kind": "normalized_parquet",
+                    "dataset_id": dataset_file.dataset_id,
+                    "file_id": dataset_file.id,
+                    "table_index": table_index,
+                    "object_identity_sha256": hashlib.sha256(
+                        object_key.encode("utf-8")
+                    ).hexdigest(),
+                    "sha256": descriptor["sha256"],
+                    "size_bytes": output_size,
+                    "schema_sha256": schema_fingerprint(descriptor["schema"]),
+                }
+            )
+    return tables, provenance_inputs
+
+
+def _schema_http_status(code: str) -> int:
+    if code in {"invalid_selection", "resource_limit"}:
+        return 422
+    if code in {
+        "invalid_artifact",
+        "normalization_unavailable",
+        "normalized_output_invalid",
+        "source_changed",
+    }:
+        return 409
+    if code == "normalized_output_unverifiable":
+        return 503
+    return 500
+
+
+def _run_schema_analysis(
+    dataset_id: int,
+    payload: SchemaAnalysisRequest,
+) -> dict:
+    if payload.business_context is not None and not payload.business_context.strip():
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_business_context",
+                "message": "Business context cannot be blank.",
+            },
+        )
+    with _pinned_upload_session() as (session, connection), ExitStack() as cleanup:
+        try:
+            dataset = session.get(Dataset, dataset_id)
+            if dataset is None:
+                raise HTTPException(status_code=404, detail="Dataset not found.")
+            if dataset.active_upload_key is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "upload_in_progress",
+                        "message": "Schema analysis cannot run while a dataset upload is active.",
+                    },
+                )
+            all_files = (
+                session.query(DatasetFile)
+                .filter(DatasetFile.dataset_id == dataset_id)
+                .order_by(DatasetFile.id.asc())
+                .all()
+            )
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            logger.error(
+                "Schema-analysis dataset lookup failed for dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Dataset could not be checked for schema analysis.",
+            ) from None
+
+        if not all_files and payload.files is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalized_files_unavailable",
+                    "message": "The dataset has no normalized files available for schema analysis.",
+                },
+            )
+        if payload.files is None:
+            selection_mode = "all"
+            requested_file_ids = [item.id for item in all_files]
+            requested_tables = {
+                item.id: None for item in all_files
+            }
+        else:
+            selection_mode = "explicit"
+            requested_file_ids = [item.file_id for item in payload.files]
+            if not requested_file_ids or len(set(requested_file_ids)) != len(requested_file_ids):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "invalid_selection",
+                        "message": "Select one or more unique dataset files.",
+                    },
+                )
+            requested_tables = {
+                item.file_id: item.table_indices for item in payload.files
+            }
+            if any(indices == [] for indices in requested_tables.values()):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "invalid_selection",
+                        "message": "A selected file must include at least one table.",
+                    },
+                )
+
+        files_by_id = {item.id: item for item in all_files}
+        missing_file_id = next(
+            (file_id for file_id in requested_file_ids if file_id not in files_by_id),
+            None,
+        )
+        if missing_file_id is not None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "dataset_file_not_found",
+                    "message": "A selected dataset file was not found.",
+                },
+            )
+
+        if len(requested_file_ids) > MAX_SCHEMA_TABLES:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "resource_limit",
+                    "message": f"Schema analysis is limited to {MAX_SCHEMA_TABLES} selected files.",
+                },
+            )
+
+        for file_id in requested_file_ids:
+            dataset_file = files_by_id[file_id]
+            if (
+                dataset_file.status != "Ready"
+                or dataset_file.normalization_status != "Ready"
+                or not dataset_file.checksum
+                or not isinstance(dataset_file.normalization_result, dict)
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "normalization_unavailable",
+                        "message": "Schema analysis requires ready normalized output for every selected file.",
+                        "file_id": file_id,
+                    },
+                )
+
+        try:
+            for file_id in sorted(requested_file_ids):
+                for operation in (
+                    "schema-analysis",
+                    "normalization",
+                    "quality-analysis",
+                    "eda",
+                    "preprocessing",
+                ):
+                    lock_id = _try_acquire_upload_lock(
+                        session,
+                        connection,
+                        dataset_id,
+                        f"{operation}:{file_id}",
+                    )
+                    if lock_id is None:
+                        code = {
+                            "schema-analysis": "schema_analysis_in_progress",
+                            "normalization": "normalization_in_progress",
+                            "quality-analysis": "quality_analysis_in_progress",
+                            "eda": "eda_in_progress",
+                            "preprocessing": "preprocessing_in_progress",
+                        }[operation]
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": code,
+                                "message": "A conflicting operation is using a selected dataset file.",
+                            },
+                        )
+                    cleanup.callback(
+                        _release_upload_lock,
+                        session,
+                        connection,
+                        lock_id,
+                    )
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            logger.error(
+                "Schema-analysis concurrency protection failed for dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "concurrency_protection_unavailable",
+                    "message": "Schema-analysis concurrency protection is temporarily unavailable.",
+                },
+            ) from None
+
+        try:
+            dataset = session.get(Dataset, dataset_id)
+            if dataset is None:
+                raise HTTPException(status_code=404, detail="Dataset not found.")
+            if dataset.active_upload_key is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "upload_in_progress",
+                        "message": "Schema analysis cannot run while a dataset upload is active.",
+                    },
+                )
+            current_files = (
+                session.query(DatasetFile)
+                .filter(DatasetFile.dataset_id == dataset_id)
+                .order_by(DatasetFile.id.asc())
+                .all()
+            )
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            logger.error(
+                "Schema-analysis source recheck failed for dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Schema-analysis inputs could not be checked.",
+            ) from None
+
+        if selection_mode == "all" and [item.id for item in current_files] != requested_file_ids:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "source_changed",
+                    "message": "Dataset files changed while schema analysis was being prepared; retry the request.",
+                },
+            )
+        current_files_by_id = {item.id: item for item in current_files}
+        selections = []
+        selected_table_count = 0
+        for file_id in requested_file_ids:
+            dataset_file = current_files_by_id.get(file_id)
+            if dataset_file is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "code": "dataset_file_not_found",
+                        "message": "A selected dataset file was not found.",
+                    },
+                )
+            if (
+                dataset_file.status != "Ready"
+                or dataset_file.normalization_status != "Ready"
+                or not dataset_file.checksum
+                or not isinstance(dataset_file.parsing_result, dict)
+                or not isinstance(dataset_file.normalization_result, dict)
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "normalization_unavailable",
+                        "message": "Schema analysis requires ready normalized output for every selected file.",
+                        "file_id": file_id,
+                    },
+                )
+            try:
+                normalized = validate_normalization_result(
+                    dataset_file.normalization_result,
+                    dataset_file.parsing_result,
+                    dataset_file.filename,
+                    dataset_file.file_size_bytes,
+                    dataset_file.checksum,
+                    dataset_id,
+                    file_id,
+                )
+            except NormalizationError:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "normalized_output_invalid",
+                        "message": "Stored normalized output metadata failed validation.",
+                    },
+                ) from None
+            table_count = len(normalized["tables"])
+            requested_indices = requested_tables[file_id]
+            if (
+                requested_indices is None
+                and table_count > MAX_SCHEMA_TABLES - selected_table_count
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "resource_limit",
+                        "message": f"Schema analysis is limited to {MAX_SCHEMA_TABLES} selected tables.",
+                    },
+                )
+            if (
+                requested_indices is not None
+                and len(requested_indices)
+                > MAX_SCHEMA_TABLES - selected_table_count
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "resource_limit",
+                        "message": f"Schema analysis is limited to {MAX_SCHEMA_TABLES} selected tables.",
+                    },
+                )
+            table_indices = (
+                list(range(table_count))
+                if requested_indices is None
+                else list(requested_indices)
+            )
+            if (
+                not table_indices
+                or any(
+                    index < 0 or index >= table_count
+                    for index in table_indices
+                )
+                or len(set(table_indices)) != len(table_indices)
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "invalid_selection",
+                        "message": "A selected normalized table index does not exist or is duplicated.",
+                        "file_id": file_id,
+                    },
+                )
+            selections.append(
+                {
+                    "file_id": file_id,
+                    "table_indices": sorted(table_indices),
+                }
+            )
+            selected_table_count += len(table_indices)
+
+        input_manifest = _schema_input_manifest(current_files, selections)
+        total_artifact_bytes = sum(
+            table["size_bytes"]
+            for source in input_manifest["files"]
+            for table in source["tables"]
+        )
+        selected_tables = [
+            table
+            for source in input_manifest["files"]
+            for table in source["tables"]
+        ]
+        if any(
+            not isinstance(table["row_count"], int)
+            or isinstance(table["row_count"], bool)
+            or table["row_count"] < 0
+            or not isinstance(table["column_count"], int)
+            or isinstance(table["column_count"], bool)
+            or table["column_count"] < 0
+            for table in selected_tables
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalized_output_invalid",
+                    "message": "Stored normalized table dimensions are invalid.",
+                },
+            )
+        if any(
+            table["column_count"] > MAX_SCHEMA_COLUMNS
+            for table in selected_tables
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "resource_limit",
+                    "message": (
+                        "A selected table exceeds the "
+                        f"{MAX_SCHEMA_COLUMNS}-column schema-analysis limit."
+                    ),
+                },
+            )
+        if sum(table["row_count"] for table in selected_tables) > MAX_SCHEMA_ROWS:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "resource_limit",
+                    "message": (
+                        "Selected normalized tables exceed the "
+                        f"{MAX_SCHEMA_ROWS}-row schema-analysis limit."
+                    ),
+                },
+            )
+        if total_artifact_bytes > MAX_TOTAL_ARTIFACT_BYTES:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "resource_limit",
+                    "message": "Selected normalized artifacts exceed the 1 GiB schema-analysis byte budget.",
+                },
+            )
+        configuration = {
+            "engine_version": SCHEMA_ARCHITECT_VERSION,
+            "selection_mode": selection_mode,
+            "dataset_file_ids": (
+                [item.id for item in current_files] if selection_mode == "all" else None
+            ),
+            "files": selections,
+            "input_manifest": input_manifest,
+            "business_context": (
+                payload.business_context.strip()
+                if payload.business_context is not None
+                else None
+            ),
+        }
+        configuration_sha256 = canonical_sha256(configuration)
+        analysis_key = configuration_sha256
+
+        try:
+            record = (
+                session.query(SchemaAnalysis)
+                .filter(
+                    SchemaAnalysis.dataset_id == dataset_id,
+                    SchemaAnalysis.analysis_key == analysis_key,
+                )
+                .one_or_none()
+            )
+            if record is not None and record.status == "Running":
+                record.status = "Failed"
+                record.result = None
+                record.provenance = None
+                record.error_code = "execution_interrupted"
+                record.error_message = (
+                    "A previous schema-analysis request ended before completion."
+                )
+                record.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                session.commit()
+                if not payload.recompute:
+                    return _schema_analysis_response(record, stale=False)
+            if record is not None and not payload.recompute:
+                stale = _schema_analysis_is_stale(
+                    session,
+                    record,
+                    current_files=current_files,
+                )
+                return _schema_analysis_response(record, stale=stale)
+            if record is None:
+                record = SchemaAnalysis(
+                    dataset_id=dataset_id,
+                    analysis_key=analysis_key,
+                    status="Requested",
+                    configuration=configuration,
+                    configuration_sha256=configuration_sha256,
+                )
+                session.add(record)
+            else:
+                record.status = "Requested"
+                record.configuration = configuration
+                record.configuration_sha256 = configuration_sha256
+                record.result = None
+                record.provenance = None
+                record.error_code = None
+                record.error_message = None
+                record.started_at = None
+                record.completed_at = None
+            session.commit()
+            session.refresh(record)
+            record.status = "Running"
+            record.started_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.commit()
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            session.rollback()
+            logger.error(
+                "Schema-analysis execution could not be persisted for dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Schema analysis could not be started.",
+            ) from None
+
+        try:
+            storage = get_storage_client()
+            processed_bucket = getenv(
+                "MINIO_PROCESSED_BUCKET",
+                "insightos-processed",
+            )
+            input_tables, provenance_inputs = _schema_input_tables(
+                storage,
+                processed_bucket,
+                current_files,
+                selections,
+                cleanup,
+            )
+            result = analyze_schema(input_tables)
+            result["business_context"] = configuration["business_context"]
+            if len(
+                json.dumps(
+                    result,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ) > MAX_SCHEMA_RESULT_BYTES:
+                raise SchemaAnalysisError(
+                    "resource_limit",
+                    "Schema-analysis results exceed the 10 MiB response-size limit.",
+                )
+
+            latest_files = (
+                session.query(DatasetFile)
+                .filter(DatasetFile.dataset_id == dataset_id)
+                .order_by(DatasetFile.id.asc())
+                .all()
+            )
+            if (
+                selection_mode == "all"
+                and [item.id for item in latest_files]
+                != configuration["dataset_file_ids"]
+            ):
+                raise SchemaAnalysisError(
+                    "source_changed",
+                    "Dataset files changed while schema analysis was running.",
+                )
+            latest_manifest = _schema_input_manifest(latest_files, selections)
+            if latest_manifest != input_manifest:
+                raise SchemaAnalysisError(
+                    "source_changed",
+                    "Schema-analysis inputs changed while analysis was running.",
+                )
+
+            result_sha256 = canonical_sha256(result)
+            record.result = result
+            record.provenance = build_provenance(
+                operation_type="schema_architect",
+                operation_version=SCHEMA_ARCHITECT_VERSION,
+                configuration_sha256=configuration_sha256,
+                status="completed",
+                inputs=provenance_inputs,
+                outputs=[
+                    {
+                        "kind": "schema_analysis",
+                        "analysis_key": analysis_key,
+                        "result_sha256": result_sha256,
+                    }
+                ],
+                verification_status="verified",
+                checks=[
+                    {"name": "normalized_artifact_checksums", "status": "verified"},
+                    {"name": "source_manifest_stability", "status": "verified"},
+                ],
+                limitations=result["limitations"],
+            )
+            record.status = "Completed"
+            record.error_code = None
+            record.error_message = None
+            record.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.commit()
+            session.refresh(record)
+            return _schema_analysis_response(record, stale=False)
+        except SchemaAnalysisError as error:
+            session.rollback()
+            record.status = "Failed"
+            record.result = None
+            record.provenance = None
+            record.error_code = error.code
+            record.error_message = error.message
+            record.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            try:
+                session.commit()
+            except SQLAlchemyError as persist_error:
+                session.rollback()
+                logger.error(
+                    "Schema-analysis failure state could not be persisted (%s)",
+                    type(persist_error).__name__,
+                )
+            raise HTTPException(
+                status_code=_schema_http_status(error.code),
+                detail={"code": error.code, "message": error.message},
+            ) from None
+        except (MinioException, HTTPError, OSError) as error:
+            session.rollback()
+            logger.error(
+                "Schema-analysis artifact access failed for dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            record.status = "Failed"
+            record.result = None
+            record.provenance = None
+            record.error_code = "artifact_storage_failure"
+            record.error_message = "A normalized artifact could not be read."
+            record.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            try:
+                session.commit()
+            except SQLAlchemyError as persist_error:
+                session.rollback()
+                logger.error(
+                    "Schema-analysis storage failure state could not be persisted (%s)",
+                    type(persist_error).__name__,
+                )
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "artifact_storage_failure",
+                    "message": "A normalized artifact could not be read.",
+                },
+            ) from None
+        except SQLAlchemyError as error:
+            session.rollback()
+            logger.error(
+                "Schema-analysis result persistence failed for dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            record.status = "Failed"
+            record.result = None
+            record.provenance = None
+            record.error_code = "schema_analysis_persistence_failure"
+            record.error_message = "Schema-analysis results could not be saved."
+            record.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            try:
+                session.commit()
+            except SQLAlchemyError as persist_error:
+                session.rollback()
+                logger.error(
+                    "Schema-analysis persistence failure state could not be saved (%s)",
+                    type(persist_error).__name__,
+                )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "schema_analysis_persistence_failure",
+                    "message": "Schema-analysis results could not be saved.",
+                },
+            ) from None
+        except Exception as error:
+            session.rollback()
+            logger.error(
+                "Schema-analysis execution failed for dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            record.status = "Failed"
+            record.result = None
+            record.provenance = None
+            record.error_code = "schema_analysis_failed"
+            record.error_message = "Schema analysis could not be completed."
+            record.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            try:
+                session.commit()
+            except SQLAlchemyError as persist_error:
+                session.rollback()
+                logger.error(
+                    "Schema-analysis failure state could not be persisted (%s)",
+                    type(persist_error).__name__,
+                )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "schema_analysis_failed",
+                    "message": "Schema analysis could not be completed.",
+                },
+            ) from None
+
+
+@app.post("/api/v1/datasets/{dataset_id}/schema-analyses")
+def analyze_dataset_schema(
+    dataset_id: int,
+    payload: SchemaAnalysisRequest,
+):
+    return _run_schema_analysis(dataset_id, payload)
+
+
+@app.get("/api/v1/datasets/{dataset_id}/schema-analyses")
+def list_dataset_schema_analyses(
+    dataset_id: int,
+    limit: int = 50,
+    offset: int = 0,
+):
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 100.")
+    if offset < 0:
+        raise HTTPException(
+            status_code=422,
+            detail="offset must be greater than or equal to 0.",
+        )
+    with SessionLocal() as session:
+        try:
+            if session.get(Dataset, dataset_id) is None:
+                raise HTTPException(status_code=404, detail="Dataset not found.")
+            query = session.query(SchemaAnalysis).filter(
+                SchemaAnalysis.dataset_id == dataset_id
+            )
+            total = query.count()
+            records = (
+                query.order_by(SchemaAnalysis.id.desc())
+                .offset(offset)
+                .limit(limit)
+                .all()
+            )
+            files = (
+                session.query(DatasetFile)
+                .filter(DatasetFile.dataset_id == dataset_id)
+                .order_by(DatasetFile.id.asc())
+                .all()
+            )
+            return {
+                "dataset_id": dataset_id,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "items": [
+                    _schema_analysis_summary(
+                        record,
+                        stale=_schema_analysis_is_stale(
+                            session,
+                            record,
+                            current_files=files,
+                        ),
+                    )
+                    for record in records
+                ],
+            }
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            logger.error(
+                "Schema-analysis listing failed for dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Schema analyses could not be retrieved.",
+            ) from None
+
+
+def _get_schema_analysis(
+    session: Session,
+    dataset_id: int,
+    analysis_id: int,
+) -> tuple[SchemaAnalysis, bool]:
+    if session.get(Dataset, dataset_id) is None:
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+    record = (
+        session.query(SchemaAnalysis)
+        .filter(
+            SchemaAnalysis.id == analysis_id,
+            SchemaAnalysis.dataset_id == dataset_id,
+        )
+        .one_or_none()
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="Schema analysis not found.")
+    files = (
+        session.query(DatasetFile)
+        .filter(DatasetFile.dataset_id == dataset_id)
+        .order_by(DatasetFile.id.asc())
+        .all()
+    )
+    return record, _schema_analysis_is_stale(session, record, current_files=files)
+
+
+@app.get("/api/v1/datasets/{dataset_id}/schema-analyses/{analysis_id}")
+def get_dataset_schema_analysis(dataset_id: int, analysis_id: int):
+    with SessionLocal() as session:
+        try:
+            record, stale = _get_schema_analysis(session, dataset_id, analysis_id)
+            return _schema_analysis_response(record, stale=stale)
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            logger.error(
+                "Schema-analysis lookup failed for dataset %s (%s)",
+                dataset_id,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Schema analysis could not be retrieved.",
+            ) from None
 
 
 # =============================================================================

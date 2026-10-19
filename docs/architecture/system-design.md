@@ -25,9 +25,10 @@ supported targets.
 
 The current Compose development stack contains FastAPI, PostgreSQL, Redis,
 MinIO, a React shell outside Compose, and a worker process. The worker connects
-to Redis and idles; it does not consume jobs. Upload, normalization, quality analysis, and EDA execute synchronously in
-API requests. Preprocessing is a Python-library entry point and is not wired into
-the API or UI; UI integration for data analysis workflows remains planned.
+to Redis and idles; it does not consume jobs. Upload, normalization, quality
+analysis, EDA, and schema analysis execute synchronously in API requests.
+Preprocessing is a Python-library entry point and is not wired into the API or
+UI; UI integration for data analysis workflows remains planned.
 
 Compose-published API and infrastructure ports bind to `127.0.0.1`. The API
 does not implement authentication, authorization, or project ownership checks.
@@ -62,6 +63,9 @@ Client upload
 API callers
   -> EDA on selected, verified normalized Parquet; execution records and bounded
      results persisted in PostgreSQL
+  -> Schema Architect profiles and relationships across selected verified
+     normalized Parquet; dataset-level execution records and bounded results
+     persisted in PostgreSQL
 
 Library callers
   -> preprocessing on caller-supplied Arrow tables; output remains in memory
@@ -74,6 +78,37 @@ statistics from the normalized artifact rather than treating the earlier
 profile as artifact-bound statistics. EDA results are persisted in `eda_analyses`
 execution records with version 1 provenance envelopes. Preprocessing outputs
 currently have no persisted execution-history lifecycle.
+
+The Phase 4 Schema Architect reads verified normalized Parquet without changing
+the uploaded source or normalized artifacts. Its deterministic profiles reuse
+the stored parser profile for source physical-type evidence and the existing
+quality report for advisory findings, while distinctness and relationship
+coverage are recomputed from normalized values. Column roles are exposed only
+as heuristic candidates; when evidence does not support dimensional modeling,
+the result recommends conservatively preserving the selected tables. Fact,
+dimension, grain, and measure semantics remain unconfirmed. Analyses are
+persisted in `schema_analyses` with source, profile, quality-report,
+normalized-object, and schema fingerprints. Results are explicitly marked
+stale when the referenced inputs change. The analysis retrieval endpoint
+returns the complete result, including schema, relationships, and model
+recommendations, with its freshness state.
+
+The schema endpoints are:
+
+- `POST /api/v1/datasets/{dataset_id}/schema-analyses` — analyze all ready
+  normalized files by default, or explicitly selected files/table indices.
+  Optional `business_context` is recorded as user context, not treated as
+  verified evidence. `recompute: true` explicitly reruns an equivalent input.
+- `GET /api/v1/datasets/{dataset_id}/schema-analyses?limit=&offset=` — bounded
+  history listing (`limit` 1-100).
+- `GET /api/v1/datasets/{dataset_id}/schema-analyses/{analysis_id}` — execution,
+  result, provenance, and freshness state.
+
+An analysis key is the canonical SHA-256 of the engine version, selection,
+input manifest, and business context. Equivalent requests replay the same
+persisted record unless recomputation is explicit. Failed results remain
+visible; retrying a failed analysis requires `recompute: true`. Synchronous
+execution states are `Requested`, `Running`, `Completed`, and `Failed`.
 
 For JSON columns that require reversible tagged text to distinguish a missing
 field from explicit null, normalization metadata retains source-level null and
@@ -239,9 +274,10 @@ backend, and the health check does not mutate storage.
 | Quality analysis | **Partial** | API validates normalized artifacts, downloads verified local copies, runs deterministic registered rules, and persists versioned provenance-bound reports. | 600 MiB normalized-input cap, 4 MiB rule-tracking memory cap, shared comparison budget, bounded findings/examples/report serialization. `RuleBudget` delegates its counters to `ExecutionBudget` while preserving quality-specific units and exhaustion semantics. Additive report provenance preserves legacy report validation and the existing deterministic analysis key. Real PostgreSQL advisory locking and MinIO integration are not established by unit tests in this checkout. |
 | Preprocessing | **Partial** | `DEFAULT_TRANSFORMATION_REGISTRY` and `orchestrate_preprocessing` run explicit DA/BA transforms on Arrow tables; business-semantic operations require explicit approvals. | Input cap 64 MiB Arrow buffers, 1,000,000 rows, 256 columns. Python-string estimates are checked before whole-column conversions and share the byte ceiling across selected columns/chunks. Input/output Arrow IPC fingerprints and ordered per-step provenance are returned in memory. This adds bounded full-table passes; it is not streaming or a process-wide memory bound. Output is not persisted; no API. |
 | EDA | **Partial** | FastAPI routes in `backend/app/main.py` (`POST /api/v1/datasets/{dataset_id}/files/{file_id}/eda`, `GET .../eda`, `GET .../eda/{analysis_id}`); deterministic univariate, bivariate, and multivariate analysis of verified normalized Parquet; PostgreSQL persistence in `eda_analyses` with idempotency, version 1 provenance envelope, and backend-only JEV lineage verification. | Defaults/caps include 1,000,000 rows, 600 MiB selected-column scan metadata, 250,000 numeric values, 50,000 categories, 250,000 grouped values, 50,000 contingency cells, 4,000,000 pairwise work units, 128 MiB estimated decoded strings, and configured result serialization up to 1 MiB. Result records are persisted with bounded pagination (limit 1-100); UI integration remains planned. |
-| Frontend | **Partial** | React shell and system-health view. | API client currently calls only health and system-info; dataset and analysis workflows are not connected. |
+| Schema Architect (Phase 4) | **Partial** | `backend/app/schema_architect.py` profiles selected normalized tables, identifies candidate keys, infers or rejects relationship hypotheses with overlap/cardinality/fan-out evidence, and produces conditional star, snowflake, and hybrid recommendations; when evidence does not support those structures, it recommends conservatively preserving the selected tables. Column roles are heuristic candidates only. FastAPI persists results in `schema_analyses` with source and artifact provenance. The React workflow selects projects, datasets, and normalized tables; creates or recomputes analyses; and displays history, relationship evidence, conditional recommendations, warnings, and provenance. | Synchronous and deterministic; accepts at most 20 files/tables and 200 columns per table, scans at most 1,000,000 rows and 1 GiB of selected normalized artifacts, retains at most 100,000 typed values (32 MiB canonical-value bytes; 10,000 values per column; 16 KiB per value), evaluates at most 10,000 relationship comparisons/500 candidates, and returns at most 10 MiB. It streams object downloads in 1 MiB chunks and scans Parquet batches. Exact distinct/overlap statistics become unavailable when retention limits are exceeded. Keys and relationships are never called verified constraints; models, grain, and measure semantics remain conditional. A per-file schema-analysis advisory lock prevents duplicate concurrent runs; existing normalization, quality, EDA, preprocessing, and deletion locks also prevent cross-operation overlap. No LLM, source rewrite, or warehouse materialization is used. Isolated PostgreSQL/MinIO integration tests cover project/dataset/file listing, analysis creation/retrieval/recomputation, history pagination, stale detection, and missing-resource errors; a browser run against the same isolated service flow verified frontend selection, creation, recomputation, retrieval, and stale display. |
+| Frontend | **Partial** | React shell, system-health view, and Phase 4 Schema Architect workflow backed by the existing project, dataset, file, and schema-analysis routes. | Other data workflows, including EDA, remain unconnected; the API does not yet implement authentication or project ownership authorization. |
 | Worker/queue | **Planned** | Worker starts, checks Redis, and idles. | No queue consumer, task contract, retries, or execution-budget propagation. |
-| Schema modeling, agents, semantic layer, NL analytics, ML, monitoring, governance | **Planned** | Product roadmap only. | No claims of implementation until code and tests establish them. |
+| Agents, semantic layer, NL analytics, ML, monitoring, governance | **Planned** | Product roadmap only. | No claims of implementation until code and tests establish them. |
 
 ### JSON expansion boundary
 
@@ -288,6 +324,11 @@ Shared semantics do not impose identical algorithms or numerical limits:
 - **EDA:** explicit table/column selection, deterministic statistics,
   pair/feature/category truncation metadata, JSON-safe results and sanitized
   failure behavior.
+- **Schema Architect:** selected, checksum-verified normalized table scans,
+  deterministic source-profile/quality-report reuse, exact tracked-value
+  statistics with explicit unavailable states, bounded relationship candidates,
+  persisted freshness/provenance, and conditional dimensional-model hypotheses.
+  It never creates database constraints or materializes warehouse tables.
 
 ## Test and verification status
 
@@ -306,6 +347,9 @@ their own CI run before their GitHub Actions status is verified. The current
 working-tree changes also passed the migration and data-flow integration test
 against fresh, isolated local PostgreSQL and MinIO containers; that local run
 is not a GitHub Actions result and does not establish deployment-scale behavior.
+That integration coverage did not include the Phase 4 Schema Architect; its
+PostgreSQL/MinIO migration and lifecycle behavior remains unverified in live
+services.
 Do not run destructive database/storage integration tests against developer
 data or shared services.
 The repository does not currently provide a verified production worker,
@@ -321,7 +365,8 @@ authentication boundary, or remote deployment profile.
 | Profiling, normalization, quality | **Partial** |
 | Preprocessing | **Partial; in-memory library** |
 | EDA (Stage 3.7 API & persistence) | **Partial; API and PostgreSQL persistence implemented, UI planned** |
-| Model/schema design, semantic layer, agents, NL-BI, ML, monitoring, governance, production deployment | **Planned** |
+| Schema Architect (Phase 4) | **Partial; deterministic API, persistence, frontend workflow, and disposable PostgreSQL/MinIO browser verification implemented** |
+| Semantic layer, agents, NL-BI, ML, monitoring, governance, production deployment | **Planned** |
 
 The historical phase sequence is retained in the root README. Stage completion
 must be updated only after its stated user-facing and integration contracts

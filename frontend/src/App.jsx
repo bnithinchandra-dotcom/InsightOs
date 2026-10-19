@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
 import { getHealth, getSystemInfo } from './api'
+import SchemaArchitect from './SchemaArchitect'
 import './App.css'
 
 const primaryNavigation = [
   { id: 'overview', label: 'Overview', icon: 'grid' },
   { id: 'projects', label: 'Projects', icon: 'folder' },
   { id: 'datasets', label: 'Datasets', icon: 'database' },
-  { id: 'analysis', label: 'Analysis', icon: 'activity' },
+  { id: 'analysis', label: 'Schema Architect', icon: 'activity' },
   { id: 'dashboards', label: 'Dashboards', icon: 'chart' },
 ]
 
@@ -36,8 +37,8 @@ const pageDetails = {
     description: 'Bring your data into an InsightOS project and prepare it for analysis.',
   },
   analysis: {
-    title: 'Analysis',
-    description: 'Explore your data, ask analytical questions, and turn results into insights.',
+    title: 'Schema Architect',
+    description: 'Inspect normalized dataset tables and review evidence-backed model recommendations.',
   },
   dashboards: {
     title: 'Dashboards',
@@ -247,7 +248,7 @@ function Overview({ health, systemInfo, loading, error, onRefresh, navigate }) {
           </button>
           <a className="action-card" href="#analysis" onClick={() => navigate('analysis')}>
             <span className="action-icon"><Icon name="activity" /></span>
-            <span><strong>Explore analysis</strong><small>See what is planned for analysis</small></span>
+            <span><strong>Open Schema Architect</strong><small>Review relationships across normalized tables</small></span>
             <span className="action-arrow"><Icon name="arrow" /></span>
           </a>
         </div>
@@ -342,10 +343,17 @@ function PageContent({ page, props }) {
     return <EmptyState icon="folder" title="No projects yet" description="Create your first InsightOS project to organize datasets, analysis, and dashboards." action="Create Project" detail="Project creation is not available in this foundation draft." />
   }
   if (page === 'datasets') {
-    return <EmptyState icon="database" title="No datasets yet" description="Add data to begin building your InsightOS workspace." action="Add Dataset" detail="Dataset ingestion is planned for a later phase." />
+    return (
+      <section className="empty-state panel">
+        <div className="empty-icon"><Icon name="database" size={23} /></div>
+        <h2>Choose a dataset to analyze</h2>
+        <p>Select a project, dataset, and normalized tables in Schema Architect to review their structure and proposed relationships.</p>
+        <a className="button button-primary" href="#analysis">Open Schema Architect</a>
+      </section>
+    )
   }
   if (page === 'analysis') {
-    return <EmptyState icon="activity" title="Your analysis workspace is being prepared" description="Analysis tools will help you explore data, ask analytical questions, and turn results into insights." detail="Foundation stage — analysis features are not available yet." />
+    return <SchemaArchitect />
   }
   if (page === 'dashboards') {
     return <EmptyState icon="chart" title="No dashboards yet" description="Create analytical views from your future insights. Dashboards will be available when analysis features are in place." detail="No charts or dashboard data are available yet." />
