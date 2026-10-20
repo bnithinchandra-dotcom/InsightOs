@@ -30,6 +30,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from urllib3.exceptions import HTTPError
 
 from app.database import SessionLocal
+from app.agent.api import router as chat_router
 from app.execution import ExecutionBudget
 from app.jev import (
     VerificationAssessment,
@@ -44,13 +45,15 @@ from app.models import (
     PreprocessingExecution,
     Project,
     SchemaAnalysis,
+    User,
 )
 from app.eda import (
     EDAConfiguration,
+    EDAExecutionInput,
     EDAError,
     EDAResult,
-    analyze_normalized_file,
     eda_configuration_from_dict,
+    execute_eda_task,
     _algorithm_version_for_analysis,
 )
 
@@ -126,6 +129,7 @@ app = FastAPI(
     title="InsightOS API",
     version="0.1.0",
 )
+app.include_router(chat_router)
 
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 UPLOAD_MIME_TYPES = {
@@ -249,6 +253,16 @@ app.add_middleware(UploadFilenameSafetyMiddleware)
 
 
 class DatasetCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    description: str | None = None
+
+
+class LocalProfileCreate(BaseModel):
+    display_name: str = Field(min_length=1, max_length=255)
+    email: str = Field(min_length=3, max_length=255)
+
+
+class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     description: str | None = None
 
@@ -1018,6 +1032,145 @@ def create_dataset(project_id: int, payload: DatasetCreate):
             "description": dataset.description,
             "status": dataset.status,
         }
+
+
+@app.get("/api/v1/workspace/profile")
+def get_local_workspace_profile():
+    with SessionLocal() as session:
+        try:
+            users = session.query(User).order_by(User.id.asc()).limit(2).all()
+        except SQLAlchemyError as error:
+            logger.error("Local workspace profile lookup failed (%s)", type(error).__name__)
+            raise HTTPException(
+                status_code=500,
+                detail="Workspace profile could not be retrieved.",
+            ) from None
+
+        if len(users) > 1:
+            return {
+                "configured": True,
+                "profile": None,
+                "message": (
+                    "Multiple user profiles exist; configure authentication "
+                    "before managing workspace ownership."
+                ),
+            }
+        if not users:
+            return {"configured": False, "profile": None}
+        return {
+            "configured": True,
+            "profile": {
+                "id": users[0].id,
+                "display_name": users[0].display_name,
+                "email": users[0].email,
+            },
+        }
+
+
+@app.post("/api/v1/workspace/profile", status_code=201)
+def create_local_workspace_profile(payload: LocalProfileCreate):
+    display_name = payload.display_name.strip()
+    email = payload.email.strip().lower()
+    if (
+        not display_name
+        or any(ord(character) < 32 for character in display_name)
+        or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_workspace_profile",
+                "message": "Enter a name and a valid email address for the local profile.",
+            },
+        )
+
+    with SessionLocal() as session:
+        try:
+            connection = session.connection()
+            if connection.dialect.name == "postgresql":
+                connection.exec_driver_sql(
+                    "SELECT pg_advisory_xact_lock(731942680154)"
+                )
+            existing = session.query(User.id).limit(1).one_or_none()
+            if existing is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "workspace_profile_already_configured",
+                        "message": (
+                            "A local workspace profile already exists. "
+                            "Authentication is required to add another user."
+                        ),
+                    },
+                )
+
+            profile = User(display_name=display_name, email=email)
+            session.add(profile)
+            session.commit()
+            session.refresh(profile)
+        except HTTPException:
+            session.rollback()
+            raise
+        except SQLAlchemyError as error:
+            session.rollback()
+            logger.error("Local workspace profile creation failed (%s)", type(error).__name__)
+            raise HTTPException(
+                status_code=500,
+                detail="Local workspace profile could not be created.",
+            ) from None
+
+        return {
+            "id": profile.id,
+            "display_name": profile.display_name,
+            "email": profile.email,
+        }
+
+
+@app.post("/api/v1/projects", status_code=201)
+def create_project(payload: ProjectCreate):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="Project name cannot be blank.")
+
+    with SessionLocal() as session:
+        try:
+            users = session.query(User).order_by(User.id.asc()).limit(2).all()
+            if not users:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "workspace_profile_required",
+                        "message": "Create a local workspace profile before creating a project.",
+                    },
+                )
+            if len(users) > 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "authentication_required",
+                        "message": "Authentication is required to choose a project owner.",
+                    },
+                )
+            project = Project(
+                user_id=users[0].id,
+                name=name,
+                description=payload.description,
+            )
+            session.add(project)
+            session.commit()
+            session.refresh(project)
+        except HTTPException:
+            session.rollback()
+            raise
+        except SQLAlchemyError as error:
+            session.rollback()
+            logger.error("Project creation failed (%s)", type(error).__name__)
+            raise HTTPException(
+                status_code=500,
+                detail="Project could not be created.",
+            ) from None
+
+        return serialize_project(project)
 
 
 @app.post("/api/v1/datasets/{dataset_id}/files", status_code=201)
@@ -3513,8 +3666,8 @@ def analyze_dataset_file_eda(
             record.provenance = None
         session.commit()
 
-        try:
-            eda_result = analyze_normalized_file(
+        execution = execute_eda_task(
+            EDAExecutionInput(
                 storage=storage,
                 processed_bucket=processed_bucket,
                 dataset_id=dataset_id,
@@ -3530,38 +3683,48 @@ def analyze_dataset_file_eda(
                 profile_result=dataset_file.profile_result,
                 quality_report=dataset_file.quality_report,
             )
-        except EDAError as error:
+        )
+        eda_result = execution.result
+        if execution.status != "completed" or not isinstance(eda_result, EDAResult):
+            task_error_code = execution.error_code or "task_execution_failed"
+            task_error_message = execution.error_message or (
+                "The task returned an invalid result."
+                if execution.status == "completed"
+                else "EDA analysis failed unexpectedly."
+            )
+            generic_failure = task_error_code in {
+                "task_execution_failed",
+                "invalid_execution_result",
+                "execution_cancelled",
+                "execution_timed_out",
+            }
+            error_code = "analysis_failed" if generic_failure else task_error_code
+            error_message = (
+                "EDA analysis failed unexpectedly."
+                if generic_failure
+                else task_error_message
+            )
             record.status = "Failed"
-            record.error_code = error.code
-            record.error_message = error.message
+            record.error_code = error_code
+            record.error_message = error_message
             record.completed_at = datetime.now(timezone.utc)
             session.commit()
-            status_code = (
-                422
-                if error.code in ("row_limit", "result_size_limit", "artifact_size_limit")
-                else 400
-            )
+            if task_error_code in {
+                "row_limit",
+                "result_size_limit",
+                "artifact_size_limit",
+                "result_too_large",
+            }:
+                status_code = 422
+            elif execution.status == "unavailable":
+                status_code = 503
+            elif generic_failure:
+                status_code = 500
+            else:
+                status_code = 400
             raise HTTPException(
                 status_code=status_code,
-                detail={"code": error.code, "message": error.message},
-            ) from None
-        except Exception as error:
-            record.status = "Failed"
-            record.error_code = "analysis_failed"
-            record.error_message = "EDA analysis failed unexpectedly."
-            record.completed_at = datetime.now(timezone.utc)
-            session.commit()
-            logger.error(
-                "EDA analysis execution failed for file %s (%s)",
-                file_id,
-                type(error).__name__,
-            )
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "code": "analysis_failed",
-                    "message": "EDA analysis failed unexpectedly.",
-                },
+                detail={"code": error_code, "message": error_message},
             ) from None
 
         result_dict = eda_result.as_dict()
@@ -3603,7 +3766,12 @@ def analyze_dataset_file_eda(
                 schema=selected_table.get("schema"),
             )
 
-        return _eda_analysis_response(record)
+        response = _eda_analysis_response(record)
+        response["execution_placement"] = {
+            "target_id": execution.target_id,
+            "rationale": execution.rationale,
+        }
+        return response
 
 
 @app.get("/api/v1/datasets/{dataset_id}/files/{file_id}/eda")

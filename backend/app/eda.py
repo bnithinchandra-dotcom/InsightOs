@@ -25,6 +25,16 @@ from app.execution import (
     ExecutionBudgetExceeded,
     estimate_decoded_python_string_bytes,
 )
+from app.task_execution import (
+    CapabilityRegistry,
+    ExecutionContext,
+    TaskExecutionFailure,
+    TaskExecutionResult,
+    TaskInput,
+    TaskRequirements,
+    backend_eda_registry,
+    run_task,
+)
 from app.profiling import _MAX_DISPLAY_VALUE_LENGTH
 from app.provenance import build_provenance, schema_fingerprint, validate_provenance
 from app.quality_analysis import (
@@ -223,6 +233,24 @@ class EDAResult:
             "multivariate_summary": self.multivariate_summary,
             "provenance": self.provenance,
         }
+
+
+@dataclass(frozen=True)
+class EDAExecutionInput:
+    storage: Any
+    processed_bucket: str
+    dataset_id: int
+    file_id: int
+    file_status: str
+    normalization_status: str
+    source_filename: str
+    source_size_bytes: int
+    source_sha256: str
+    parsed_result: dict
+    normalization_result: dict
+    configuration: EDAConfiguration
+    profile_result: dict | None = None
+    quality_report: dict | None = None
 
 
 @dataclass
@@ -1981,6 +2009,53 @@ def analyze_normalized_file(
                     temp_path.unlink()
                 except FileNotFoundError:
                     pass
+
+
+def execute_eda_task(
+    payload: EDAExecutionInput,
+    *,
+    registry: CapabilityRegistry | None = None,
+) -> TaskExecutionResult[EDAResult]:
+    def operation(
+        _context: ExecutionContext,
+        task_input: EDAExecutionInput,
+    ) -> EDAResult:
+        try:
+            return analyze_normalized_file(
+                storage=task_input.storage,
+                processed_bucket=task_input.processed_bucket,
+                dataset_id=task_input.dataset_id,
+                file_id=task_input.file_id,
+                file_status=task_input.file_status,
+                normalization_status=task_input.normalization_status,
+                source_filename=task_input.source_filename,
+                source_size_bytes=task_input.source_size_bytes,
+                source_sha256=task_input.source_sha256,
+                parsed_result=task_input.parsed_result,
+                normalization_result=task_input.normalization_result,
+                configuration=task_input.configuration,
+                profile_result=task_input.profile_result,
+                quality_report=task_input.quality_report,
+            )
+        except EDAError as error:
+            raise TaskExecutionFailure(error.code, error.message) from None
+
+    return run_task(
+        task=TaskInput("deterministic_eda", payload),
+        requirements=TaskRequirements(
+            required_capabilities=("deterministic_eda",),
+            data_locality="backend",
+            data_classification="sensitive",
+            allowed_targets=("backend",),
+            prefer_local=False,
+            allow_data_transfer=False,
+            max_result_bytes=MAX_EDA_RESULT_BYTES,
+        ),
+        registry=registry or backend_eda_registry(),
+        operation=operation,
+        result_validator=lambda result: isinstance(result, EDAResult),
+        result_serializer=lambda result: result.as_dict(),
+    )
 
 
 def _analyze_local_parquet(

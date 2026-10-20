@@ -9,6 +9,7 @@ async function request(path, { signal, method = 'GET', body } = {}) {
   })
   if (!response.ok) {
     let message = `Request failed (${response.status}).`
+    let code
     try {
       const payload = await response.json()
       const detail = payload?.detail
@@ -17,10 +18,14 @@ async function request(path, { signal, method = 'GET', body } = {}) {
       } else if (typeof detail?.message === 'string' && detail.message.trim()) {
         message = detail.message
       }
+      if (typeof detail?.code === 'string') code = detail.code
     } catch {
       // Keep the status-based message when the server does not return JSON.
     }
-    throw new Error(message)
+    const error = new Error(message)
+    error.code = code
+    error.status = response.status
+    throw error
   }
 
   return response.json()
@@ -54,14 +59,91 @@ export function getProjects(signal) {
   return get('/api/v1/projects', signal).then((value) => expectArray(value, 'projects'))
 }
 
+export function getLocalWorkspaceProfile(signal) {
+  return get('/api/v1/workspace/profile', signal)
+    .then((value) => expectObject(value, 'workspace profile'))
+}
+
+export function createLocalWorkspaceProfile(payload, signal) {
+  return request('/api/v1/workspace/profile', {
+    signal,
+    method: 'POST',
+    body: payload,
+  }).then((value) => expectObject(value, 'workspace profile'))
+}
+
+export function createProject(payload, signal) {
+  return request('/api/v1/projects', {
+    signal,
+    method: 'POST',
+    body: payload,
+  }).then((value) => expectObject(value, 'project'))
+}
+
 export function getProjectDatasets(projectId, signal) {
   return get(`/api/v1/projects/${projectId}/datasets`, signal)
     .then((value) => expectArray(value, 'project datasets'))
 }
 
+export function createDataset(projectId, payload, signal) {
+  return request(`/api/v1/projects/${projectId}/datasets`, {
+    signal,
+    method: 'POST',
+    body: payload,
+  }).then((value) => expectObject(value, 'dataset'))
+}
+
 export function getDatasetFiles(datasetId, signal) {
   return get(`/api/v1/datasets/${datasetId}/files`, signal)
     .then((value) => expectArray(value, 'dataset files'))
+}
+
+export async function uploadDatasetFile(datasetId, file, signal) {
+  const form = new FormData()
+  form.append('file', file)
+  const response = await fetch(`${apiBaseUrl}/api/v1/datasets/${datasetId}/files`, {
+    method: 'POST',
+    signal,
+    body: form,
+  })
+  return expectObject(await readResponse(response), 'uploaded file')
+}
+
+async function readResponse(response) {
+  if (!response.ok) {
+    let message = `Request failed (${response.status}).`
+    let code
+    try {
+      const payload = await response.json()
+      const detail = payload?.detail
+      if (typeof detail === 'string' && detail.trim()) message = detail
+      else if (typeof detail?.message === 'string' && detail.message.trim()) message = detail.message
+      if (typeof detail?.code === 'string') code = detail.code
+    } catch {
+      // Preserve the status message for non-JSON server responses.
+    }
+    const error = new Error(message)
+    error.code = code
+    error.status = response.status
+    throw error
+  }
+  return response.json()
+}
+
+export function normalizeDatasetFile(datasetId, fileId, signal) {
+  return request(`/api/v1/datasets/${datasetId}/files/${fileId}/normalize`, {
+    signal,
+    method: 'POST',
+    body: {},
+  }).then((value) => expectObject(value, 'normalization'))
+}
+
+export function createDatasetEda(datasetId, fileId, payload, signal) {
+  return request(`/api/v1/datasets/${datasetId}/files/${fileId}/eda`, {
+    signal,
+    method: 'POST',
+    body: payload,
+  }).then((value) => expectObject(value, 'EDA analysis'))
 }
 
 export function getSchemaAnalyses(datasetId, { limit = 10, offset = 0, signal } = {}) {
@@ -87,4 +169,37 @@ export function createSchemaAnalysis(datasetId, payload, signal) {
     method: 'POST',
     body: payload,
   }).then((value) => expectObject(value, 'schema analysis'))
+}
+
+export function getChatProviderStatus(signal) {
+  return get('/api/v1/chat/provider-status', signal)
+    .then((value) => expectObject(value, 'chat provider status'))
+}
+
+export function getConversations({ limit = 25, offset = 0, signal } = {}) {
+  const query = new URLSearchParams({ limit: String(limit), offset: String(offset) })
+  return get(`/api/v1/chat/conversations?${query}`, signal)
+    .then((value) => expectArray(value, 'conversations'))
+}
+
+export function getConversation(conversationId, { limit = 100, offset = 0, signal } = {}) {
+  const query = new URLSearchParams({ limit: String(limit), offset: String(offset) })
+  return get(`/api/v1/chat/conversations/${conversationId}?${query}`, signal)
+    .then((value) => expectObject(value, 'conversation'))
+}
+
+export function createConversation(payload = {}, signal) {
+  return request('/api/v1/chat/conversations', {
+    signal,
+    method: 'POST',
+    body: payload,
+  }).then((value) => expectObject(value, 'conversation'))
+}
+
+export function sendConversationMessage(conversationId, content, signal) {
+  return request(`/api/v1/chat/conversations/${conversationId}/messages`, {
+    signal,
+    method: 'POST',
+    body: { content },
+  }).then((value) => expectObject(value, 'chat response'))
 }

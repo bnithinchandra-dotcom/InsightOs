@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
 import { getHealth, getSystemInfo } from './api'
+import BrowserExecution from './BrowserExecution'
+import ConversationWorkspace from './ConversationWorkspace'
+import DataWorkspace from './DataWorkspace'
 import SchemaArchitect from './SchemaArchitect'
 import './App.css'
 
 const primaryNavigation = [
+  { id: 'chat', label: 'Assistant', icon: 'spark' },
   { id: 'overview', label: 'Overview', icon: 'grid' },
   { id: 'projects', label: 'Projects', icon: 'folder' },
   { id: 'datasets', label: 'Datasets', icon: 'database' },
@@ -24,6 +28,10 @@ const services = [
 ]
 
 const pageDetails = {
+  chat: {
+    title: 'Assistant',
+    description: 'Work with your existing projects and deterministic data-analysis capabilities.',
+  },
   overview: {
     title: 'Overview',
     description: 'Your workspace for turning data into decisions.',
@@ -236,19 +244,24 @@ function Overview({ health, systemInfo, loading, error, onRefresh, navigate }) {
           <div><h2>Get started</h2><p>Set up your workspace to begin.</p></div>
         </div>
         <div className="action-grid">
-          <button className="action-card" type="button" disabled title="Project creation is not available yet.">
+          <a className="action-card" href="#projects" onClick={() => navigate('projects')}>
             <span className="action-icon"><Icon name="folder" /></span>
             <span><strong>Create a project</strong><small>Organize your work in projects</small></span>
-            <span className="action-soon">Not available yet</span>
-          </button>
-          <button className="action-card" type="button" disabled title="Dataset ingestion is planned for a later phase.">
+            <span className="action-arrow"><Icon name="arrow" /></span>
+          </a>
+          <a className="action-card" href="#datasets" onClick={() => navigate('datasets')}>
             <span className="action-icon"><Icon name="database" /></span>
             <span><strong>Add a dataset</strong><small>Bring data into your workspace</small></span>
-            <span className="action-soon">Planned</span>
-          </button>
+            <span className="action-arrow"><Icon name="arrow" /></span>
+          </a>
           <a className="action-card" href="#analysis" onClick={() => navigate('analysis')}>
             <span className="action-icon"><Icon name="activity" /></span>
             <span><strong>Open Schema Architect</strong><small>Review relationships across normalized tables</small></span>
+            <span className="action-arrow"><Icon name="arrow" /></span>
+          </a>
+          <a className="action-card" href="#chat" onClick={() => navigate('chat')}>
+            <span className="action-icon"><Icon name="spark" /></span>
+            <span><strong>Start a conversation</strong><small>Explore existing projects and analysis</small></span>
             <span className="action-arrow"><Icon name="arrow" /></span>
           </a>
         </div>
@@ -262,7 +275,7 @@ function Overview({ health, systemInfo, loading, error, onRefresh, navigate }) {
           </div>
           <div className="workspace-empty">
             <span className="empty-icon small"><Icon name="folder" /></span>
-            <div><strong>No projects yet</strong><p>Create a project to organize data and analysis when project creation is available.</p></div>
+            <div><strong>Start with a project</strong><p>Create a project, then upload a supported file to begin analysis.</p></div>
           </div>
         </section>
         <section className="panel activity-panel">
@@ -309,6 +322,7 @@ function SystemPage({ health, systemInfo, loading, error, onRefresh }) {
         error={error}
         onRefresh={onRefresh}
       />
+      <BrowserExecution />
     </div>
   )
 }
@@ -338,20 +352,9 @@ function SettingsPage({ systemInfo }) {
 }
 
 function PageContent({ page, props }) {
+  if (page === 'chat') return <ConversationWorkspace />
   if (page === 'overview') return <Overview {...props} />
-  if (page === 'projects') {
-    return <EmptyState icon="folder" title="No projects yet" description="Create your first InsightOS project to organize datasets, analysis, and dashboards." action="Create Project" detail="Project creation is not available in this foundation draft." />
-  }
-  if (page === 'datasets') {
-    return (
-      <section className="empty-state panel">
-        <div className="empty-icon"><Icon name="database" size={23} /></div>
-        <h2>Choose a dataset to analyze</h2>
-        <p>Select a project, dataset, and normalized tables in Schema Architect to review their structure and proposed relationships.</p>
-        <a className="button button-primary" href="#analysis">Open Schema Architect</a>
-      </section>
-    )
-  }
+  if (page === 'projects' || page === 'datasets') return <DataWorkspace page={page} />
   if (page === 'analysis') {
     return <SchemaArchitect />
   }
@@ -364,7 +367,7 @@ function PageContent({ page, props }) {
 
 function App() {
   const currentHash = useSyncExternalStore(subscribeToHash, getCurrentHash, () => '')
-  const page = pageDetails[currentHash] ? currentHash : 'overview'
+  const page = pageDetails[currentHash] ? currentHash : 'chat'
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [health, setHealth] = useState('loading')
   const [systemInfo, setSystemInfo] = useState(null)

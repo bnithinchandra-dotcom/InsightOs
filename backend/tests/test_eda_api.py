@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from app.database import Base
 from app.models import Dataset, DatasetFile, EDAAnalysis, Project, User
 from app.migrations.versions import b27c49e1d8f3_add_eda_analyses_table as eda_migration
 from app import main, normalization, eda
+from app.task_execution import CapabilityRegistry, ExecutionTarget
 
 
 class MissingObject(Exception):
@@ -209,6 +211,8 @@ class EDAApiTests(unittest.TestCase):
         self.assertEqual(data["dataset_id"], self.dataset_id)
         self.assertEqual(data["file_id"], file_id)
         self.assertEqual(data["status"], "Completed")
+        self.assertEqual(data["execution_placement"]["target_id"], "backend")
+        self.assertIn("matches data locality", data["execution_placement"]["rationale"])
         self.assertIn("id", data)
         analysis_id = data["id"]
         self.assertIsNotNone(data["result"])
@@ -437,6 +441,8 @@ class EDAApiTests(unittest.TestCase):
         )
         self.assertEqual(res2.status_code, 200)
         self.assertEqual(res2.json()["id"], id1)
+        self.assertNotIn("execution_placement", res2.json())
+        self.assertEqual(res2.json()["result"], res1.json()["result"])
 
         # Run 3 with recompute=True
         res3 = self.client.post(
@@ -453,6 +459,102 @@ class EDAApiTests(unittest.TestCase):
         )
         self.assertEqual(res4.status_code, 200)
         self.assertNotEqual(res4.json()["id"], id1)
+
+    def test_eda_domain_errors_keep_their_code_through_execution_boundary(self):
+        file_id = self._setup_normalized_file()
+        with patch(
+            "app.eda.analyze_normalized_file",
+            side_effect=eda.EDAError("row_limit", "Exact EDA exceeded its row limit."),
+        ):
+            response = self.client.post(
+                f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/eda",
+                json={"analysis_type": "univariate", "selected_columns": ["a"]},
+            )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["detail"]["code"], "row_limit")
+        session = self.session_factory()
+        record = session.query(EDAAnalysis).filter(EDAAnalysis.file_id == file_id).one()
+        self.assertEqual(record.status, "Failed")
+        self.assertEqual(record.error_code, "row_limit")
+        session.close()
+
+    def test_eda_requires_a_compatible_backend_capability(self):
+        file_id = self._setup_normalized_file()
+        unavailable_registry = CapabilityRegistry(
+            (
+                ExecutionTarget(
+                    target_id="backend",
+                    kind="backend",
+                    capabilities=frozenset({"different_operation"}),
+                    data_classifications=frozenset({"sensitive"}),
+                ),
+            )
+        )
+        with patch(
+            "app.eda.backend_eda_registry",
+            return_value=unavailable_registry,
+        ):
+            response = self.client.post(
+                f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/eda",
+                json={"analysis_type": "univariate", "selected_columns": ["a"]},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"]["code"], "no_execution_target")
+        session = self.session_factory()
+        record = session.query(EDAAnalysis).filter(EDAAnalysis.file_id == file_id).one()
+        self.assertEqual(record.status, "Failed")
+        self.assertEqual(record.error_code, "no_execution_target")
+        session.close()
+
+    def test_eda_unexpected_task_failure_is_sanitized_and_persisted(self):
+        file_id = self._setup_normalized_file()
+        with patch(
+            "app.eda.analyze_normalized_file",
+            side_effect=RuntimeError("private operation details"),
+        ):
+            response = self.client.post(
+                f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/eda",
+                json={"analysis_type": "univariate", "selected_columns": ["a"]},
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["detail"]["code"], "analysis_failed")
+        self.assertNotIn("private operation details", response.text)
+        session = self.session_factory()
+        record = session.query(EDAAnalysis).filter(EDAAnalysis.file_id == file_id).one()
+        self.assertEqual(record.status, "Failed")
+        self.assertEqual(record.error_code, "analysis_failed")
+        session.close()
+
+    def test_eda_task_rejects_serialized_results_over_boundary_limit(self):
+        file_id = self._setup_normalized_file()
+        analyze = eda.analyze_normalized_file
+
+        def oversized_result(**arguments):
+            result = analyze(**arguments)
+            return replace(
+                result,
+                warnings=(*result.warnings, "x" * eda.MAX_EDA_RESULT_BYTES),
+            )
+
+        with patch(
+            "app.eda.analyze_normalized_file",
+            side_effect=oversized_result,
+        ):
+            response = self.client.post(
+                f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/eda",
+                json={"analysis_type": "univariate", "selected_columns": ["a"]},
+            )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["detail"]["code"], "result_too_large")
+        session = self.session_factory()
+        record = session.query(EDAAnalysis).filter(EDAAnalysis.file_id == file_id).one()
+        self.assertEqual(record.status, "Failed")
+        self.assertEqual(record.error_code, "result_too_large")
+        session.close()
 
     def test_pagination_and_listing(self):
         file_id = self._setup_normalized_file()
