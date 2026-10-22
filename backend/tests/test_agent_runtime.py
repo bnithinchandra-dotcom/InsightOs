@@ -2,10 +2,13 @@ import json
 import unittest
 from unittest.mock import patch
 
+import httpx2
+
 from app.agent.config import AgentSettings
 from app.agent.contracts import (
     ModelRequest,
     ModelResponse,
+    ProviderHealth,
     ProviderError,
     ProviderMessage,
     ToolCall,
@@ -63,7 +66,7 @@ class FakeHttpClient:
     def __exit__(self, *_args):
         return False
 
-    def stream(self, method, url, json, headers):
+    def stream(self, method, url, json=None, headers=None):
         self.request = (method, url, json, headers)
         return self.response
 
@@ -153,6 +156,118 @@ class AgentProviderTests(unittest.TestCase):
         self.assertEqual(response.message.tool_calls[0].name, "list_projects")
         self.assertEqual(response.message.tool_calls[0].arguments, {})
         self.assertEqual(response.usage, UsageMetadata(5, 3))
+        self.assertEqual(client.request[3]["Authorization"], "Bearer fixture-secret")
+
+    def test_openai_json_mode_is_forwarded_to_provider(self):
+        client = FakeHttpClient(
+            FakeHttpResponse({
+                "choices": [{
+                    "message": {"role": "assistant", "content": '{"ok":true}'},
+                    "finish_reason": "stop",
+                }],
+            })
+        )
+        with patch("app.agent.providers.httpx2.Client", return_value=client):
+            OpenAICompatibleProvider(
+                settings("openai_compatible", api_key="fixture-secret")
+            ).complete(
+                ModelRequest(
+                    "fixture-model",
+                    (),
+                    (),
+                    32,
+                    response_format="json",
+                )
+            )
+        self.assertEqual(
+            client.request[2]["response_format"],
+            {"type": "json_object"},
+        )
+
+    def test_ollama_json_mode_is_forwarded_to_provider(self):
+        client = FakeHttpClient(
+            FakeHttpResponse({
+                "message": {"role": "assistant", "content": '{"ok":true}'},
+                "done_reason": "stop",
+            })
+        )
+        with patch("app.agent.providers.httpx2.Client", return_value=client):
+            OllamaProvider(settings()).complete(
+                ModelRequest(
+                    "fixture-model",
+                    (),
+                    (),
+                    32,
+                    response_format="json",
+                )
+            )
+        self.assertEqual(client.request[2]["format"], "json")
+
+    def test_ollama_health_requires_configured_model_in_runtime_model_list(self):
+        available_client = FakeHttpClient(
+            FakeHttpResponse({"models": [{"name": "fixture-model"}]})
+        )
+        version_client = FakeHttpClient(
+            FakeHttpResponse({"version": "0.13.0"})
+        )
+        with patch(
+            "app.agent.providers.httpx2.Client",
+            side_effect=[available_client, version_client],
+        ):
+            health = OllamaProvider(settings()).check_health()
+        self.assertEqual(
+            health,
+            ProviderHealth(status="healthy", runtime_version="0.13.0"),
+        )
+        self.assertEqual(available_client.request[:2], ("GET", "http://provider.invalid/api/tags"))
+        self.assertEqual(version_client.request[:2], ("GET", "http://provider.invalid/api/version"))
+
+        missing_client = FakeHttpClient(FakeHttpResponse({"models": []}))
+        with patch(
+            "app.agent.providers.httpx2.Client",
+            return_value=missing_client,
+        ):
+            health = OllamaProvider(settings()).check_health()
+        self.assertEqual(health.status, "unavailable")
+
+    def test_openai_health_uses_authenticated_model_list(self):
+        client = FakeHttpClient(
+            FakeHttpResponse({"data": [{"id": "fixture-model"}]})
+        )
+        with patch("app.agent.providers.httpx2.Client", return_value=client):
+            health = OpenAICompatibleProvider(
+                settings("openai_compatible", api_key="fixture-secret")
+            ).check_health()
+        self.assertEqual(health, ProviderHealth(status="healthy"))
+        self.assertEqual(client.request[:2], ("GET", "http://provider.invalid/models"))
+        self.assertEqual(client.request[3]["Authorization"], "Bearer fixture-secret")
+
+    def test_provider_sanitizes_timeout_and_connection_failures(self):
+        failures = (
+            (httpx2.TimeoutException("private timeout"), "provider_timeout"),
+            (httpx2.ConnectError("private address"), "provider_unavailable"),
+        )
+        for exception, expected_code in failures:
+            with self.subTest(expected_code=expected_code):
+                with patch(
+                    "app.agent.providers.httpx2.Client",
+                    side_effect=exception,
+                ):
+                    with self.assertRaises(ProviderError) as raised:
+                        OllamaProvider(settings()).complete(
+                            ModelRequest("fixture-model", (), (), 32)
+                        )
+                self.assertEqual(raised.exception.code, expected_code)
+                self.assertNotIn("private", raised.exception.message)
+
+    def test_provider_rejects_malformed_json_responses(self):
+        client = FakeHttpClient(FakeHttpResponse(b"not JSON"))
+        with patch("app.agent.providers.httpx2.Client", return_value=client):
+            with self.assertRaises(ProviderError) as raised:
+                OllamaProvider(settings()).complete(
+                    ModelRequest("fixture-model", (), (), 32)
+                )
+        self.assertEqual(raised.exception.code, "provider_response_invalid")
 
     def test_provider_error_does_not_include_raw_payload_or_credentials(self):
         client = FakeHttpClient(

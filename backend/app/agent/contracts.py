@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 
 Role = Literal["system", "user", "assistant", "tool"]
+CapabilityStatus = Literal["supported", "unsupported", "unverified"]
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,7 @@ class ModelRequest:
     messages: tuple[ProviderMessage, ...]
     tools: tuple[dict[str, Any], ...]
     max_output_tokens: int
+    response_format: Literal["json"] | None = None
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,12 @@ class ModelResponse:
     message: ProviderMessage
     finish_reason: str
     usage: UsageMetadata = field(default_factory=UsageMetadata)
+
+
+@dataclass(frozen=True)
+class ProviderHealth:
+    status: Literal["healthy", "unavailable"]
+    runtime_version: str | None = None
 
 
 class ProviderError(Exception):

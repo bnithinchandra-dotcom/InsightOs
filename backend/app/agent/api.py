@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Annotated
+from typing import Annotated, Literal
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
@@ -17,7 +17,13 @@ from app.agent.config import (
     MAX_USER_MESSAGE_CHARS,
     get_agent_settings,
 )
-from app.agent.contracts import AgentOutcome, ProviderError, UsageMetadata
+from app.agent.contracts import (
+    AgentOutcome,
+    CapabilityStatus,
+    ProviderError,
+    UsageMetadata,
+)
+from app.agent.providers import create_provider
 from app.agent.runtime import execute_agent_request, public_outcome_metadata
 from app.database import SessionLocal
 from app.models import Conversation, ConversationMessage, Dataset, Project
@@ -83,9 +89,18 @@ class ChatTurnResponse(BaseModel):
 
 class ProviderStatusResponse(BaseModel):
     provider: str
-    status: str
+    status: Literal[
+        "not_configured",
+        "invalid_configuration",
+        "unavailable",
+        "failed",
+        "healthy",
+    ]
     model: str | None
     message: str
+    capabilities: dict[str, CapabilityStatus]
+    limits: dict[str, int | None]
+    runtime_version: str | None = None
 
 
 def _conversation_summary(conversation: Conversation) -> dict[str, Any]:
@@ -122,14 +137,24 @@ def _utcnow() -> datetime:
 
 
 def _provider_status() -> dict[str, Any]:
+    capabilities: dict[str, CapabilityStatus] = {
+        "text_generation": "unsupported",
+        "structured_output": "unsupported",
+        "tool_calling": "unsupported",
+        "streaming": "unsupported",
+        "local_inference": "unsupported",
+    }
     try:
         settings = get_agent_settings()
-    except ProviderError as error:
+    except ProviderError:
         return {
             "provider": "invalid",
             "status": "invalid_configuration",
             "model": None,
-            "message": error.message,
+            "message": "The model provider configuration is invalid.",
+            "capabilities": capabilities,
+            "limits": {"max_output_tokens": None, "context_window_tokens": None},
+            "runtime_version": None,
         }
     if settings.provider == "none":
         return {
@@ -137,6 +162,12 @@ def _provider_status() -> dict[str, Any]:
             "status": "not_configured",
             "model": None,
             "message": "Configure Ollama or an OpenAI-compatible model to use the assistant. Deterministic data APIs remain available.",
+            "capabilities": capabilities,
+            "limits": {
+                "max_output_tokens": settings.max_output_tokens,
+                "context_window_tokens": None,
+            },
+            "runtime_version": None,
         }
     missing = not settings.model or (
         settings.provider == "openai_compatible" and not settings.api_key
@@ -147,12 +178,60 @@ def _provider_status() -> dict[str, Any]:
             "status": "not_configured",
             "model": settings.model,
             "message": "The selected model provider needs additional server-side configuration.",
+            "capabilities": capabilities,
+            "limits": {
+                "max_output_tokens": settings.max_output_tokens,
+                "context_window_tokens": None,
+            },
+            "runtime_version": None,
         }
+    capabilities = {
+        "text_generation": "unverified",
+        "structured_output": "unverified",
+        "tool_calling": "unverified",
+        "streaming": "unsupported",
+        "local_inference": "unverified",
+    }
+    limits = {
+        "max_output_tokens": settings.max_output_tokens,
+        "context_window_tokens": None,
+    }
+    try:
+        health = create_provider(settings).check_health()
+    except ProviderError as error:
+        unavailable_codes = {
+            "provider_timeout",
+            "provider_unavailable",
+            "provider_rate_limited",
+        }
+        is_unavailable = error.code in unavailable_codes
+        return {
+            "provider": settings.provider,
+            "status": "unavailable" if is_unavailable else "failed",
+            "model": settings.model,
+            "message": (
+                "The configured model runtime is unavailable."
+                if is_unavailable
+                else "The configured model runtime could not verify its status."
+            ),
+            "capabilities": capabilities,
+            "limits": limits,
+            "runtime_version": None,
+        }
+    status_value = health.status
     return {
         "provider": settings.provider,
-        "status": "configured",
+        "status": status_value,
         "model": settings.model,
-        "message": "Provider configuration is present. Connectivity is checked when a message is sent.",
+        "message": (
+            "The provider runtime and configured model are reachable. "
+            "Generation behavior remains unverified until model evaluation."
+            if status_value == "healthy"
+            else "The provider is reachable, but the configured model is not available."
+        ),
+        "capabilities": capabilities,
+        "limits": limits,
+        "runtime_version": health.runtime_version,
     }
 
 

@@ -84,6 +84,7 @@ is a short navigation document. Operation contracts remain in:
 - [Quality rule catalog](backend/QUALITY_RULE_CATALOG.md)
 - [Preprocessing operations](backend/PREPROCESSING_ARCHITECTURE.md)
 - [EDA](backend/EDA_ARCHITECTURE.md)
+- [Open model foundation and evaluation](backend/OPEN_MODEL_FOUNDATION.md)
 
 ## Development roadmap
 
@@ -98,6 +99,7 @@ is a short navigation document. Operation contracts remain in:
 | 4. AI Schema Architect | Partial | Deterministic schema discovery, relationship evidence, and conditional dimensional-model recommendations with PostgreSQL persistence and versioned provenance; the Schema Architect UI and its disposable-service workflow validation are implemented. |
 | 5A. Conversational assistant foundation | Foundation accepted; live local-model verification pending | Bounded model adapters, allowlisted deterministic tools, persisted conversations, and a conversation-first UI; no authentication, dashboards, or approval-gated preprocessing. A separate local-only workspace workflow supports profile/project setup, upload, normalization, and univariate EDA. |
 | 5B. Capability-aware execution foundation | Partial | Typed target/task contracts, privacy/locality-aware placement, the existing read-only agent-tool boundary routed through the backend target, and a bounded browser Web Worker SHA-256 demonstration. No BI analysis has moved to browser/local execution; no cross-environment scheduler or queue exists. |
+| 5C. Open model foundation | Provider health and synthetic evaluation implemented; live model verification pending | Provider-neutral completion, honest health/capability status, and an evaluation harness exist. No runtime or model weights are installed; no real inference has been claimed. |
 | 5-13. Remaining agents, BI, ML, monitoring, governance, production | Planned | Do not treat roadmap descriptions as implemented capabilities. |
 
 ## Assistant configuration
@@ -108,8 +110,14 @@ an accessible `OLLAMA_BASE_URL`, or
 `INSIGHTOS_LLM_PROVIDER=openai_compatible` with the server-side base URL, model,
 and API key. The OpenAI-compatible adapter can send configured prompts and
 tool results to that provider; do not enable it with data unless that transfer
-is acceptable. Timeout, output-token, model-turn, tool-call, and history
-limits are listed in `.env.example`.
+is acceptable. The provider-status endpoint now checks whether the configured
+runtime lists the selected model; this does not verify generation quality.
+Capabilities remain `unverified` until tested with the selected model. There
+is no automatic provider fallback. Timeout, output-token, model-turn,
+tool-call, and history limits are listed in `.env.example`. See the
+[open model foundation](backend/OPEN_MODEL_FOUNDATION.md) for the local model
+recommendation, resource constraints, evaluation command, and approval-gated
+setup instructions.
 
 The assistant only invokes its named read-only discovery and retrieval tools.
 It does not start/recompute quality, EDA, or schema analyses, nor run arbitrary

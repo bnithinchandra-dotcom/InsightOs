@@ -9,6 +9,7 @@ from app.agent.config import AgentSettings
 from app.agent.contracts import (
     ModelRequest,
     ModelResponse,
+    ProviderHealth,
     ProviderError,
     ProviderMessage,
     ToolCall,
@@ -21,6 +22,8 @@ MAX_PROVIDER_RESPONSE_BYTES = 1024 * 1024
 
 class ModelProvider(Protocol):
     def complete(self, request: ModelRequest) -> ModelResponse: ...
+
+    def check_health(self) -> ProviderHealth: ...
 
 
 def _tool_call_id(value: Any, fallback: str) -> str:
@@ -161,19 +164,23 @@ class _HttpProvider:
         self.settings = settings
         self.transport = transport
 
-    def _post(self, url: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         try:
             with httpx2.Client(
                 timeout=self.settings.timeout_seconds,
                 transport=self.transport,
                 follow_redirects=False,
             ) as client:
-                with client.stream(
-                    "POST",
-                    url,
-                    json=payload,
-                    headers=headers,
-                ) as response:
+                request_options: dict[str, Any] = {"headers": headers}
+                if payload is not None:
+                    request_options["json"] = payload
+                with client.stream(method, url, **request_options) as response:
                     if response.status_code == 429:
                         raise ProviderError(
                             "provider_rate_limited",
@@ -230,8 +237,46 @@ class _HttpProvider:
             )
         return payload_result
 
+    def _post(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+    ) -> dict[str, Any]:
+        return self._request("POST", url, headers, payload)
+
+    def _get(self, url: str, headers: dict[str, str]) -> dict[str, Any]:
+        return self._request("GET", url, headers)
+
 
 class OllamaProvider(_HttpProvider):
+    def check_health(self) -> ProviderHealth:
+        if not self.settings.model:
+            raise ProviderError(
+                "provider_not_configured",
+                "Configure OLLAMA_MODEL before using the local model provider.",
+            )
+        payload = self._get(f"{self.settings.base_url}/api/tags", {})
+        models = payload.get("models")
+        if not isinstance(models, list):
+            raise ProviderError(
+                "provider_response_invalid",
+                "The configured model provider returned an invalid model list.",
+            )
+        available = any(
+            isinstance(item, dict)
+            and self.settings.model in {item.get("name"), item.get("model")}
+            for item in models
+        )
+        if not available:
+            return ProviderHealth(status="unavailable")
+        version_response = self._get(f"{self.settings.base_url}/api/version", {})
+        version = version_response.get("version")
+        return ProviderHealth(
+            status="healthy",
+            runtime_version=version if isinstance(version, str) else None,
+        )
+
     def complete(self, request: ModelRequest) -> ModelResponse:
         if not self.settings.model:
             raise ProviderError(
@@ -246,6 +291,7 @@ class OllamaProvider(_HttpProvider):
                 "tools": list(request.tools),
                 "stream": False,
                 "options": {"num_predict": request.max_output_tokens},
+                **({"format": "json"} if request.response_format == "json" else {}),
             },
             {},
         )
@@ -267,19 +313,52 @@ class OllamaProvider(_HttpProvider):
 
 
 class OpenAICompatibleProvider(_HttpProvider):
-    def complete(self, request: ModelRequest) -> ModelResponse:
-        if not self.settings.model or not self.settings.api_key:
-            raise ProviderError(
-                "provider_not_configured",
-                "Configure OPENAI_COMPATIBLE_MODEL and OPENAI_COMPATIBLE_API_KEY before using this provider.",
-            )
+    def _endpoint(self, resource: str) -> str:
         base_url = self.settings.base_url
         if base_url is None:
             raise ProviderError(
                 "provider_configuration_invalid",
                 "OPENAI_COMPATIBLE_BASE_URL must be configured.",
             )
-        endpoint = base_url if base_url.endswith("/chat/completions") else f"{base_url.rstrip('/')}/chat/completions"
+        base_url = base_url.removesuffix("/chat/completions").rstrip("/")
+        if base_url.endswith(f"/{resource}"):
+            return base_url
+        return f"{base_url}/{resource}"
+
+    def _headers(self) -> dict[str, str]:
+        if not self.settings.api_key:
+            raise ProviderError(
+                "provider_not_configured",
+                "Configure OPENAI_COMPATIBLE_API_KEY before using this provider.",
+            )
+        return {"Authorization": f"Bearer {self.settings.api_key}"}
+
+    def check_health(self) -> ProviderHealth:
+        if not self.settings.model:
+            raise ProviderError(
+                "provider_not_configured",
+                "Configure OPENAI_COMPATIBLE_MODEL before using this provider.",
+            )
+        payload = self._get(self._endpoint("models"), self._headers())
+        models = payload.get("data")
+        if not isinstance(models, list):
+            raise ProviderError(
+                "provider_response_invalid",
+                "The configured model provider returned an invalid model list.",
+            )
+        available = any(
+            isinstance(item, dict) and item.get("id") == self.settings.model
+            for item in models
+        )
+        return ProviderHealth(status="healthy" if available else "unavailable")
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        if not self.settings.model or not self.settings.api_key:
+            raise ProviderError(
+                "provider_not_configured",
+                "Configure OPENAI_COMPATIBLE_MODEL and OPENAI_COMPATIBLE_API_KEY before using this provider.",
+            )
+        endpoint = self._endpoint("chat/completions")
         payload = self._post(
             endpoint,
             {
@@ -288,6 +367,11 @@ class OpenAICompatibleProvider(_HttpProvider):
                 "tools": list(request.tools),
                 "tool_choice": "auto",
                 "max_tokens": request.max_output_tokens,
+                **(
+                    {"response_format": {"type": "json_object"}}
+                    if request.response_format == "json"
+                    else {}
+                ),
             },
             {"Authorization": f"Bearer {self.settings.api_key}"},
         )

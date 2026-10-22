@@ -131,7 +131,8 @@
   text-transform: capitalize;
 }
 
-.provider-configured {
+.provider-configured,
+.provider-healthy {
   border-color: #2b604e;
   color: var(--green);
 }
@@ -140,6 +141,12 @@
 .provider-invalid_configuration {
   border-color: #69562e;
   color: var(--yellow);
+}
+
+.provider-unavailable,
+.provider-failed {
+  border-color: #683b3b;
+  color: #f0a3a3;
 }
 
 .provider-notice,

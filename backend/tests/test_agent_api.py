@@ -1,6 +1,6 @@
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
@@ -10,7 +10,8 @@ from sqlalchemy.pool import StaticPool
 
 from app import main
 from app.agent import api as chat_api
-from app.agent.contracts import AgentOutcome, UsageMetadata
+from app.agent.config import AgentSettings
+from app.agent.contracts import AgentOutcome, ProviderError, ProviderHealth, UsageMetadata
 from app.database import Base
 from app.migrations.versions import (
     da7304d9fe22_add_conversations as conversation_migration,
@@ -235,6 +236,113 @@ class ConversationApiTests(unittest.TestCase):
             self.assertEqual(record.status, "Processing")
             self.assertIsNotNone(record.processing_token)
             self.assertEqual(session.query(ConversationMessage).count(), 1)
+
+    def test_provider_status_reports_unconfigured_without_claiming_capabilities(self):
+        settings = AgentSettings(
+            provider="none",
+            base_url=None,
+            model=None,
+            api_key=None,
+            timeout_seconds=1,
+            max_output_tokens=32,
+            max_model_turns=1,
+            max_tool_calls=1,
+            max_history_messages=1,
+        )
+        with patch.object(chat_api, "get_agent_settings", return_value=settings):
+            response = self.client.get("/api/v1/chat/provider-status")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "not_configured")
+        self.assertEqual(response.json()["capabilities"]["text_generation"], "unsupported")
+        self.assertIsNone(response.json()["limits"]["context_window_tokens"])
+
+    def test_provider_status_reports_live_health_and_unverified_model_capabilities(self):
+        settings = AgentSettings(
+            provider="ollama",
+            base_url="http://localhost:11434",
+            model="fixture-model",
+            api_key=None,
+            timeout_seconds=1,
+            max_output_tokens=32,
+            max_model_turns=1,
+            max_tool_calls=1,
+            max_history_messages=1,
+        )
+        provider = Mock()
+        provider.check_health.return_value = ProviderHealth(status="healthy")
+        with patch.object(chat_api, "get_agent_settings", return_value=settings), patch.object(
+            chat_api,
+            "create_provider",
+            return_value=provider,
+        ):
+            response = self.client.get("/api/v1/chat/provider-status")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "healthy")
+        self.assertEqual(
+            response.json()["capabilities"]["text_generation"],
+            "unverified",
+        )
+        self.assertEqual(response.json()["capabilities"]["streaming"], "unsupported")
+        self.assertEqual(response.json()["limits"]["max_output_tokens"], 32)
+        self.assertNotIn("localhost", response.text)
+
+    def test_provider_status_reports_unavailable_runtime_without_raw_error(self):
+        settings = AgentSettings(
+            provider="ollama",
+            base_url="http://localhost:11434",
+            model="fixture-model",
+            api_key=None,
+            timeout_seconds=1,
+            max_output_tokens=32,
+            max_model_turns=1,
+            max_tool_calls=1,
+            max_history_messages=1,
+        )
+        provider = Mock()
+        provider.check_health.side_effect = ProviderError(
+            "provider_unavailable",
+            "private runtime detail",
+        )
+        with patch.object(chat_api, "get_agent_settings", return_value=settings), patch.object(
+            chat_api,
+            "create_provider",
+            return_value=provider,
+        ):
+            response = self.client.get("/api/v1/chat/provider-status")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "unavailable")
+        self.assertNotIn("private runtime detail", response.text)
+
+    def test_provider_status_sanitizes_health_check_failures(self):
+        settings = AgentSettings(
+            provider="openai_compatible",
+            base_url="https://provider.invalid/v1",
+            model="fixture-model",
+            api_key="fixture-secret",
+            timeout_seconds=1,
+            max_output_tokens=32,
+            max_model_turns=1,
+            max_tool_calls=1,
+            max_history_messages=1,
+        )
+        provider = Mock()
+        provider.check_health.side_effect = ProviderError(
+            "provider_authentication_failed",
+            "fixture-secret",
+        )
+        with patch.object(chat_api, "get_agent_settings", return_value=settings), patch.object(
+            chat_api,
+            "create_provider",
+            return_value=provider,
+        ):
+            response = self.client.get("/api/v1/chat/provider-status")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "failed")
+        self.assertNotIn("fixture-secret", response.text)
 
     def test_conversation_migration_upgrade_and_downgrade(self):
         with self.engine.begin() as connection:
