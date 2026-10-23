@@ -16,7 +16,7 @@ from app.agent.contracts import (
     UsageMetadata,
 )
 from app.agent.providers import OpenAICompatibleProvider, OllamaProvider
-from app.agent.runtime import execute_agent_request
+from app.agent.runtime import SYSTEM_INSTRUCTIONS, execute_agent_request
 from app.agent.tools import StrictArguments, ToolDefinition, ToolRegistry
 
 
@@ -86,6 +86,21 @@ class SequenceProvider:
 
 
 class AgentProviderTests(unittest.TestCase):
+    def test_system_instructions_define_finance_and_execution_evidence_rules(self):
+        self.assertIn("profit equals revenue minus expenses, not an outflow", SYSTEM_INSTRUCTIONS)
+        self.assertIn("If revenue is missing or zero", SYSTEM_INSTRUCTIONS)
+        self.assertIn("Check date parsing and numeric values", SYSTEM_INSTRUCTIONS)
+        self.assertIn("Group valid records by calendar month", SYSTEM_INSTRUCTIONS)
+        self.assertIn("Zero revenue makes margin mathematically undefined", SYSTEM_INSTRUCTIONS)
+        self.assertIn("Flag negative revenue for validation or business-policy review", SYSTEM_INSTRUCTIONS)
+        self.assertIn("do not automatically classify it as invalid or exclude it without that policy", SYSTEM_INSTRUCTIONS)
+        self.assertIn("defer its treatment until the applicable policy is known", SYSTEM_INSTRUCTIONS)
+        self.assertIn("Do not claim division by a negative number is mathematically undefined", SYSTEM_INSTRUCTIONS)
+        self.assertIn("actual columns cannot be confirmed", SYSTEM_INSTRUCTIONS)
+        self.assertIn("customer count, churn count, and time period separately", SYSTEM_INSTRUCTIONS)
+        self.assertIn("ask a concise clarification", SYSTEM_INSTRUCTIONS)
+        self.assertIn("only when the corresponding tool result is present", SYSTEM_INSTRUCTIONS)
+
     def test_default_registry_only_advertises_read_only_tools(self):
         registry = ToolRegistry()
         names = {

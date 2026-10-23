@@ -1,0 +1,94 @@
+{
+  "suite_version": "insightos-hf-baseline-v2",
+  "description": "Synthetic-only baseline suite for local Hugging Face checkpoint evaluation.",
+  "cases": [
+    {
+      "id": "business_revenue_profit",
+      "category": "business_understanding",
+      "purpose": "Distinguish revenue from profit without calculating unsupported values.",
+      "prompt": "In plain language, explain the difference between a business's revenue and its profit. Do not invent example values.",
+      "expected_behavior": "Revenue is income from sales before costs; profit is what remains after costs are deducted.",
+      "scorer": "human_review",
+      "human_review_rubric": [
+        "Revenue is described as sales/income before costs.",
+        "Profit is described as the amount remaining after costs.",
+        "No unsupported numerical example is invented."
+      ]
+    },
+    {
+      "id": "instruction_exactly_two_sentences",
+      "category": "instruction_following",
+      "purpose": "Measure a simple, independently machine-checkable output constraint.",
+      "prompt": "Explain the difference between revenue and profit in exactly two short sentences. Do not use abbreviations.",
+      "expected_behavior": "Exactly two non-empty sentences.",
+      "scorer": "two_sentences",
+      "human_review_rubric": [
+        "Separately review whether both sentences correctly distinguish revenue from profit."
+      ]
+    },
+    {
+      "id": "json_profit_margin",
+      "category": "structured_output_and_calculation",
+      "purpose": "Check JSON-only compliance, schema shape, and a deterministic calculation.",
+      "prompt": "Revenue is 1000 and profit is 250. Calculate profit margin as a percentage. Return only a JSON object with exactly these keys: metric, value, unit. Use metric \"profit_margin\", value 25, and unit \"%\".",
+      "expected_behavior": "A JSON object with exactly metric=\"profit_margin\", numeric value 25, and unit=\"%\"; no prose outside JSON.",
+      "scorer": "json_profit_margin",
+      "expected": {
+        "metric": "profit_margin",
+        "value": 25,
+        "unit": "%",
+        "absolute_tolerance": 0.01
+      }
+    },
+    {
+      "id": "missing_churn_inputs",
+      "category": "grounding_and_uncertainty",
+      "purpose": "Check abstention when required business inputs are absent.",
+      "prompt": "Calculate the customer churn rate for this business. No customer counts, churn counts, or time period have been provided. State what is missing and do not invent a rate.",
+      "expected_behavior": "Clearly state that churn cannot be calculated from the supplied information and identify the missing inputs without inventing a percentage.",
+      "scorer": "missing_inputs",
+      "human_review_rubric": [
+        "The response does not claim a churn rate.",
+        "The response identifies that relevant customer/churn counts and a period are missing."
+      ]
+    },
+    {
+      "id": "analysis_plan_profit_margin",
+      "category": "data_analysis_planning",
+      "purpose": "Check required financial fields, date validation, monthly aggregation, formulas, safe missing-data handling, and honest limits.",
+      "prompt": "A CSV contains order records. Describe the columns and high-level steps needed to calculate monthly profit margin. Do not claim to have inspected or analyzed a file.",
+      "expected_behavior": "Identify revenue and expense/profit fields and a date field; validate the date values, group by month, calculate profit as revenue minus expenses, and calculate profit margin as profit divided by revenue times 100. State that the source schema is unavailable and do not assert unprovided columns exist. If revenue is missing or zero, do not calculate a margin and identify the undefined or missing input; zero profit with positive revenue yields a valid 0% margin. Do not claim execution.",
+      "scorer": "human_review",
+      "human_review_rubric": [
+        "Names revenue and expense/cost fields or profit as required data.",
+        "Names a date/time field, validates it, and groups records by month.",
+        "States profit = revenue - expenses and profit margin = profit / revenue * 100.",
+        "States that the source schema is unavailable and does not assert unprovided columns exist.",
+        "Does not calculate a margin when revenue is missing or zero; recognizes that zero profit with positive revenue gives a valid 0% margin.",
+        "Does not claim to have inspected or analyzed a file."
+      ]
+    },
+    {
+      "id": "tool_plan_without_execution",
+      "category": "tool_use_planning",
+      "purpose": "Assess a textual plan while explicitly separating planning from tool execution.",
+      "prompt": "You have not been given a file or access to tools. Describe a safe, high-level plan for checking whether a CSV has the columns needed to calculate profit margin. Do not claim that you opened a file, called a tool, or calculated a result.",
+      "expected_behavior": "Describe a plausible validation plan and make clear that no file was accessed and no tool was executed.",
+      "scorer": "human_review",
+      "human_review_rubric": [
+        "Mentions checking for revenue and cost/profit fields.",
+        "Mentions validating relevant values or missingness before calculation.",
+        "Does not claim file access, tool execution, or a computed result."
+      ]
+    },
+    {
+      "id": "repeat_exact_token",
+      "category": "repeatability",
+      "purpose": "Check exact repeatability under greedy decoding on a simple prompt.",
+      "prompt": "Synthetic token: ORBIT-72. Return only the exact token, with no explanation.",
+      "expected_behavior": "Return exactly ORBIT-72 on every repetition.",
+      "scorer": "repeat_token",
+      "repetitions": 3
+    }
+  ]
+}
