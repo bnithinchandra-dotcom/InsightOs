@@ -468,8 +468,13 @@ function DataWorkspace({ page }) {
                                     [file.id]: event.target.value,
                                   }))}
                                 >
-                                  {columns.map((column) => (
-                                    <option key={column.name} value={column.name}>{column.name}</option>
+                                  {columns.map((column, index) => (
+                                    <option
+                                      key={column.id ?? `${column.name}-${index}`}
+                                      value={column.name}
+                                    >
+                                      {column.name}
+                                    </option>
                                   ))}
                                 </select>
                               </label>

@@ -153,6 +153,56 @@ describe('data workspace upload flow', () => {
     })
   })
 
+  it('renders duplicate column names with distinct React keys', async () => {
+    globalThis.fetch = vi.fn(async (input) => {
+      const url = new URL(String(input), window.location.origin)
+      if (url.pathname === '/api/v1/workspace/profile') {
+        return jsonResponse({
+          configured: true,
+          profile: { id: 1, display_name: 'Local analyst', email: 'analyst@example.invalid' },
+        })
+      }
+      if (url.pathname === '/api/v1/projects') return jsonResponse([project])
+      if (url.pathname === `/api/v1/projects/${project.id}/datasets`) {
+        return jsonResponse([dataset])
+      }
+      if (url.pathname === `/api/v1/datasets/${dataset.id}/files`) {
+        return jsonResponse([{
+          id: 39,
+          dataset_id: dataset.id,
+          filename: 'sales.csv',
+          status: 'Ready',
+          detected_format: 'csv',
+          normalization_status: 'Ready',
+          profile_result: {
+            tables: [{
+              columns: [
+                { name: 'revenue', position: 0 },
+                { name: 'revenue', position: 0 },
+              ],
+            }],
+          },
+        }])
+      }
+      return jsonResponse({ detail: `Unexpected request: ${url.pathname}` }, 500)
+    })
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    try {
+      render(<DataWorkspace page="datasets" />)
+      const columnSelect = await screen.findByLabelText('Column')
+      expect([...columnSelect.options].map((option) => option.value)).toEqual([
+        'revenue',
+        'revenue',
+      ])
+      expect(consoleError.mock.calls.flat().join(' ')).not.toMatch(
+        /same key|unique "key" prop/i,
+      )
+    } finally {
+      consoleError.mockRestore()
+    }
+  })
+
   it('shows an actionable upload error returned by the API', async () => {
     globalThis.fetch = vi.fn(async (input, options = {}) => {
       const url = new URL(String(input), window.location.origin)
