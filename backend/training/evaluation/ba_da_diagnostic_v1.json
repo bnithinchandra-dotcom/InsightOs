@@ -1,0 +1,2218 @@
+{
+  "benchmark_version": "insightos-ba-da-diagnostic-v2",
+  "modes": [
+    "base",
+    "context_assisted",
+    "tool_assisted"
+  ],
+  "diagnostic_pairs": [
+    {
+      "pair_id": "margin_formula_context",
+      "case_id": "calc_margin",
+      "compare_modes": [
+        "base",
+        "context_assisted"
+      ],
+      "diagnostic_question": "Does the controlled definition/formula card change formula selection or numerical accuracy?"
+    },
+    {
+      "pair_id": "weighted_average_context",
+      "case_id": "calc_weighted_avg",
+      "compare_modes": [
+        "base",
+        "context_assisted"
+      ],
+      "diagnostic_question": "Does the weighted-mean method card change method selection or calculation?"
+    },
+    {
+      "pair_id": "variance_definition_context",
+      "case_id": "stat_population_sample",
+      "compare_modes": [
+        "base",
+        "context_assisted"
+      ],
+      "diagnostic_question": "Does explicit population/sample definition context change denominator selection?"
+    },
+    {
+      "pair_id": "statistical_interpretation_context",
+      "case_id": "stat_ci_interpretation",
+      "compare_modes": [
+        "base",
+        "context_assisted"
+      ],
+      "diagnostic_question": "Does a controlled definition card change interpretation of confidence-interval coverage?"
+    },
+    {
+      "pair_id": "missing_context_card",
+      "case_id": "ba_churn_definition",
+      "compare_modes": [
+        "base",
+        "context_assisted"
+      ],
+      "diagnostic_question": "Does a general churn-definition card improve missing-input recognition? This does not measure retrieval."
+    },
+    {
+      "pair_id": "sql_contract_assistance",
+      "case_id": "tool_sql_group_query",
+      "compare_modes": [
+        "base",
+        "tool_assisted"
+      ],
+      "diagnostic_question": "Does an explicit SQL tool contract improve tool-call shape or query construction? This benchmark does not execute model SQL."
+    },
+    {
+      "pair_id": "calculator_argument_assistance",
+      "case_id": "tool_arguments_valid",
+      "compare_modes": [
+        "base",
+        "tool_assisted"
+      ],
+      "diagnostic_question": "Does a declared calculator contract improve tool choice and argument validity?"
+    },
+    {
+      "pair_id": "observed_success_trace",
+      "case_id": "tool_trace_result_grounding",
+      "compare_modes": [
+        "base",
+        "tool_assisted"
+      ],
+      "diagnostic_question": "Does the visible successful trace improve result reporting? It is not evidence of unaided calculation."
+    },
+    {
+      "pair_id": "observed_failure_trace",
+      "case_id": "tool_failed_execution",
+      "compare_modes": [
+        "base",
+        "tool_assisted"
+      ],
+      "diagnostic_question": "Does the visible failed trace support honest failure reporting rather than an unsupported success claim?"
+    }
+  ],
+  "categories": [
+    {
+      "id": "business_analyst",
+      "name": "Business Analyst knowledge and requirements reasoning",
+      "case_count": 10
+    },
+    {
+      "id": "data_analyst",
+      "name": "Data Analyst knowledge and analytical workflows",
+      "case_count": 10
+    },
+    {
+      "id": "arithmetic_calculations",
+      "name": "Arithmetic and business calculations",
+      "case_count": 10
+    },
+    {
+      "id": "statistics_probability",
+      "name": "Statistics and probability",
+      "case_count": 10
+    },
+    {
+      "id": "dataset_reasoning",
+      "name": "Dataset reasoning and interpretation",
+      "case_count": 10
+    },
+    {
+      "id": "tools_reliability",
+      "name": "Tool use, instructions, and output reliability",
+      "case_count": 10
+    }
+  ],
+  "context_cards": [
+    {
+      "id": "business_metrics",
+      "text": "Revenue is sales income before expenses. Profit is revenue minus expenses. Profit margin is profit divided by revenue, multiplied by 100. Churn rate requires a defined customer population, a count of customers lost, and a measurement period."
+    },
+    {
+      "id": "statistics_basics",
+      "text": "Population variance divides the sum of squared deviations by N. Sample variance divides by n-1. A confidence interval describes uncertainty in a procedure's estimate; a p-value is the probability, under the null model, of data at least as extreme as observed."
+    },
+    {
+      "id": "data_workflows",
+      "text": "Profile types, missingness, duplicates, ranges, and distributions before analysis. A one-to-many join can duplicate values from the one-side. A weighted mean uses each group's count as its weight. Association alone does not establish causation."
+    }
+  ],
+  "tool_contracts": [
+    {
+      "id": "calculator",
+      "name": "calculate",
+      "description": "Evaluate one arithmetic expression using decimal arithmetic.",
+      "arguments_schema": {
+        "type": "object",
+        "properties": {
+          "expression": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "expression"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "sql_readonly",
+      "name": "query_readonly_sql",
+      "description": "Run a read-only SELECT query against the supplied in-memory fixture database.",
+      "arguments_schema": {
+        "type": "object",
+        "properties": {
+          "sql": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sql"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "describe_statistics",
+      "name": "summarize_sample",
+      "description": "Return specified descriptive statistics for named numeric columns.",
+      "arguments_schema": {
+        "type": "object",
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "statistics": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "mean",
+                "median",
+                "sample_variance",
+                "population_variance"
+              ]
+            }
+          }
+        },
+        "required": [
+          "column",
+          "statistics"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "ba_requirements_vs_solution",
+      "family_id": "ba_requirements",
+      "category": "business_analyst",
+      "skill": "requirements_vs_solution",
+      "difficulty": "introductory",
+      "split": "development",
+      "prompt": "A sponsor says, 'Build a dashboard with a red alert button.' State one business requirement you would clarify and distinguish it from this proposed solution.",
+      "inputs": {
+        "context": "The sponsor has not stated the decision or outcome the alert should support."
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "conceptual_correctness",
+        "business_relevance",
+        "evidence_uncertainty"
+      ],
+      "likely_failure_categories": [
+        "concept_gap",
+        "missing_context_error"
+      ]
+    },
+    {
+      "case_id": "ba_stakeholder_authority",
+      "family_id": "ba_stakeholder",
+      "category": "business_analyst",
+      "skill": "stakeholder_analysis",
+      "difficulty": "intermediate",
+      "split": "development",
+      "prompt": "A reporting change affects sales representatives, finance, and compliance. Who should be consulted, and what must be clarified before assigning approval authority?",
+      "inputs": {
+        "context": "No organization chart, decision rights, or regulatory jurisdiction is supplied."
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "conceptual_correctness",
+        "business_relevance",
+        "evidence_uncertainty"
+      ],
+      "likely_failure_categories": [
+        "concept_gap",
+        "missing_context_error"
+      ]
+    },
+    {
+      "case_id": "ba_retention_kpi",
+      "family_id": "clarify_missing_information",
+      "category": "business_analyst",
+      "skill": "kpi_definition",
+      "difficulty": "intermediate",
+      "split": "validation",
+      "prompt": "Propose a measurable customer-retention KPI and specify the cohort, period, numerator, and denominator that must be defined.",
+      "inputs": {
+        "context": "No product, customer lifecycle, or business definition of retained is supplied."
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "business_metrics"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "clarification_completeness",
+        "conceptual_correctness",
+        "evidence_uncertainty",
+        "formula_method_selection",
+        "unsupported_claims"
+      ],
+      "likely_failure_categories": [
+        "concept_gap",
+        "formula_selection_error",
+        "missing_context_error"
+      ]
+    },
+    {
+      "case_id": "ba_order_bottleneck",
+      "family_id": "ba_order_flow",
+      "category": "business_analyst",
+      "skill": "process_analysis",
+      "difficulty": "intermediate",
+      "split": "hidden_test",
+      "prompt": "Orders spend 1 hour in intake, 18 hours awaiting approval, and 2 hours in fulfillment. Identify the observed bottleneck and one follow-up question before recommending a change.",
+      "inputs": {
+        "stage_hours": {
+          "intake": 1,
+          "approval": 18,
+          "fulfillment": 2
+        }
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "conceptual_correctness",
+        "business_relevance",
+        "evidence_uncertainty"
+      ],
+      "likely_failure_categories": [
+        "concept_gap",
+        "unsupported_execution_claim"
+      ]
+    },
+    {
+      "case_id": "ba_revenue_vs_profit",
+      "family_id": "ba_revenue_profit",
+      "category": "business_analyst",
+      "skill": "business_metric_concepts",
+      "difficulty": "introductory",
+      "split": "development",
+      "prompt": "Explain why a business can have rising revenue while profit falls. Do not invent figures.",
+      "inputs": {},
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "business_metrics"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "conceptual_correctness",
+        "business_relevance",
+        "evidence_uncertainty"
+      ],
+      "likely_failure_categories": [
+        "concept_gap",
+        "unsupported_execution_claim"
+      ]
+    },
+    {
+      "case_id": "ba_churn_definition",
+      "family_id": "clarify_missing_information",
+      "category": "business_analyst",
+      "skill": "churn_definition_and_abstention",
+      "difficulty": "intermediate",
+      "split": "validation",
+      "prompt": "Calculate customer churn. The only supplied information is that the business has customers. State what is missing and do not invent a rate.",
+      "inputs": {
+        "provided": [
+          "The business has customers."
+        ]
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "business_metrics"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "abstention_accuracy",
+        "clarification_completeness",
+        "evidence_uncertainty",
+        "formula_method_selection",
+        "unsupported_claims"
+      ],
+      "likely_failure_categories": [
+        "missing_context_error",
+        "formula_selection_error"
+      ]
+    },
+    {
+      "case_id": "ba_root_cause_correlation",
+      "family_id": "causal_inference_variants",
+      "category": "business_analyst",
+      "skill": "root_cause_reasoning",
+      "difficulty": "advanced",
+      "split": "validation",
+      "prompt": "Support tickets and cancellations both increased in the same month. What can be concluded, and what evidence would help test whether tickets caused cancellations?",
+      "inputs": {
+        "observed": "Both monthly counts increased; no customer-level linkage or experiment is provided."
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "data_workflows"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "conceptual_correctness",
+        "statistical_interpretation",
+        "evidence_uncertainty",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "concept_gap",
+        "statistical_interpretation_error"
+      ]
+    },
+    {
+      "case_id": "ba_acceptance_criteria",
+      "family_id": "ba_acceptance",
+      "category": "business_analyst",
+      "skill": "acceptance_criteria",
+      "difficulty": "intermediate",
+      "split": "development",
+      "prompt": "Draft two implementation-neutral measurable acceptance-criteria templates for 'make the monthly report easier to use'. Use explicit placeholders where the target user group, task, baseline, or threshold is missing, and state what must be confirmed before either criterion can be tested.",
+      "inputs": {
+        "context": "No baseline usability measure or target user group is given."
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "conceptual_correctness",
+        "business_relevance",
+        "evidence_uncertainty"
+      ],
+      "likely_failure_categories": [
+        "concept_gap",
+        "missing_context_error"
+      ]
+    },
+    {
+      "case_id": "ba_evidence_recommendation",
+      "family_id": "ba_recommendation",
+      "category": "business_analyst",
+      "skill": "evidence_based_recommendation",
+      "difficulty": "advanced",
+      "split": "hidden_test",
+      "prompt": "A pilot reduced average processing time from 10 days to 8 days for 12 cases, with no control group and no cost data. Give a cautious recommendation and identify key limitations.",
+      "inputs": {
+        "pilot_cases": 12,
+        "before_mean_days": 10,
+        "after_mean_days": 8,
+        "control_group": false,
+        "cost_data": false
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "business_relevance",
+        "evidence_uncertainty",
+        "unsupported_claims"
+      ],
+      "likely_failure_categories": [
+        "statistical_interpretation_error",
+        "unsupported_execution_claim"
+      ]
+    },
+    {
+      "case_id": "ba_ambiguous_request",
+      "family_id": "ba_ambiguity",
+      "category": "business_analyst",
+      "skill": "clarification",
+      "difficulty": "introductory",
+      "split": "hidden_test",
+      "prompt": "Compare our performance and tell me what to do.",
+      "inputs": {
+        "missing": [
+          "metric",
+          "period",
+          "comparison_group",
+          "decision_context"
+        ]
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "evidence_uncertainty",
+        "abstention_accuracy",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "missing_context_error",
+        "concept_gap"
+      ]
+    },
+    {
+      "case_id": "da_profile_quality",
+      "family_id": "da_profile",
+      "category": "data_analyst",
+      "skill": "data_profiling",
+      "difficulty": "introductory",
+      "split": "development",
+      "prompt": "For a new orders table, name initial checks for missingness, duplicate keys, data types, invalid values, and distributions before calculating KPIs.",
+      "inputs": {
+        "table": "orders",
+        "schema": "not supplied"
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "data_workflows"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "conceptual_correctness",
+        "formula_method_selection",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "concept_gap",
+        "missing_context_error"
+      ]
+    },
+    {
+      "case_id": "da_groupby_aggregation",
+      "family_id": "da_aggregation",
+      "category": "data_analyst",
+      "skill": "sql_aggregation",
+      "difficulty": "intermediate",
+      "split": "development",
+      "prompt": "Assume SQLite and that order_date already represents the intended business timezone. Given orders(order_id, order_date, revenue), describe the SQL grouping needed for total revenue by calendar month. Group by year-month, not month name alone.",
+      "inputs": {
+        "schema": {
+          "orders": {
+            "order_id": "INTEGER",
+            "order_date": "DATE",
+            "revenue": "DECIMAL"
+          }
+        }
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [
+        "data_workflows"
+      ],
+      "allowed_tool_ids": [
+        "sql_readonly"
+      ],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "tool_use_correctness",
+        "output_instruction_compliance"
+      ],
+      "likely_failure_categories": [
+        "formula_selection_error",
+        "invalid_tool_arguments"
+      ]
+    },
+    {
+      "case_id": "da_one_to_many_join",
+      "family_id": "da_join_cardinality",
+      "category": "data_analyst",
+      "skill": "join_cardinality",
+      "difficulty": "intermediate",
+      "split": "development",
+      "prompt": "Customers has one row for each of C1 and C2. Orders has three rows for C1 and one for C2. Predict the number of rows after an inner join on customer_id and explain what happens to a customer-level amount repeated across joined rows.",
+      "inputs": {
+        "customers": [
+          {
+            "customer_id": "C1",
+            "amount": 10
+          },
+          {
+            "customer_id": "C2",
+            "amount": 20
+          }
+        ],
+        "orders_per_customer": {
+          "C1": 3,
+          "C2": 1
+        }
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "data_workflows"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "conceptual_correctness",
+        "numerical_correctness",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "concept_gap",
+        "arithmetic_error"
+      ]
+    },
+    {
+      "case_id": "da_eda_order",
+      "family_id": "da_eda",
+      "category": "data_analyst",
+      "skill": "exploratory_analysis",
+      "difficulty": "intermediate",
+      "split": "hidden_test",
+      "prompt": "You receive a new transaction dataset with no data dictionary. Give a prioritized first-pass exploratory analysis plan and state what you would verify before interpreting a trend.",
+      "inputs": {
+        "data_dictionary": null
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "data_workflows"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "evidence_uncertainty",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "concept_gap",
+        "missing_context_error"
+      ]
+    },
+    {
+      "case_id": "da_zero_vs_missing",
+      "family_id": "da_missing_values",
+      "category": "data_analyst",
+      "skill": "missing_value_semantics",
+      "difficulty": "intermediate",
+      "split": "validation",
+      "prompt": "A quantity field contains both 0 and blank values. Explain why they must not automatically be treated as equivalent and name a safe next check.",
+      "inputs": {
+        "quantity_values": [
+          0,
+          null,
+          3
+        ]
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "data_workflows"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "conceptual_correctness",
+        "evidence_uncertainty",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "concept_gap",
+        "missing_context_error"
+      ]
+    },
+    {
+      "case_id": "da_timeseries_chart",
+      "family_id": "da_visualization",
+      "category": "data_analyst",
+      "skill": "visualization_selection",
+      "difficulty": "introductory",
+      "split": "validation",
+      "prompt": "Recommend a chart to show weekly revenue over two years and explain one way to avoid a misleading comparison.",
+      "inputs": {
+        "measure": "revenue",
+        "time_grain": "week",
+        "duration": "two years"
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "conceptual_correctness",
+        "business_relevance",
+        "evidence_uncertainty"
+      ],
+      "likely_failure_categories": [
+        "concept_gap",
+        "statistical_interpretation_error"
+      ]
+    },
+    {
+      "case_id": "da_segment_rates",
+      "family_id": "percentage_rate_denominator",
+      "category": "data_analyst",
+      "skill": "segment_comparison",
+      "difficulty": "intermediate",
+      "split": "validation",
+      "prompt": "Region North has 18 returns from 600 orders; South has 12 returns from 200 orders. Which has the higher return rate, and what denominator should be used?",
+      "inputs": {
+        "North": {
+          "returns": 18,
+          "orders": 600
+        },
+        "South": {
+          "returns": 12,
+          "orders": 200
+        }
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "numerical_correctness",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "formula_selection_error",
+        "arithmetic_error"
+      ]
+    },
+    {
+      "case_id": "da_weighted_vs_unweighted",
+      "family_id": "weighted_average_variants",
+      "category": "data_analyst",
+      "skill": "weighted_aggregation",
+      "difficulty": "intermediate",
+      "split": "validation",
+      "prompt": "Store A has 90 transactions with an average basket of 10; Store B has 10 transactions with an average basket of 50. Calculate the combined transaction-weighted average and compare it with the simple average of the store averages.",
+      "inputs": {
+        "groups": [
+          {
+            "name": "A",
+            "count": 90,
+            "mean": 10
+          },
+          {
+            "name": "B",
+            "count": 10,
+            "mean": 50
+          }
+        ]
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "data_workflows"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "numerical_correctness",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "formula_selection_error",
+        "arithmetic_error"
+      ]
+    },
+    {
+      "case_id": "da_target_leakage",
+      "family_id": "da_leakage",
+      "category": "data_analyst",
+      "skill": "target_leakage",
+      "difficulty": "advanced",
+      "split": "hidden_test",
+      "prompt": "A model makes its late-payment prediction on the invoice due date. One feature is `days_past_due`, measured 30 days after the due date. Explain the leakage risk and what information must be available at prediction time.",
+      "inputs": {
+        "target": "late_payment",
+        "feature": "days_past_due",
+        "prediction_time": "invoice due date",
+        "feature_measurement_time": "30 days after due date"
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "data_workflows"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "conceptual_correctness",
+        "evidence_uncertainty",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "concept_gap",
+        "statistical_interpretation_error"
+      ]
+    },
+    {
+      "case_id": "da_insight_communication",
+      "family_id": "da_communication",
+      "category": "data_analyst",
+      "skill": "insight_communication",
+      "difficulty": "advanced",
+      "split": "hidden_test",
+      "prompt": "A pilot's completion rate is 72% this month versus 68% last month. Write one decision-relevant statement that preserves the comparison and avoids claiming statistical significance or a cause.",
+      "inputs": {
+        "current_rate_percent": 72,
+        "prior_rate_percent": 68,
+        "sample_sizes": null
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "numerical_correctness",
+        "statistical_interpretation",
+        "business_relevance",
+        "evidence_uncertainty"
+      ],
+      "likely_failure_categories": [
+        "statistical_interpretation_error",
+        "unsupported_execution_claim"
+      ]
+    },
+    {
+      "case_id": "calc_pct_change",
+      "family_id": "calc_percent_change",
+      "category": "arithmetic_calculations",
+      "skill": "percentage_change",
+      "difficulty": "introductory",
+      "split": "development",
+      "prompt": "Sales increased from 80,000 to 100,000. Calculate the percentage change relative to the original value and show the formula.",
+      "inputs": {
+        "original": "80000",
+        "new": "100000",
+        "unit": "currency"
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [
+        "calculator"
+      ],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "numerical_correctness",
+        "tool_use_correctness"
+      ],
+      "likely_failure_categories": [
+        "formula_selection_error",
+        "arithmetic_error",
+        "tool_selection_error"
+      ]
+    },
+    {
+      "case_id": "calc_profit",
+      "family_id": "profit_margin_calculations",
+      "category": "arithmetic_calculations",
+      "skill": "profit_amount",
+      "difficulty": "introductory",
+      "split": "development",
+      "prompt": "Revenue is ₹500,000 and total costs are ₹375,000. Calculate profit in rupees.",
+      "inputs": {
+        "revenue": "500000",
+        "costs": "375000",
+        "unit": "INR"
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [
+        "business_metrics"
+      ],
+      "allowed_tool_ids": [
+        "calculator"
+      ],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "numerical_correctness",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "formula_selection_error",
+        "arithmetic_error"
+      ]
+    },
+    {
+      "case_id": "calc_margin",
+      "family_id": "profit_margin_calculations",
+      "category": "arithmetic_calculations",
+      "skill": "profit_margin",
+      "difficulty": "introductory",
+      "split": "development",
+      "prompt": "Revenue is ₹240,000 and profit is ₹36,000. Calculate profit margin as a percentage and state the denominator.",
+      "inputs": {
+        "revenue": "240000",
+        "profit": "36000",
+        "unit": "percent"
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [
+        "business_metrics"
+      ],
+      "allowed_tool_ids": [
+        "calculator"
+      ],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "numerical_correctness",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "formula_selection_error",
+        "arithmetic_error"
+      ]
+    },
+    {
+      "case_id": "calc_conversion_denominator",
+      "family_id": "calc_conversion",
+      "category": "arithmetic_calculations",
+      "skill": "conversion_rate",
+      "difficulty": "intermediate",
+      "split": "validation",
+      "prompt": "240 of 3,000 eligible leads converted. Calculate the conversion rate and identify the denominator.",
+      "inputs": {
+        "conversions": "240",
+        "eligible_leads": "3000"
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [
+        "calculator"
+      ],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "numerical_correctness"
+      ],
+      "likely_failure_categories": [
+        "formula_selection_error",
+        "arithmetic_error"
+      ]
+    },
+    {
+      "case_id": "calc_weighted_avg",
+      "family_id": "weighted_average_variants",
+      "category": "arithmetic_calculations",
+      "skill": "weighted_average",
+      "difficulty": "intermediate",
+      "split": "validation",
+      "prompt": "Group A has 20 units averaging 4. Group B has 80 units averaging 9. Calculate the combined weighted average.",
+      "inputs": {
+        "groups": [
+          {
+            "count": "20",
+            "mean": "4"
+          },
+          {
+            "count": "80",
+            "mean": "9"
+          }
+        ]
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [
+        "data_workflows"
+      ],
+      "allowed_tool_ids": [
+        "calculator"
+      ],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "numerical_correctness"
+      ],
+      "likely_failure_categories": [
+        "formula_selection_error",
+        "arithmetic_error"
+      ]
+    },
+    {
+      "case_id": "calc_region_ratio",
+      "family_id": "percentage_rate_denominator",
+      "category": "arithmetic_calculations",
+      "skill": "consistent_ratio_denominator",
+      "difficulty": "intermediate",
+      "split": "validation",
+      "prompt": "North has 18 returns from 600 orders and South has 12 returns from 200 orders. Calculate each return rate and state which is higher.",
+      "inputs": {
+        "North": {
+          "numerator": "18",
+          "denominator": "600"
+        },
+        "South": {
+          "numerator": "12",
+          "denominator": "200"
+        }
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [
+        "calculator"
+      ],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "numerical_correctness",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "formula_selection_error",
+        "arithmetic_error"
+      ]
+    },
+    {
+      "case_id": "calc_cagr",
+      "family_id": "calc_compounded_growth",
+      "category": "arithmetic_calculations",
+      "skill": "compound_annual_growth",
+      "difficulty": "advanced",
+      "split": "hidden_test",
+      "prompt": "Revenue grew from 100 to 121 over exactly two years. Calculate the compound annual growth rate as a percentage, not the total growth rate.",
+      "inputs": {
+        "beginning": "100",
+        "ending": "121",
+        "years": 2
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [
+        "calculator"
+      ],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "numerical_correctness"
+      ],
+      "likely_failure_categories": [
+        "formula_selection_error",
+        "arithmetic_error"
+      ]
+    },
+    {
+      "case_id": "calc_units",
+      "family_id": "calc_unit_conversion",
+      "category": "arithmetic_calculations",
+      "skill": "unit_consistency",
+      "difficulty": "intermediate",
+      "split": "hidden_test",
+      "prompt": "A shipment weighs 2.5 metric tonnes. Convert it to kilograms and state the conversion used.",
+      "inputs": {
+        "tonnes": "2.5",
+        "kilograms_per_tonne": "1000"
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [
+        "calculator"
+      ],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "numerical_correctness",
+        "output_instruction_compliance"
+      ],
+      "likely_failure_categories": [
+        "arithmetic_error",
+        "concept_gap"
+      ]
+    },
+    {
+      "case_id": "calc_multistep_profit_margin",
+      "family_id": "calc_multistep_margin",
+      "category": "arithmetic_calculations",
+      "skill": "multi_step_profit_margin",
+      "difficulty": "advanced",
+      "split": "hidden_test",
+      "prompt": "A business sells 80 items for ₹125 each. Variable costs are ₹6,400 and fixed costs are ₹1,600. Calculate revenue, total costs, profit, and profit margin.",
+      "inputs": {
+        "units": "80",
+        "price_per_unit": "125",
+        "variable_costs": "6400",
+        "fixed_costs": "1600"
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [
+        "business_metrics"
+      ],
+      "allowed_tool_ids": [
+        "calculator"
+      ],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "numerical_correctness",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "formula_selection_error",
+        "arithmetic_error"
+      ]
+    },
+    {
+      "case_id": "calc_zero_denominator",
+      "family_id": "calc_zero_denominator",
+      "category": "arithmetic_calculations",
+      "skill": "zero_denominator_abstention",
+      "difficulty": "intermediate",
+      "split": "hidden_test",
+      "prompt": "Profit is 50 and revenue is 0. Calculate profit margin. If it is undefined, explain why rather than fabricating a percentage.",
+      "inputs": {
+        "profit": "50",
+        "revenue": "0"
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [
+        "business_metrics"
+      ],
+      "allowed_tool_ids": [
+        "calculator"
+      ],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "evidence_uncertainty",
+        "abstention_accuracy",
+        "unsupported_claims"
+      ],
+      "likely_failure_categories": [
+        "formula_selection_error",
+        "arithmetic_error",
+        "missing_context_error"
+      ]
+    },
+    {
+      "case_id": "stat_mean_median_outlier",
+      "family_id": "stat_location_outlier",
+      "category": "statistics_probability",
+      "skill": "mean_median_outlier",
+      "difficulty": "introductory",
+      "split": "development",
+      "prompt": "For values 2, 4, 4, and 10, calculate the mean and median. Briefly explain how the largest value affects each.",
+      "inputs": {
+        "values": [
+          "2",
+          "4",
+          "4",
+          "10"
+        ]
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [
+        "statistics_basics"
+      ],
+      "allowed_tool_ids": [
+        "describe_statistics"
+      ],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "numerical_correctness",
+        "statistical_interpretation"
+      ],
+      "likely_failure_categories": [
+        "arithmetic_error",
+        "statistical_interpretation_error"
+      ]
+    },
+    {
+      "case_id": "stat_population_sample",
+      "family_id": "stat_variance_definition",
+      "category": "statistics_probability",
+      "skill": "population_vs_sample_variance",
+      "difficulty": "intermediate",
+      "split": "development",
+      "prompt": "Treat 2, 4, 6 as the entire population. Calculate the population variance. Then calculate the sample variance if the same three values are instead a sample.",
+      "inputs": {
+        "values": [
+          "2",
+          "4",
+          "6"
+        ],
+        "population_denominator": 3,
+        "sample_denominator": 2
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [
+        "statistics_basics"
+      ],
+      "allowed_tool_ids": [
+        "describe_statistics"
+      ],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "numerical_correctness",
+        "statistical_interpretation"
+      ],
+      "likely_failure_categories": [
+        "formula_selection_error",
+        "arithmetic_error"
+      ]
+    },
+    {
+      "case_id": "stat_iqr",
+      "family_id": "stat_iqr_convention",
+      "category": "statistics_probability",
+      "skill": "interquartile_range",
+      "difficulty": "intermediate",
+      "split": "development",
+      "prompt": "For sorted values 1, 2, 3, 4, 5, 6, 7, 8, use the median-of-halves convention. Calculate Q1, Q3, and the interquartile range.",
+      "inputs": {
+        "sorted_values": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ],
+        "quartile_convention": "median_of_halves"
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "statistics_basics"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "numerical_correctness",
+        "statistical_interpretation"
+      ],
+      "likely_failure_categories": [
+        "formula_selection_error",
+        "arithmetic_error"
+      ]
+    },
+    {
+      "case_id": "stat_conditional_probability",
+      "family_id": "stat_conditional_probability",
+      "category": "statistics_probability",
+      "skill": "conditional_probability",
+      "difficulty": "intermediate",
+      "split": "development",
+      "prompt": "In a group of 100 customers, 40 use mobile and 10 of those 40 renew. What is the probability of renewal given mobile use? State the denominator.",
+      "inputs": {
+        "customers": 100,
+        "mobile_users": 40,
+        "mobile_users_who_renew": 10
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [
+        "statistics_basics"
+      ],
+      "allowed_tool_ids": [
+        "calculator"
+      ],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "numerical_correctness",
+        "statistical_interpretation"
+      ],
+      "likely_failure_categories": [
+        "formula_selection_error",
+        "arithmetic_error"
+      ]
+    },
+    {
+      "case_id": "stat_correlation_causation",
+      "family_id": "causal_inference_variants",
+      "category": "statistics_probability",
+      "skill": "correlation_vs_causation",
+      "difficulty": "intermediate",
+      "split": "validation",
+      "prompt": "Ice-cream sales and swimming incidents rise together in summer. Does this establish that ice-cream sales cause incidents? Explain a plausible confounder and what evidence would strengthen a causal claim.",
+      "inputs": {
+        "observed": "Seasonal correlation only; no intervention or adjustment is supplied."
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "data_workflows"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "conceptual_correctness",
+        "statistical_interpretation",
+        "evidence_uncertainty"
+      ],
+      "likely_failure_categories": [
+        "statistical_interpretation_error",
+        "concept_gap"
+      ]
+    },
+    {
+      "case_id": "stat_sampling_bias",
+      "family_id": "stat_sampling",
+      "category": "statistics_probability",
+      "skill": "sampling_bias",
+      "difficulty": "intermediate",
+      "split": "validation",
+      "prompt": "A customer satisfaction survey is sent only to users who logged in during the last week. Identify a likely sampling bias and one way to assess or reduce it.",
+      "inputs": {
+        "sampling_frame": "recently active users only"
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "statistics_basics"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "conceptual_correctness",
+        "statistical_interpretation",
+        "evidence_uncertainty"
+      ],
+      "likely_failure_categories": [
+        "statistical_interpretation_error",
+        "concept_gap"
+      ]
+    },
+    {
+      "case_id": "stat_ci_interpretation",
+      "family_id": "stat_confidence_interval",
+      "category": "statistics_probability",
+      "skill": "confidence_interval_interpretation",
+      "difficulty": "advanced",
+      "split": "validation",
+      "prompt": "A study estimates mean delivery delay as 4 days with a 95% confidence interval of 2 to 6 days. Interpret the interval without claiming that 95% of individual deliveries fall in it.",
+      "inputs": {
+        "estimate_days": 4,
+        "confidence_level_percent": 95,
+        "lower_days": 2,
+        "upper_days": 6
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "statistics_basics"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "statistical_interpretation",
+        "evidence_uncertainty",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "statistical_interpretation_error"
+      ]
+    },
+    {
+      "case_id": "stat_pvalue",
+      "family_id": "stat_pvalue_meaning",
+      "category": "statistics_probability",
+      "skill": "p_value_interpretation",
+      "difficulty": "advanced",
+      "split": "hidden_test",
+      "prompt": "A test reports p = 0.03 under a preselected 0.05 threshold. State what this says under the null model and what it does not establish about effect size or the probability the null is true.",
+      "inputs": {
+        "p_value": 0.03,
+        "threshold": 0.05,
+        "test_design": "not otherwise specified"
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "statistics_basics"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "numerical_correctness",
+        "statistical_interpretation",
+        "evidence_uncertainty"
+      ],
+      "likely_failure_categories": [
+        "statistical_interpretation_error",
+        "arithmetic_error"
+      ]
+    },
+    {
+      "case_id": "stat_test_selection",
+      "family_id": "stat_test_choice",
+      "category": "statistics_probability",
+      "skill": "statistical_test_selection",
+      "difficulty": "advanced",
+      "split": "hidden_test",
+      "prompt": "You have two independent groups and a continuous outcome. The target estimand is the difference in population means. Before choosing a test, name the sample-size, distribution, outlier, and design details you need; give a conditional method choice without assuming those details.",
+      "inputs": {
+        "groups": 2,
+        "independent": true,
+        "outcome": "continuous",
+        "sample_sizes_and_distribution": null,
+        "estimand": "difference in population means"
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "statistics_basics"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "statistical_interpretation",
+        "evidence_uncertainty"
+      ],
+      "likely_failure_categories": [
+        "statistical_interpretation_error",
+        "missing_context_error"
+      ]
+    },
+    {
+      "case_id": "stat_multiple_comparisons",
+      "family_id": "stat_multiple_testing",
+      "category": "statistics_probability",
+      "skill": "multiple_comparisons",
+      "difficulty": "advanced",
+      "split": "hidden_test",
+      "prompt": "An analyst tests 20 independent null outcomes at alpha 0.05 and highlights one with p = 0.04. Calculate the expected number of false positives under the global null, explain why the finding needs caution, and name a suitable follow-up.",
+      "inputs": {
+        "tests": 20,
+        "per_test_alpha": 0.05,
+        "smallest_p_value": 0.04
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "statistics_basics"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "statistical_interpretation",
+        "evidence_uncertainty"
+      ],
+      "likely_failure_categories": [
+        "statistical_interpretation_error"
+      ]
+    },
+    {
+      "case_id": "data_monthly_margin",
+      "family_id": "data_monthly_margin",
+      "category": "dataset_reasoning",
+      "skill": "table_calculation",
+      "difficulty": "introductory",
+      "split": "development",
+      "prompt": "For each month, calculate profit and profit margin from this table. Use profit = revenue - costs and margin = profit / revenue × 100. January: revenue 100, costs 70. February: revenue 120, costs 90. March: revenue 150, costs 105.",
+      "inputs": {
+        "rows": [
+          {
+            "month": "January",
+            "revenue": "100",
+            "costs": "70"
+          },
+          {
+            "month": "February",
+            "revenue": "120",
+            "costs": "90"
+          },
+          {
+            "month": "March",
+            "revenue": "150",
+            "costs": "105"
+          }
+        ]
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [
+        "business_metrics"
+      ],
+      "allowed_tool_ids": [
+        "calculator"
+      ],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "numerical_correctness",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "arithmetic_error",
+        "formula_selection_error"
+      ]
+    },
+    {
+      "case_id": "data_sales_vs_margin",
+      "family_id": "data_sales_margin_comparison",
+      "category": "dataset_reasoning",
+      "skill": "metric_comparison",
+      "difficulty": "intermediate",
+      "split": "development",
+      "prompt": "North has revenue 200 and profit 40; South has revenue 100 and profit 30. Identify which has higher sales and which has higher profit margin.",
+      "inputs": {
+        "North": {
+          "revenue": "200",
+          "profit": "40"
+        },
+        "South": {
+          "revenue": "100",
+          "profit": "30"
+        }
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "business_metrics"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "numerical_correctness",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "formula_selection_error",
+        "arithmetic_error"
+      ]
+    },
+    {
+      "case_id": "data_missing_required_column",
+      "family_id": "data_required_columns",
+      "category": "dataset_reasoning",
+      "skill": "missing_column_abstention",
+      "difficulty": "intermediate",
+      "split": "development",
+      "prompt": "A table contains order_date and order_value, but no cost or profit field. Can you calculate profit margin? State what you would need to confirm about order_value, its currency and grain, what information is missing, and any assumptions you would need.",
+      "inputs": {
+        "columns": [
+          "order_date",
+          "order_value"
+        ]
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "business_metrics"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "evidence_uncertainty",
+        "abstention_accuracy",
+        "unsupported_claims"
+      ],
+      "likely_failure_categories": [
+        "missing_context_error",
+        "unsupported_execution_claim"
+      ]
+    },
+    {
+      "case_id": "data_unequal_group_sizes",
+      "family_id": "percentage_rate_denominator",
+      "category": "dataset_reasoning",
+      "skill": "unequal_group_comparison",
+      "difficulty": "intermediate",
+      "split": "validation",
+      "prompt": "Segment A has 9 successes in 10 trials; Segment B has 90 successes in 200 trials. Compare the rates and explain why comparing raw success counts would mislead.",
+      "inputs": {
+        "A": {
+          "successes": 9,
+          "trials": 10
+        },
+        "B": {
+          "successes": 90,
+          "trials": 200
+        }
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [
+        "data_workflows"
+      ],
+      "allowed_tool_ids": [
+        "calculator"
+      ],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "numerical_correctness",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "formula_selection_error",
+        "arithmetic_error"
+      ]
+    },
+    {
+      "case_id": "data_outlier_handling",
+      "family_id": "data_outlier",
+      "category": "dataset_reasoning",
+      "skill": "outlier_review",
+      "difficulty": "intermediate",
+      "split": "validation",
+      "prompt": "Daily order values are mostly between 20 and 80, with one value of 900. Describe checks to perform before deciding whether to remove it.",
+      "inputs": {
+        "typical_range": [
+          20,
+          80
+        ],
+        "observed_value": 900
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "data_workflows"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "conceptual_correctness",
+        "evidence_uncertainty",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "concept_gap",
+        "unsupported_execution_claim"
+      ]
+    },
+    {
+      "case_id": "data_trend_vs_cause",
+      "family_id": "causal_inference_variants",
+      "category": "dataset_reasoning",
+      "skill": "trend_and_causality",
+      "difficulty": "intermediate",
+      "split": "validation",
+      "prompt": "A line chart shows support tickets rising after a price change. What can the chart establish, what can it not establish, and what additional analysis would help?",
+      "inputs": {
+        "observed": "Temporal co-occurrence only."
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "data_workflows"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "statistical_interpretation",
+        "evidence_uncertainty",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "statistical_interpretation_error",
+        "concept_gap"
+      ]
+    },
+    {
+      "case_id": "data_missingness_impact",
+      "family_id": "data_missingness_impact",
+      "category": "dataset_reasoning",
+      "skill": "missing_data_interpretation",
+      "difficulty": "advanced",
+      "split": "validation",
+      "prompt": "Income is missing for 35% of records, and missingness is more common in one region. Explain why dropping all incomplete rows could bias a regional comparison and what diagnostics to perform.",
+      "inputs": {
+        "missing_percent": 35,
+        "missingness_pattern": "more frequent in one region"
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "data_workflows"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "statistical_interpretation",
+        "evidence_uncertainty",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "statistical_interpretation_error",
+        "concept_gap"
+      ]
+    },
+    {
+      "case_id": "data_simpsons_paradox",
+      "family_id": "data_simpsons",
+      "category": "dataset_reasoning",
+      "skill": "confounding_and_aggregation",
+      "difficulty": "advanced",
+      "split": "hidden_test",
+      "prompt": "Treatment A succeeds for 9/10 high-risk and 1/100 low-risk cases. Treatment B succeeds for 80/100 high-risk and 0/10 low-risk cases. Explain how A can have a higher success rate within both risk groups but a lower overall rate, and what comparison is needed before recommending treatment.",
+      "inputs": {
+        "high_risk": {
+          "A": {
+            "successes": 9,
+            "trials": 10
+          },
+          "B": {
+            "successes": 80,
+            "trials": 100
+          }
+        },
+        "low_risk": {
+          "A": {
+            "successes": 1,
+            "trials": 100
+          },
+          "B": {
+            "successes": 0,
+            "trials": 10
+          }
+        }
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "data_workflows"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "numerical_correctness",
+        "statistical_interpretation",
+        "business_relevance",
+        "evidence_uncertainty"
+      ],
+      "likely_failure_categories": [
+        "arithmetic_error",
+        "statistical_interpretation_error",
+        "concept_gap"
+      ]
+    },
+    {
+      "case_id": "data_misleading_aggregation_chart",
+      "family_id": "data_chart_aggregation",
+      "category": "dataset_reasoning",
+      "skill": "aggregation_and_chart_integrity",
+      "difficulty": "advanced",
+      "split": "hidden_test",
+      "prompt": "A chart compares total sales for regions with very different populations and uses a truncated vertical axis. Identify two interpretation risks and propose fairer views.",
+      "inputs": {
+        "region_populations": "substantially different",
+        "axis": "truncated"
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "data_workflows"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "statistical_interpretation",
+        "business_relevance",
+        "evidence_uncertainty"
+      ],
+      "likely_failure_categories": [
+        "statistical_interpretation_error",
+        "concept_gap"
+      ]
+    },
+    {
+      "case_id": "data_forecast_uncertainty",
+      "family_id": "data_forecast",
+      "category": "dataset_reasoning",
+      "skill": "forecast_uncertainty",
+      "difficulty": "advanced",
+      "split": "hidden_test",
+      "prompt": "A forecast estimates next-quarter demand at 1,000 units, with a prediction interval of 800 to 1,250. Explain the estimate and interval without presenting the point forecast as certain.",
+      "inputs": {
+        "point_forecast": 1000,
+        "prediction_interval": [
+          800,
+          1250
+        ],
+        "period": "next quarter"
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "statistical_interpretation",
+        "evidence_uncertainty",
+        "business_relevance"
+      ],
+      "likely_failure_categories": [
+        "statistical_interpretation_error",
+        "unsupported_execution_claim"
+      ]
+    },
+    {
+      "case_id": "tool_json_only",
+      "family_id": "tool_json_format",
+      "category": "tools_reliability",
+      "skill": "strict_json",
+      "difficulty": "introductory",
+      "split": "development",
+      "prompt": "Return only a JSON object with exactly the keys `status` and `count`. Use status `ok` and numeric count 3. Do not use Markdown fences.",
+      "inputs": {
+        "requested_shape": {
+          "status": "string",
+          "count": "number"
+        }
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "output_instruction_compliance"
+      ],
+      "likely_failure_categories": [
+        "output_format_failure"
+      ]
+    },
+    {
+      "case_id": "tool_exact_sentence_count",
+      "family_id": "tool_sentence_count",
+      "category": "tools_reliability",
+      "skill": "exact_sentence_count",
+      "difficulty": "introductory",
+      "split": "hidden_test",
+      "prompt": "Explain that revenue is before costs and profit is after costs in exactly two sentences. Do not use abbreviations.",
+      "inputs": {},
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "business_metrics"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "abbreviation_compliance",
+        "conceptual_correctness",
+        "output_instruction_compliance",
+        "sentence_count_compliance"
+      ],
+      "likely_failure_categories": [
+        "output_format_failure",
+        "concept_gap"
+      ]
+    },
+    {
+      "case_id": "tool_sql_group_query",
+      "family_id": "tool_sql_aggregation",
+      "category": "tools_reliability",
+      "skill": "sql_query_generation",
+      "difficulty": "intermediate",
+      "split": "development",
+      "prompt": "Using the supplied orders table, write a read-only SQL query that returns total revenue by region, ordered by region name. Return SQL only.",
+      "inputs": {
+        "schema": "orders(region TEXT, revenue NUMERIC)",
+        "rows": [
+          [
+            "East",
+            10
+          ],
+          [
+            "East",
+            15
+          ],
+          [
+            "West",
+            12
+          ]
+        ],
+        "dialect": "SQLite"
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [
+        "data_workflows"
+      ],
+      "allowed_tool_ids": [
+        "sql_readonly"
+      ],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "output_instruction_compliance",
+        "query_result_correctness",
+        "sql_safety",
+        "tool_use_correctness"
+      ],
+      "likely_failure_categories": [
+        "formula_selection_error",
+        "invalid_tool_arguments",
+        "output_format_failure"
+      ]
+    },
+    {
+      "case_id": "tool_calculator_choice",
+      "family_id": "tool_calculator_selection",
+      "category": "tools_reliability",
+      "skill": "calculator_selection",
+      "difficulty": "intermediate",
+      "split": "development",
+      "prompt": "You need to calculate the weighted average of 12 group means with different sample sizes. State whether a deterministic calculator tool is appropriate and what inputs are needed; do not claim a calculation has run.",
+      "inputs": {
+        "group_count": 12,
+        "means_and_sizes": "must be supplied for every group"
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [
+        "data_workflows"
+      ],
+      "allowed_tool_ids": [
+        "calculator"
+      ],
+      "scoring_dimensions": [
+        "formula_method_selection",
+        "tool_use_correctness",
+        "evidence_uncertainty",
+        "unsupported_claims"
+      ],
+      "likely_failure_categories": [
+        "tool_selection_error",
+        "missing_context_error",
+        "unsupported_execution_claim"
+      ]
+    },
+    {
+      "case_id": "tool_statistical_tool_choice",
+      "family_id": "clarify_missing_information",
+      "category": "tools_reliability",
+      "skill": "statistical_tool_selection",
+      "difficulty": "advanced",
+      "split": "validation",
+      "prompt": "A dataset has 50,000 rows and you need a reproducible sample variance and confidence interval. Choose an appropriate computation tool and list key inputs or assumptions; do not report uncomputed values.",
+      "inputs": {
+        "row_count": 50000,
+        "target": "sample variance and confidence interval",
+        "confidence_level": null
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [
+        "statistics_basics"
+      ],
+      "allowed_tool_ids": [
+        "describe_statistics"
+      ],
+      "scoring_dimensions": [
+        "clarification_completeness",
+        "evidence_uncertainty",
+        "formula_method_selection",
+        "tool_use_correctness",
+        "unsupported_claims"
+      ],
+      "likely_failure_categories": [
+        "tool_selection_error",
+        "missing_context_error"
+      ]
+    },
+    {
+      "case_id": "tool_arguments_valid",
+      "family_id": "percentage_rate_denominator",
+      "category": "tools_reliability",
+      "skill": "tool_argument_schema",
+      "difficulty": "intermediate",
+      "split": "validation",
+      "prompt": "A proposed calculator call is `{\"expression\": 3, \"extra\": true}`. The contract requires one expression string. Correct the arguments to calculate 18 divided by 600 as a percentage, and identify why the proposed arguments are invalid.",
+      "inputs": {
+        "proposed_arguments": {
+          "expression": 3,
+          "extra": true
+        },
+        "requested_operation": "(18 / 600) * 100"
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [
+        "calculator"
+      ],
+      "scoring_dimensions": [
+        "numerical_correctness",
+        "tool_use_correctness",
+        "formula_method_selection",
+        "conceptual_correctness"
+      ],
+      "likely_failure_categories": [
+        "tool_selection_error",
+        "invalid_tool_arguments"
+      ]
+    },
+    {
+      "case_id": "tool_trace_result_grounding",
+      "family_id": "tool_result_grounding",
+      "category": "tools_reliability",
+      "skill": "tool_result_interpretation",
+      "difficulty": "intermediate",
+      "split": "hidden_test",
+      "prompt": "Report the result of the requested calculation, if it is available. Preserve the returned value and state when the result is unavailable.",
+      "inputs": {
+        "task": "Report a calculation result only when an observed result is provided."
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [
+        "calculator"
+      ],
+      "visible_tool_trace": {
+        "tool": "calculate",
+        "status": "succeeded",
+        "result": {
+          "result": 18.5,
+          "unit": "%"
+        }
+      },
+      "scoring_dimensions": [
+        "numerical_correctness",
+        "tool_use_correctness",
+        "unsupported_claims",
+        "execution_claim_integrity",
+        "result_interpretation_error"
+      ],
+      "likely_failure_categories": [
+        "result_interpretation_error",
+        "unsupported_execution_claim"
+      ]
+    },
+    {
+      "case_id": "tool_failed_execution",
+      "family_id": "tool_execution_failure",
+      "category": "tools_reliability",
+      "skill": "execution_failure_honesty",
+      "difficulty": "advanced",
+      "split": "validation",
+      "prompt": "State whether the SQL analysis completed and what should happen next. Do not report a result unless one is available.",
+      "inputs": {
+        "task": "Report execution state and next step from any available SQL trace."
+      },
+      "modes": [
+        "base",
+        "context_assisted",
+        "tool_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [
+        "sql_readonly"
+      ],
+      "visible_tool_trace": {
+        "tool": "query_readonly_sql",
+        "status": "failed",
+        "error": "no such column: net_sales"
+      },
+      "scoring_dimensions": [
+        "tool_use_correctness",
+        "evidence_uncertainty",
+        "unsupported_claims",
+        "execution_claim_integrity",
+        "result_interpretation_error"
+      ],
+      "likely_failure_categories": [
+        "execution_failure",
+        "unsupported_execution_claim",
+        "missing_context_error"
+      ]
+    },
+    {
+      "case_id": "tool_clarify_ambiguous_definition",
+      "family_id": "tool_definition_clarification",
+      "category": "tools_reliability",
+      "skill": "metric_definition_clarification",
+      "difficulty": "advanced",
+      "split": "hidden_test",
+      "prompt": "Calculate active-customer growth. The business has not defined 'active customer' or the comparison periods. Ask the minimum focused clarification needed before calculating.",
+      "inputs": {
+        "undefined": [
+          "active_customer",
+          "comparison_periods"
+        ]
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [
+        "business_metrics"
+      ],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "evidence_uncertainty",
+        "abstention_accuracy",
+        "output_instruction_compliance"
+      ],
+      "likely_failure_categories": [
+        "missing_context_error",
+        "formula_selection_error"
+      ]
+    },
+    {
+      "case_id": "tool_no_execution_claim",
+      "family_id": "tool_no_execution_claim",
+      "category": "tools_reliability",
+      "skill": "execution_claim_grounding",
+      "difficulty": "advanced",
+      "split": "hidden_test",
+      "prompt": "No file or tool is available. Describe a safe plan for checking whether a CSV contains revenue and cost columns. Do not claim to have opened, inspected, or analyzed a file.",
+      "inputs": {
+        "file_available": false,
+        "tools_available": false
+      },
+      "modes": [
+        "base",
+        "context_assisted"
+      ],
+      "allowed_context_ids": [],
+      "allowed_tool_ids": [],
+      "scoring_dimensions": [
+        "business_relevance",
+        "evidence_uncertainty",
+        "unsupported_claims",
+        "output_instruction_compliance"
+      ],
+      "likely_failure_categories": [
+        "unsupported_execution_claim"
+      ]
+    }
+  ]
+}

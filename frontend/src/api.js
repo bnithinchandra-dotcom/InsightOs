@@ -203,3 +203,52 @@ export function sendConversationMessage(conversationId, content, signal) {
     body: { content },
   }).then((value) => expectObject(value, 'chat response'))
 }
+
+export function getDashboards(signal) {
+  return get('/api/v1/dashboards', signal)
+    .then((value) => expectArray(value, 'dashboards'))
+}
+
+export function getDashboard(dashboardId, signal) {
+  return get(`/api/v1/dashboards/${dashboardId}`, signal)
+    .then((value) => expectObject(value, 'dashboard'))
+}
+
+export function createDashboard(payload, signal) {
+  return request('/api/v1/dashboards', {
+    signal,
+    method: 'POST',
+    body: payload,
+  }).then((value) => expectObject(value, 'dashboard'))
+}
+
+export function updateDashboard(dashboardId, payload, signal) {
+  return request(`/api/v1/dashboards/${dashboardId}`, {
+    signal,
+    method: 'PUT',
+    body: payload,
+  }).then((value) => expectObject(value, 'dashboard'))
+}
+
+export function deleteDashboard(dashboardId, signal) {
+  return request(`/api/v1/dashboards/${dashboardId}`, {
+    signal,
+    method: 'DELETE',
+  }).then((value) => expectObject(value, 'dashboard deletion'))
+}
+
+export function generateAnalyticsReport(payload, signal) {
+  return request('/api/v1/analytics/reports', {
+    signal,
+    method: 'POST',
+    body: payload,
+  }).then((value) => expectObject(value, 'analytics report'))
+}
+
+export function generateEdaEvidenceReport(payload, signal) {
+  return request('/api/v1/analytics/eda-reports', {
+    signal,
+    method: 'POST',
+    body: payload,
+  }).then((value) => expectObject(value, 'EDA evidence report'))
+}

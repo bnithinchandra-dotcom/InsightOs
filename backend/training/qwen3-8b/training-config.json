@@ -1,0 +1,47 @@
+{
+  "config_version": "insightos-qwen3-8b-lora-v1",
+  "base_model": "Qwen/Qwen3-8B",
+  "base_model_revision": null,
+  "base_model_revision_required_before_run": true,
+  "dataset_version": "insightos-agent-sft-v1",
+  "dataset_path": "backend/training/qwen3-8b/insightos-agent-sft-v1.jsonl",
+  "dataset_schema_path": "backend/training/qwen3-0.6b/insightos-sft.schema.json",
+  "require_approved_examples": true,
+  "evaluation_suite_path": "backend/training/evaluation/suite_v1.json",
+  "held_out_sft_split": "test",
+  "method": "LoRA",
+  "load_in_4bit": false,
+  "max_sequence_length": 512,
+  "seed": 20261026,
+  "training": {
+    "per_device_train_batch_size": 1,
+    "gradient_accumulation_steps": 4,
+    "learning_rate": 0.0001,
+    "num_train_epochs": 1,
+    "max_steps": 5,
+    "logging_steps": 1,
+    "save_strategy": "no",
+    "evaluation_strategy": "no",
+    "gradient_checkpointing": true
+  },
+  "lora": {
+    "rank": 8,
+    "alpha": 16,
+    "dropout": 0.05,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ]
+  },
+  "status": "preparation_only",
+  "blockers": [
+    "Pin the immutable Hugging Face model revision before resolving or downloading the checkpoint.",
+    "Obtain human approval for every training example; the current dataset is draft-only.",
+    "Run resource checks and a smoke test on hardware with adequate model-training memory."
+  ]
+}

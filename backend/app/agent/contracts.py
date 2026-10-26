@@ -6,6 +6,14 @@ from typing import Any, Literal
 
 Role = Literal["system", "user", "assistant", "tool"]
 CapabilityStatus = Literal["supported", "unsupported", "unverified"]
+AgentExecutionStatus = Literal[
+    "completed",
+    "partial",
+    "failed",
+    "provider_unavailable",
+    "blocked",
+    "unsupported",
+]
 
 
 @dataclass(frozen=True)
@@ -22,6 +30,7 @@ class ProviderMessage:
     tool_calls: tuple[ToolCall, ...] = ()
     tool_call_id: str | None = None
     name: str | None = None
+    thinking: str | None = None
 
 
 @dataclass(frozen=True)
@@ -47,9 +56,36 @@ class ModelResponse:
 
 
 @dataclass(frozen=True)
+class ModelIdentity:
+    provider: str
+    model: str
+    digest: str | None = None
+
+
+@dataclass(frozen=True)
+class ProviderCapabilities:
+    text_generation: CapabilityStatus
+    tool_calling: CapabilityStatus
+    structured_output: CapabilityStatus
+    streaming: CapabilityStatus
+    local_inference: CapabilityStatus
+
+    def as_dict(self) -> dict[str, CapabilityStatus]:
+        return {
+            "text_generation": self.text_generation,
+            "tool_calling": self.tool_calling,
+            "structured_output": self.structured_output,
+            "streaming": self.streaming,
+            "local_inference": self.local_inference,
+        }
+
+
+@dataclass(frozen=True)
 class ProviderHealth:
     status: Literal["healthy", "unavailable"]
     runtime_version: str | None = None
+    model_identity: ModelIdentity | None = None
+    capabilities: ProviderCapabilities | None = None
 
 
 class ProviderError(Exception):
@@ -91,7 +127,7 @@ class ToolActivity:
 
 @dataclass(frozen=True)
 class AgentOutcome:
-    status: Literal["completed", "partial", "failed", "provider_unavailable"]
+    status: AgentExecutionStatus
     assistant_text: str
     activities: tuple[ToolActivity, ...]
     structured_results: tuple[dict[str, Any], ...]

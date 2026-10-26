@@ -2,14 +2,25 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, replace
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from fastapi import HTTPException
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, ValidationError
+from fastapi.encoders import jsonable_encoder
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    ValidationError,
+)
 
 from app.agent.config import MAX_TOOL_OUTPUT_BYTES
 from app.agent.contracts import ToolExecutionError, ToolResult
+from app.agent.inspection_handoff import build_inspection_handoff
 from app.task_execution import (
     CapabilityRegistry,
     ExecutionContext,
@@ -43,6 +54,16 @@ class FileArguments(DatasetArguments):
     file_id: StrictInt = Field(gt=0)
 
 
+class InspectionArguments(FileArguments):
+    pass
+
+
+class EDAExecutionArguments(FileArguments):
+    analysis_type: Literal["univariate", "bivariate", "multivariate"]
+    table_index: StrictInt = Field(default=0, ge=0)
+    selected_columns: list[StrictStr] = Field(min_length=1, max_length=16)
+
+
 class EDAAnalysisArguments(FileArguments):
     analysis_id: StrictInt = Field(gt=0)
 
@@ -61,6 +82,78 @@ class EDAHistoryArguments(FileArguments):
     offset: StrictInt = Field(default=0, ge=0)
 
 
+class MultiDatasetSourceArguments(StrictArguments):
+    alias: StrictStr = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
+    dataset_id: StrictInt = Field(gt=0)
+    file_id: StrictInt = Field(gt=0)
+    table_index: StrictInt = Field(default=0, ge=0)
+
+
+class MultiDatasetKeyArguments(StrictArguments):
+    alias: StrictStr = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
+    column: StrictStr = Field(min_length=1, max_length=255)
+
+
+class MultiDatasetJoinArguments(StrictArguments):
+    left_key: MultiDatasetKeyArguments
+    right_key: MultiDatasetKeyArguments
+    join_type: Literal["inner", "left"]
+    allow_many_to_many: StrictBool = False
+
+
+class MultiDatasetMetricArguments(StrictArguments):
+    name: StrictStr = Field(min_length=1, max_length=64)
+    operation: Literal[
+        "count",
+        "sum",
+        "average",
+        "minimum",
+        "maximum",
+        "distinct_count",
+    ]
+    column: MultiDatasetKeyArguments | None = None
+
+
+class MultiDatasetRecommendationArguments(StrictArguments):
+    sources: list[MultiDatasetSourceArguments] = Field(min_length=2, max_length=4)
+
+
+class MultiDatasetAnalysisArguments(MultiDatasetRecommendationArguments):
+    joins: list[MultiDatasetJoinArguments] = Field(min_length=1, max_length=3)
+    dimensions: list[MultiDatasetKeyArguments] = Field(default_factory=list, max_length=16)
+    metrics: list[MultiDatasetMetricArguments] = Field(min_length=1, max_length=16)
+
+
+class ChartSpecificationArguments(StrictArguments):
+    title: StrictStr = Field(min_length=1, max_length=120)
+    chart_type: Literal["bar", "line", "scatter", "pie"]
+    x_field: StrictStr = Field(min_length=1, max_length=255)
+    y_field: StrictStr = Field(min_length=1, max_length=64)
+    series_field: StrictStr | None = Field(default=None, min_length=1, max_length=255)
+
+
+class EvidenceReportArguments(MultiDatasetAnalysisArguments):
+    charts: list[ChartSpecificationArguments] = Field(default_factory=list, max_length=8)
+
+
+class EDAEvidenceReportArguments(StrictArguments):
+    dataset_id: StrictInt = Field(gt=0)
+    file_id: StrictInt = Field(gt=0)
+    analysis_id: StrictInt = Field(gt=0)
+    chart_columns: list[StrictStr] = Field(default_factory=list, max_length=8)
+
+
+class DatasetInspectionHandoff(StrictArguments):
+    contract_version: Literal[1]
+    agent: Literal["data_intelligence"]
+    dataset_id: StrictInt
+    file_id: StrictInt
+    status: Literal["completed"]
+    file: dict[str, Any]
+    profile: dict[str, Any] | None
+    source_fingerprint: StrictStr | None
+
+
 @dataclass(frozen=True)
 class ToolDefinition:
     name: str
@@ -68,6 +161,8 @@ class ToolDefinition:
     description: str
     arguments_model: type[StrictArguments]
     execute: Callable[[dict[str, Any]], ToolResult]
+    engine_operation: bool = False
+    capability: str = "readonly_agent_tool"
 
     def provider_schema(self) -> dict[str, Any]:
         return {
@@ -81,9 +176,10 @@ class ToolDefinition:
 
 
 def _bound(data: Any, name: str) -> Any:
+    encoded = jsonable_encoder(data)
     try:
         serialized = json.dumps(
-            data,
+            encoded,
             ensure_ascii=False,
             separators=(",", ":"),
             allow_nan=False,
@@ -99,7 +195,7 @@ def _bound(data: Any, name: str) -> Any:
             "tool_result_too_large",
             f"{name} returned more data than can be safely included in this conversation.",
         )
-    return data
+    return encoded
 
 
 def _clean_file(file_record: dict[str, Any]) -> dict[str, Any]:
@@ -135,11 +231,19 @@ def _profile_summary(response: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(profile, dict):
         return {"dataset_id": response.get("dataset_id"), "file_id": response.get("file_id")}
     tables = []
-    for table in profile.get("tables", [])[:20] if isinstance(profile.get("tables"), list) else []:
+    for table_index, table in enumerate(
+        profile.get("tables", [])[:20]
+        if isinstance(profile.get("tables"), list)
+        else []
+    ):
         if not isinstance(table, dict):
             continue
         columns = []
-        for column in table.get("columns", [])[:200] if isinstance(table.get("columns"), list) else []:
+        for column in (
+            table.get("columns", [])[:200]
+            if isinstance(table.get("columns"), list)
+            else []
+        ):
             if not isinstance(column, dict):
                 continue
             columns.append({
@@ -147,28 +251,40 @@ def _profile_summary(response: dict[str, Any]) -> dict[str, Any]:
                 for key in (
                     "name",
                     "position",
-                    "data_type",
-                    "row_count",
-                    "null_count",
-                    "null_percentage",
-                    "distinct_count",
+                    "physical_types",
+                    "missing_value_count",
+                    "empty_value_count",
+                    "distinct_value_count",
                     "distinct_count_exact",
-                    "unique_non_null_ratio",
                 )
-                if key in column and isinstance(column[key], (str, int, float, bool, type(None)))
+                if key in column
+                and (
+                    isinstance(
+                        column[key],
+                        (str, int, float, bool, type(None)),
+                    )
+                    or key == "physical_types"
+                    and isinstance(column[key], list)
+                    and all(isinstance(value, str) for value in column[key])
+                )
             })
         tables.append({
+            "table_index": table_index,
             "name": table.get("name"),
             "row_count": table.get("row_count"),
             "column_count": table.get("column_count"),
+            "duplicate_row_count": table.get("duplicate_row_count"),
+            "duplicate_row_count_exact": table.get("duplicate_row_count_exact"),
             "columns": columns,
         })
     return {
         "dataset_id": response.get("dataset_id"),
         "file_id": response.get("file_id"),
         "profile": {
-            "profile_version": profile.get("profile_version"),
+            "version": profile.get("version"),
             "tables": tables,
+            "warnings": profile.get("warnings", []),
+            "unsupported_analyses": profile.get("unsupported_analyses", []),
         },
     }
 
@@ -186,7 +302,20 @@ def _quality_summary(response: dict[str, Any]) -> dict[str, Any]:
             continue
         findings.append({
             key: finding[key]
-            for key in ("rule_id", "title", "severity", "classification", "scope", "message")
+            for key in (
+                "finding_id",
+                "rule_id",
+                "rule_version",
+                "title",
+                "severity",
+                "classification",
+                "scope",
+                "evidence",
+                "denominator",
+                "confidence",
+                "confidence_basis",
+                "recommended_investigation",
+            )
             if key in finding
         })
     return {
@@ -194,8 +323,11 @@ def _quality_summary(response: dict[str, Any]) -> dict[str, Any]:
         "file_id": response.get("file_id"),
         "status": response.get("status"),
         "report_is_current": response.get("report_is_current"),
+        "analysis_key": report.get("analysis", {}).get("analysis_key"),
+        "completion_status": report.get("completion_status"),
         "summary": report.get("summary"),
         "findings": findings,
+        "coverage": report.get("coverage"),
         "warnings": report.get("warnings", []),
     }
 
@@ -320,6 +452,131 @@ def _get_quality(arguments: dict[str, Any]) -> ToolResult:
     )
 
 
+def _get_inspection_handoff(arguments: dict[str, Any]) -> ToolResult:
+    main = _main()
+    file_result = _call_api_tool(
+        main.get_dataset_file,
+        arguments["dataset_id"],
+        arguments["file_id"],
+        name="get_inspection_file",
+    )
+    profile_result = _call_api_tool(
+        main.get_dataset_file_profile,
+        arguments["dataset_id"],
+        arguments["file_id"],
+        name="get_inspection_profile",
+    )
+    quality_result = _call_api_tool(
+        main.get_dataset_file_quality_analysis,
+        arguments["dataset_id"],
+        arguments["file_id"],
+        name="get_inspection_quality",
+    )
+    schema_list_result = _call_api_tool(
+        main.list_dataset_schema_analyses,
+        arguments["dataset_id"],
+        limit=100,
+        offset=0,
+        name="list_inspection_schema_analyses",
+    )
+    for result in (
+        file_result,
+        profile_result,
+        quality_result,
+        schema_list_result,
+    ):
+        if result.status == "failed":
+            return result
+
+    schema_analysis = None
+    schema_items = (
+        schema_list_result.data.get("items")
+        if isinstance(schema_list_result.data, dict)
+        else None
+    )
+    if isinstance(schema_items, list):
+        current_analysis = next(
+            (
+                item
+                for item in schema_items
+                if isinstance(item, dict)
+                and item.get("status") == "Completed"
+                and item.get("stale") is False
+                and isinstance(item.get("id"), int)
+                and not isinstance(item.get("id"), bool)
+            ),
+            None,
+        )
+        if current_analysis is not None:
+            detail = _call_api_tool(
+                main.get_dataset_schema_analysis,
+                arguments["dataset_id"],
+                current_analysis["id"],
+                name="get_inspection_schema_analysis",
+            )
+            if detail.status == "failed":
+                return detail
+            schema_analysis = detail.data
+
+    missing_values = 0
+    profile_data = profile_result.data
+    if isinstance(profile_data, dict):
+        profile = profile_data.get("profile_result")
+        if isinstance(profile, dict):
+            for table in profile.get("tables", []):
+                if isinstance(table, dict):
+                    for column in table.get("columns", []):
+                        if isinstance(column, dict):
+                            count = column.get("missing_value_count")
+                            if isinstance(count, int) and not isinstance(count, bool):
+                                missing_values += count
+
+    operations = []
+    if missing_values:
+        catalog = _call_api_tool(
+            main.list_preprocessing_operations,
+            name="list_preprocessing_operations",
+        )
+        if catalog.status == "failed":
+            return catalog
+        if isinstance(catalog.data, dict) and isinstance(
+            catalog.data.get("operations"), list
+        ):
+            operations = catalog.data["operations"]
+
+    try:
+        handoff = build_inspection_handoff(
+            file_record=file_result.data,
+            profile_response=profile_result.data,
+            quality_response=quality_result.data,
+            schema_analysis=schema_analysis,
+            preprocessing_operations=operations,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        logger.warning(
+            "Inspection handoff validation failed for file %s (%s)",
+            arguments["file_id"],
+            type(error).__name__,
+        )
+        return ToolResult(
+            status="failed",
+            summary="Stored inspection results could not be validated into a handoff.",
+            error_code="inspection_handoff_invalid",
+        )
+    return ToolResult(
+        status="succeeded",
+        summary=(
+            "Built a schema-validated inspection handoff from stored dataset results."
+        ),
+        data=_bound(handoff, "get_inspection_handoff"),
+        warnings=tuple(handoff["unresolved"]),
+        limitations=(
+            "The handoff references persisted records; JEV does not resolve these references.",
+            "The model's final natural-language response is not claim-validated.",
+        ),
+    )
+
+
 def _get_eda(arguments: dict[str, Any]) -> ToolResult:
     main = _main()
     return _call_api_tool(
@@ -329,6 +586,218 @@ def _get_eda(arguments: dict[str, Any]) -> ToolResult:
         arguments["analysis_id"],
         name="get_eda_result",
     )
+
+
+def _authorized_engine_file(
+    main: Any,
+    arguments: dict[str, Any],
+    *,
+    tool_name: str,
+) -> ToolResult:
+    file_result = _call_api_tool(
+        main.get_dataset_file,
+        arguments["dataset_id"],
+        arguments["file_id"],
+        name=tool_name,
+    )
+    if file_result.status == "failed":
+        return file_result
+    record = file_result.data
+    if not isinstance(record, dict) or record.get("status") != "Ready":
+        return ToolResult(
+            status="failed",
+            summary="This engine requires a ready dataset file.",
+            data=record if isinstance(record, dict) else None,
+            error_code="file_not_ready",
+        )
+    clean_file = _clean_file(record)
+    profile = _profile_summary(record).get("profile")
+    try:
+        findings = DatasetInspectionHandoff.model_validate(
+            {
+                "contract_version": 1,
+                "agent": "data_intelligence",
+                "dataset_id": arguments["dataset_id"],
+                "file_id": arguments["file_id"],
+                "status": "completed",
+                "file": clean_file,
+                "profile": profile,
+                "source_fingerprint": record.get("checksum"),
+            }
+        ).model_dump(mode="json")
+    except ValidationError:
+        return ToolResult(
+            status="failed",
+            summary="The selected file inspection did not satisfy its handoff contract.",
+            error_code="inspection_handoff_invalid",
+        )
+    return ToolResult(
+        status="succeeded",
+        summary="Inspected the selected file metadata and available stored profile before engine execution.",
+        data=findings,
+        references=(
+            {
+                "type": "dataset_file_inspection",
+                "dataset_id": arguments["dataset_id"],
+                "file_id": arguments["file_id"],
+                "source_fingerprint": record.get("checksum"),
+            },
+        ),
+    )
+
+
+def _attach_inspection(
+    result: ToolResult,
+    inspection: ToolResult,
+) -> ToolResult:
+    try:
+        validated_inspection = DatasetInspectionHandoff.model_validate(
+            inspection.data
+        ).model_dump(mode="json")
+    except ValidationError:
+        return ToolResult(
+            status="failed",
+            summary="Engine execution could not consume a valid data-inspection handoff.",
+            error_code="inspection_handoff_invalid",
+            references=inspection.references,
+        )
+    engine_data = result.data if isinstance(result.data, dict) else {}
+    return replace(
+        result,
+        data={
+            **engine_data,
+            "dataset_id": engine_data.get(
+                "dataset_id",
+                validated_inspection["dataset_id"],
+            ),
+            "file_id": engine_data.get(
+                "file_id",
+                validated_inspection["file_id"],
+            ),
+            "agent1_inspection": validated_inspection,
+        },
+        references=result.references + inspection.references,
+        warnings=result.warnings + inspection.warnings,
+    )
+
+
+def _run_normalization(arguments: dict[str, Any]) -> ToolResult:
+    main = _main()
+    inspection = _authorized_engine_file(
+        main,
+        arguments,
+        tool_name="normalize_file",
+    )
+    if inspection.status != "succeeded":
+        return inspection
+    result = _call_api_tool(
+        main.normalize_dataset_file,
+        arguments["dataset_id"],
+        arguments["file_id"],
+        name="normalize_file",
+    )
+    if result.status == "failed":
+        return _attach_inspection(result, inspection)
+    status = result.data.get("status") if isinstance(result.data, dict) else None
+    if status != "Ready":
+        return _attach_inspection(ToolResult(
+            status="failed",
+            summary="File normalization did not complete.",
+            data=result.data,
+            error_code="normalization_incomplete",
+        ), inspection)
+    return _attach_inspection(ToolResult(
+        status="succeeded",
+        summary="The existing normalization engine completed and persisted its result.",
+        data=result.data,
+        warnings=result.warnings,
+        references=result.references,
+    ), inspection)
+
+
+def _run_quality_analysis(arguments: dict[str, Any]) -> ToolResult:
+    main = _main()
+    inspection = _authorized_engine_file(
+        main,
+        arguments,
+        tool_name="run_quality_analysis",
+    )
+    if inspection.status != "succeeded":
+        return inspection
+    result = _call_api_tool(
+        main.analyze_dataset_file_quality,
+        arguments["dataset_id"],
+        arguments["file_id"],
+        name="run_quality_analysis",
+    )
+    if result.status == "failed":
+        return _attach_inspection(result, inspection)
+    status = result.data.get("status") if isinstance(result.data, dict) else None
+    if status not in {"Completed", "PartiallyCompleted"}:
+        return _attach_inspection(ToolResult(
+            status="failed",
+            summary="Quality analysis did not complete.",
+            data=result.data,
+            error_code="quality_analysis_incomplete",
+        ), inspection)
+    warnings = (
+        ("Quality analysis completed with partial coverage.",)
+        if status == "PartiallyCompleted"
+        else ()
+    )
+    return _attach_inspection(ToolResult(
+        status="succeeded",
+        summary="The existing deterministic quality engine completed.",
+        data=result.data,
+        warnings=warnings,
+        references=result.references,
+    ), inspection)
+
+
+def _run_eda_analysis(arguments: dict[str, Any]) -> ToolResult:
+    main = _main()
+    inspection = _authorized_engine_file(
+        main,
+        arguments,
+        tool_name="run_eda_analysis",
+    )
+    if inspection.status != "succeeded":
+        return inspection
+    request = {
+        "schema_version": 1,
+        "analysis_type": arguments["analysis_type"],
+        "table_index": arguments["table_index"],
+        "selected_columns": arguments["selected_columns"],
+    }
+    result = _call_api_tool(
+        main.analyze_dataset_file_eda,
+        arguments["dataset_id"],
+        arguments["file_id"],
+        request=request,
+        name="run_eda_analysis",
+    )
+    if result.status == "failed":
+        return _attach_inspection(result, inspection)
+    status = result.data.get("status") if isinstance(result.data, dict) else None
+    if status not in {"Completed", "PartiallyCompleted"}:
+        return _attach_inspection(ToolResult(
+            status="failed",
+            summary="EDA did not complete.",
+            data=result.data,
+            error_code="eda_incomplete",
+        ), inspection)
+    warnings = (
+        ("EDA completed with partial results.",)
+        if status == "PartiallyCompleted"
+        else ()
+    )
+    return _attach_inspection(ToolResult(
+        status="succeeded",
+        summary="The existing deterministic EDA engine completed and persisted its result.",
+        data=result.data,
+        warnings=warnings,
+        references=result.references,
+    ), inspection)
 
 
 def _list_eda(arguments: dict[str, Any]) -> ToolResult:
@@ -364,6 +833,105 @@ def _get_schema(arguments: dict[str, Any]) -> ToolResult:
     )
 
 
+def _recommend_multi_dataset_joins(arguments: dict[str, Any]) -> ToolResult:
+    main = _main()
+    try:
+        request = main.MultiDatasetRecommendationRequest.model_validate(arguments)
+    except ValidationError:
+        return ToolResult(
+            status="failed",
+            summary="The selected dataset sources are invalid.",
+            error_code="invalid_arguments",
+        )
+    result = _call_api_tool(
+        main.recommend_multi_dataset_relationships,
+        request,
+        name="recommend_multi_dataset_joins",
+    )
+    return _attach_multi_dataset_references(result)
+
+
+def _analyze_multiple_datasets(arguments: dict[str, Any]) -> ToolResult:
+    main = _main()
+    try:
+        request = main.MultiDatasetAnalysisRequest.model_validate(arguments)
+    except ValidationError:
+        return ToolResult(
+            status="failed",
+            summary="The multi-dataset join or aggregation request is invalid.",
+            error_code="invalid_arguments",
+        )
+    result = _call_api_tool(
+        main.analyze_multiple_datasets,
+        request,
+        name="analyze_multiple_datasets",
+    )
+    return _attach_multi_dataset_references(result)
+
+
+def _generate_evidence_report(arguments: dict[str, Any]) -> ToolResult:
+    main = _main()
+    try:
+        request = main.MultiDatasetReportRequest.model_validate(arguments)
+    except ValidationError:
+        return ToolResult(
+            status="failed",
+            summary="The analytics report request is invalid.",
+            error_code="invalid_arguments",
+        )
+    return _attach_multi_dataset_references(
+        _call_api_tool(
+            main.generate_analytics_report,
+            request,
+            name="generate_evidence_report",
+        )
+    )
+
+
+def _generate_eda_evidence_report(arguments: dict[str, Any]) -> ToolResult:
+    main = _main()
+    try:
+        request = main.EDAReportRequest.model_validate(arguments)
+    except ValidationError:
+        return ToolResult(
+            status="failed",
+            summary="The stored EDA report request is invalid.",
+            error_code="invalid_arguments",
+        )
+    return _call_api_tool(
+        main.generate_eda_evidence_report,
+        request,
+        name="generate_eda_evidence_report",
+    )
+
+
+def _attach_multi_dataset_references(result: ToolResult) -> ToolResult:
+    if result.status != "succeeded" or not isinstance(result.data, dict):
+        return result
+    sources = result.data.get("input_sources", result.data.get("sources", []))
+    references = [
+        {
+            "type": "multi_dataset_source",
+            "alias": source.get("alias"),
+            "dataset_id": source.get("dataset_id"),
+            "file_id": source.get("file_id"),
+            "table_index": source.get("table_index"),
+            "sha256": source.get("source_sha256"),
+        }
+        for source in sources
+        if isinstance(source, dict)
+    ] if isinstance(sources, list) else []
+    fingerprint = result.data.get("execution_fingerprint")
+    if isinstance(fingerprint, str):
+        references.append(
+            {
+                "type": "multi_dataset_execution",
+                "sha256": fingerprint,
+            }
+        )
+    return replace(result, references=tuple(references))
+
+
 TOOL_DEFINITIONS = (
     ToolDefinition(
         "list_projects",
@@ -387,6 +955,34 @@ TOOL_DEFINITIONS = (
         _list_files,
     ),
     ToolDefinition(
+        "recommend_multi_dataset_joins",
+        "Recommending dataset relationships",
+        "Compare explicitly selected ready dataset tables and return explainable join-key candidates using names, types, uniqueness, null rates, and observed value overlap. Recommendations are hypotheses, not approved joins.",
+        MultiDatasetRecommendationArguments,
+        _recommend_multi_dataset_joins,
+    ),
+    ToolDefinition(
+        "analyze_multiple_datasets",
+        "Joining and aggregating datasets",
+        "Execute explicitly supplied inner/left join keys across 2 to 4 authorized dataset tables, then calculate deterministic grouped metrics. Use only user-approved exact keys; many-to-many joins require explicit approval and remain row-limited.",
+        MultiDatasetAnalysisArguments,
+        _analyze_multiple_datasets,
+    ),
+    ToolDefinition(
+        "generate_evidence_report",
+        "Generating an evidence-backed report",
+        "Calculate grouped metrics with the deterministic analytics engine, then return measured findings, validated chart specifications, source references, warnings, and provenance. All keys and metrics must be explicitly supplied; the model cannot provide chart values.",
+        EvidenceReportArguments,
+        _generate_evidence_report,
+    ),
+    ToolDefinition(
+        "generate_eda_evidence_report",
+        "Reporting stored EDA findings",
+        "Turn a completed, current stored EDA result into factual metric findings and deterministic charts with source provenance. This reports existing results and does not rerun analysis.",
+        EDAEvidenceReportArguments,
+        _generate_eda_evidence_report,
+    ),
+    ToolDefinition(
         "get_profile",
         "Reviewing a data profile",
         "Retrieve a stored deterministic profile for a ready dataset file. This does not recompute a profile.",
@@ -401,11 +997,45 @@ TOOL_DEFINITIONS = (
         _get_quality,
     ),
     ToolDefinition(
+        "get_inspection_handoff",
+        "Preparing an inspection handoff",
+        "Build a versioned, schema-validated handoff from stored profile, quality, and current schema-analysis results. This does not execute preprocessing.",
+        InspectionArguments,
+        _get_inspection_handoff,
+    ),
+    ToolDefinition(
         "get_eda_result",
         "Retrieving analysis results",
         "Retrieve a saved exploratory data analysis result.",
         EDAAnalysisArguments,
         _get_eda,
+    ),
+    ToolDefinition(
+        "normalize_file",
+        "Normalizing dataset file",
+        "Run the existing bounded ETL normalization for an explicitly requested ready file. Writes the verified normalized artifact and metadata; does not execute preprocessing transformations.",
+        FileArguments,
+        _run_normalization,
+        engine_operation=True,
+        capability="registered_dataset_engine",
+    ),
+    ToolDefinition(
+        "run_quality_analysis",
+        "Running data-quality analysis",
+        "Run the existing deterministic quality-analysis engine for an explicitly requested normalized file. Persists its quality report.",
+        FileArguments,
+        _run_quality_analysis,
+        engine_operation=True,
+        capability="registered_dataset_engine",
+    ),
+    ToolDefinition(
+        "run_eda_analysis",
+        "Running exploratory data analysis",
+        "Run the existing deterministic univariate, bivariate, or multivariate EDA engine on explicitly selected columns of a normalized file. This does not implement grouped business aggregations, forecasting, or prediction.",
+        EDAExecutionArguments,
+        _run_eda_analysis,
+        engine_operation=True,
+        capability="registered_dataset_engine",
     ),
     ToolDefinition(
         "list_eda_results",
@@ -431,6 +1061,56 @@ TOOL_DEFINITIONS = (
 )
 
 
+_ENGINE_INTENT_PATTERNS = {
+    "normalize_file": re.compile(
+        r"\b(?:normalize|normalise)\b|"
+        r"\b(?:run|perform|execute)\b.{0,40}\bnormalization\b",
+        re.IGNORECASE,
+    ),
+    "run_quality_analysis": re.compile(
+        r"\b(?:run|perform|execute|check|start)\b.{0,40}\bquality\b|"
+        r"\bquality\b.{0,40}\b(?:run|perform|execute|check)\b",
+        re.IGNORECASE,
+    ),
+    "run_eda_analysis": re.compile(
+        r"\b(?:run|perform|execute|calculate|compute|analy[sz]e)\b.{0,50}"
+        r"\b(?:eda|exploratory(?:\s+data\s+analysis)?|distribution|statistics|"
+        r"histogram|correlation)\b",
+        re.IGNORECASE,
+    ),
+}
+
+_MULTI_DATASET_INTENT = re.compile(
+    r"\b(?:join|joins|joining|merge|merges|merging|combine|combines|combining|"
+    r"relationship|relationships|relate|link)\b",
+    re.IGNORECASE,
+)
+
+_REPORT_INTENT = re.compile(
+    r"\b(?:dashboard|chart|visuali[sz]|report|insight|findings?)\b",
+    re.IGNORECASE,
+)
+
+
+def _multi_dataset_intent_allowed(context: dict[str, Any] | None) -> bool:
+    message = context.get("user_message") if isinstance(context, dict) else None
+    return isinstance(message, str) and bool(
+        _MULTI_DATASET_INTENT.search(message) or _REPORT_INTENT.search(message)
+    )
+
+
+def _engine_intent_allowed(tool_name: str, context: dict[str, Any] | None) -> bool:
+    if (
+        not isinstance(context, dict)
+        or not isinstance(context.get("dataset_id"), int)
+        or isinstance(context.get("dataset_id"), bool)
+    ):
+        return False
+    message = context.get("user_message")
+    pattern = _ENGINE_INTENT_PATTERNS.get(tool_name)
+    return isinstance(message, str) and pattern is not None and bool(pattern.search(message))
+
+
 class ToolRegistry:
     def __init__(
         self,
@@ -441,13 +1121,86 @@ class ToolRegistry:
         self._definitions = {definition.name: definition for definition in definitions}
         self._execution_targets = execution_targets or backend_agent_registry()
 
-    def provider_schemas(self) -> tuple[dict[str, Any], ...]:
+    def provider_schemas(
+        self,
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], ...]:
         return tuple(
             definition.provider_schema()
             for definition in self._definitions.values()
+            if (
+                definition.name
+                not in {
+                    "recommend_multi_dataset_joins",
+                    "analyze_multiple_datasets",
+                    "generate_evidence_report",
+                    "generate_eda_evidence_report",
+                }
+                or _multi_dataset_intent_allowed(context)
+            )
+            and (
+                not definition.engine_operation
+                or _engine_intent_allowed(definition.name, context)
+            )
         )
 
-    def execute(self, name: str, raw_arguments: dict[str, Any]) -> tuple[str, ToolResult, str]:
+    def is_engine_operation(self, name: str) -> bool:
+        definition = self._definitions.get(name)
+        return definition is not None and definition.engine_operation
+
+    def prepare_engine_inspection(
+        self,
+        name: str,
+        raw_arguments: dict[str, Any],
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        definition = self._definitions.get(name)
+        if definition is None or not definition.engine_operation:
+            return ToolResult(
+                status="failed",
+                summary="The requested inspection is not an engine operation.",
+                error_code="unknown_tool",
+            )
+        if not _engine_intent_allowed(name, context):
+            return ToolResult(
+                status="failed",
+                summary="This engine operation requires an explicit user request and a selected dataset.",
+                error_code="engine_execution_not_authorized",
+            )
+        try:
+            arguments = definition.arguments_model.model_validate(raw_arguments)
+        except ValidationError:
+            return ToolResult(
+                status="failed",
+                summary="The requested operation parameters are invalid.",
+                error_code="invalid_arguments",
+            )
+        if (
+            isinstance(context, dict)
+            and isinstance(context.get("dataset_id"), int)
+            and not isinstance(context.get("dataset_id"), bool)
+            and arguments.dataset_id != context["dataset_id"]
+        ):
+            return ToolResult(
+                status="failed",
+                summary="The requested operation is outside the conversation dataset scope.",
+                error_code="dataset_scope_mismatch",
+            )
+        return _authorized_engine_file(
+            _main(),
+            arguments.model_dump(),
+            tool_name=name,
+        )
+
+    def execute(
+        self,
+        name: str,
+        raw_arguments: dict[str, Any],
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> tuple[str, ToolResult, str]:
         definition = self._definitions.get(name)
         if definition is None:
             return (
@@ -459,6 +1212,122 @@ class ToolRegistry:
                 ),
                 "Unavailable operation",
             )
+        if name in {
+            "recommend_multi_dataset_joins",
+            "analyze_multiple_datasets",
+            "generate_evidence_report",
+            "generate_eda_evidence_report",
+        } and not _multi_dataset_intent_allowed(context):
+            return (
+                "Analytics tools require an explicit report, visualization, join, or relationship request.",
+                ToolResult(
+                    status="failed",
+                    summary="Analytics tools require an explicit report, visualization, join, or relationship request.",
+                    error_code="multi_dataset_intent_required",
+                ),
+                definition.label,
+            )
+        if definition.engine_operation:
+            if not _engine_intent_allowed(name, context):
+                return (
+                    "This engine operation requires an explicit user request and a selected dataset.",
+                    ToolResult(
+                        status="failed",
+                        summary="This engine operation requires an explicit user request and a selected dataset.",
+                        error_code="engine_execution_not_authorized",
+                    ),
+                    definition.label,
+                )
+            if (
+                isinstance(raw_arguments, dict)
+                and raw_arguments.get("file_id") is not None
+                and not isinstance(raw_arguments.get("file_id"), int)
+            ):
+                return (
+                    "The dataset file identifier is invalid.",
+                    ToolResult(
+                        status="failed",
+                        summary="The dataset file identifier is invalid.",
+                        error_code="invalid_arguments",
+                    ),
+                    definition.label,
+                )
+            if context.get("_engine_operation_executed"):
+                return (
+                    "Only one engine operation may run per chat request.",
+                    ToolResult(
+                        status="failed",
+                        summary="Only one engine operation may run per chat request.",
+                        error_code="engine_operation_limit",
+                    ),
+                    definition.label,
+                )
+        if isinstance(raw_arguments, dict) and isinstance(context, dict):
+            requested_dataset_id = raw_arguments.get("dataset_id")
+            pinned_dataset_id = context.get("dataset_id")
+            if name in {
+                "recommend_multi_dataset_joins",
+                "analyze_multiple_datasets",
+                "generate_evidence_report",
+                "generate_eda_evidence_report",
+            } and isinstance(pinned_dataset_id, int) and not isinstance(
+                pinned_dataset_id, bool
+            ):
+                source_values = raw_arguments.get("sources")
+                selected_source_ids = {
+                    source.get("dataset_id")
+                    for source in (
+                        source_values if isinstance(source_values, list) else []
+                    )
+                    if isinstance(source, dict)
+                    and isinstance(source.get("dataset_id"), int)
+                    and not isinstance(source.get("dataset_id"), bool)
+                }
+                if pinned_dataset_id not in selected_source_ids:
+                    return (
+                        "The selected dataset must be included in the multi-dataset request.",
+                        ToolResult(
+                            status="failed",
+                            summary="The requested operation is outside the conversation dataset scope.",
+                            error_code="dataset_scope_mismatch",
+                        ),
+                        definition.label,
+                    )
+            if (
+                isinstance(pinned_dataset_id, int)
+                and not isinstance(pinned_dataset_id, bool)
+                and isinstance(requested_dataset_id, int)
+                and not isinstance(requested_dataset_id, bool)
+                and requested_dataset_id != pinned_dataset_id
+            ):
+                return (
+                    "The requested operation is outside the conversation dataset scope.",
+                    ToolResult(
+                        status="failed",
+                        summary="The requested operation is outside the conversation dataset scope.",
+                        error_code="dataset_scope_mismatch",
+                    ),
+                    definition.label,
+                )
+            requested_project_id = raw_arguments.get("project_id")
+            pinned_project_id = context.get("project_id")
+            if (
+                isinstance(pinned_project_id, int)
+                and not isinstance(pinned_project_id, bool)
+                and isinstance(requested_project_id, int)
+                and not isinstance(requested_project_id, bool)
+                and requested_project_id != pinned_project_id
+            ):
+                return (
+                    "The requested operation is outside the conversation project scope.",
+                    ToolResult(
+                        status="failed",
+                        summary="The requested operation is outside the conversation project scope.",
+                        error_code="project_scope_mismatch",
+                    ),
+                    definition.label,
+                )
+        request_context = context
         try:
             arguments = definition.arguments_model.model_validate(raw_arguments)
         except ValidationError:
@@ -472,11 +1341,14 @@ class ToolRegistry:
                 definition.label,
             )
         def execute_tool(
-            context: ExecutionContext,
+            task_context: ExecutionContext,
             tool_arguments: dict[str, Any],
         ) -> ToolResult:
-            context.report_progress(10)
+            task_context.report_progress(10)
             try:
+                if definition.engine_operation:
+                    if isinstance(request_context, dict):
+                        request_context["_engine_operation_executed"] = True
                 result = definition.execute(tool_arguments)
             except ToolExecutionError as error:
                 result = ToolResult(
@@ -491,7 +1363,7 @@ class ToolRegistry:
                     summary="The requested data operation failed.",
                     error_code="tool_execution_failed",
                 )
-            context.report_progress(90)
+            task_context.report_progress(90)
             return result
 
         execution = run_task(
@@ -500,7 +1372,7 @@ class ToolRegistry:
                 payload=arguments.model_dump(),
             ),
             requirements=TaskRequirements(
-                required_capabilities=("readonly_agent_tool",),
+                required_capabilities=(definition.capability,),
                 data_locality="backend",
                 data_classification="internal",
                 allowed_targets=("backend",),

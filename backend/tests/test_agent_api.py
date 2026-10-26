@@ -11,12 +11,34 @@ from sqlalchemy.pool import StaticPool
 from app import main
 from app.agent import api as chat_api
 from app.agent.config import AgentSettings
-from app.agent.contracts import AgentOutcome, ProviderError, ProviderHealth, UsageMetadata
+from app.agent.contracts import (
+    AgentOutcome,
+    ModelIdentity,
+    ModelResponse,
+    ProviderCapabilities,
+    ProviderError,
+    ProviderHealth,
+    ProviderMessage,
+    ToolCall,
+    ToolResult,
+    UsageMetadata,
+)
+from app.agent import runtime as agent_runtime
 from app.database import Base
 from app.migrations.versions import (
     da7304d9fe22_add_conversations as conversation_migration,
 )
-from app.models import Conversation, ConversationMessage, Dataset, Project, User
+from app.models import (
+    Conversation,
+    ConversationMessage,
+    Dataset,
+    DatasetFile,
+    Project,
+    User,
+    WorkflowExecution,
+    WorkflowTask,
+)
+from tests.test_agent_orchestrator import FakeRegistry, build_handoff
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 
@@ -57,6 +79,7 @@ class ConversationApiTests(unittest.TestCase):
             session.add(dataset)
             session.commit()
             self.project_id = project.id
+            self.user_id = user.id
             self.other_project_id = other_project.id
             self.dataset_id = dataset.id
 
@@ -127,6 +150,42 @@ class ConversationApiTests(unittest.TestCase):
         invalid_path = self.client.get("/api/v1/chat/conversations/0")
         self.assertEqual(invalid_path.status_code, 422)
 
+    def test_conversation_access_rechecks_project_ownership(self):
+        conversation = self._create_conversation()
+        with self.session_factory() as session:
+            owner = session.query(User).one()
+            foreign_user = User(email="foreign-owner@example.invalid")
+            session.add(foreign_user)
+            session.flush()
+            foreign_project = Project(
+                name="Foreign project",
+                user_id=foreign_user.id,
+            )
+            session.add(foreign_project)
+            session.flush()
+            stored_conversation = session.get(Conversation, conversation["id"])
+            stored_conversation.project_id = foreign_project.id
+            session.commit()
+            owner_id = owner.id
+
+        # Exercise the resource-scope check with a fixed selected owner. In the
+        # real local-profile flow, multiple profiles are rejected before access.
+        with patch.object(
+            chat_api,
+            "_require_workspace_owner",
+            side_effect=lambda session: session.get(User, owner_id),
+        ):
+            retrieved = self.client.get(
+                f"/api/v1/chat/conversations/{conversation['id']}"
+            )
+            sent = self.client.post(
+                f"/api/v1/chat/conversations/{conversation['id']}/messages",
+                json={"content": "Read this conversation"},
+            )
+
+        self.assertEqual(retrieved.status_code, 404)
+        self.assertEqual(sent.status_code, 404)
+
     def test_send_persists_user_and_assistant_outcome(self):
         conversation = self._create_conversation()
         outcome = AgentOutcome(
@@ -153,6 +212,500 @@ class ConversationApiTests(unittest.TestCase):
         self.assertEqual(detail.json()["messages"][1]["content"], "The stored profile is ready.")
         self.assertEqual(detail.json()["status"], "Active")
 
+    def test_api_runs_model_tool_loop_with_persisted_history(self):
+        conversation = self._create_conversation()
+
+        class SequenceProvider:
+            def __init__(self):
+                self.responses = iter((
+                    ModelResponse(
+                        ProviderMessage(
+                            role="assistant",
+                            content="Hello from the configured model.",
+                        ),
+                        finish_reason="stop",
+                    ),
+                    ModelResponse(
+                        ProviderMessage(
+                            role="assistant",
+                            content="",
+                            tool_calls=(
+                                ToolCall("call-1", "list_projects", {}),
+                            ),
+                        ),
+                        finish_reason="tool_calls",
+                    ),
+                    ModelResponse(
+                        ProviderMessage(
+                            role="assistant",
+                            content="I found the available projects.",
+                        ),
+                        finish_reason="stop",
+                    ),
+                ))
+                self.requests = []
+
+            def complete(self, request):
+                self.requests.append(request)
+                return next(self.responses)
+
+        provider = SequenceProvider()
+        settings = AgentSettings(
+            provider="ollama",
+            base_url="http://127.0.0.1:11434",
+            model="qwen3:4b-instruct",
+            api_key=None,
+            timeout_seconds=1,
+            max_output_tokens=32,
+            max_model_turns=3,
+            max_tool_calls=2,
+            max_history_messages=4,
+        )
+        with patch.object(main, "SessionLocal", self.session_factory), patch.object(
+            agent_runtime,
+            "get_agent_settings",
+            return_value=settings,
+        ), patch.object(
+            agent_runtime,
+            "create_provider",
+            return_value=provider,
+        ):
+            greeting = self.client.post(
+                f"/api/v1/chat/conversations/{conversation['id']}/messages",
+                json={"content": "Hello"},
+            )
+            tool_turn = self.client.post(
+                f"/api/v1/chat/conversations/{conversation['id']}/messages",
+                json={"content": "List my projects"},
+            )
+
+        self.assertEqual(greeting.status_code, 200, greeting.text)
+        self.assertEqual(
+            greeting.json()["assistant_message"]["content"],
+            "Hello from the configured model.",
+        )
+        self.assertEqual(tool_turn.status_code, 200, tool_turn.text)
+        self.assertIn(
+            "couldn't validate a data-specific response",
+            tool_turn.json()["assistant_message"]["content"],
+        )
+        self.assertEqual(
+            tool_turn.json()["tool_activities"][0]["tool_name"],
+            "list_projects",
+        )
+        self.assertEqual(
+            tool_turn.json()["tool_activities"][0]["status"],
+            "succeeded",
+        )
+        self.assertIsInstance(
+            tool_turn.json()["structured_results"][0]["data"][0]["created_at"],
+            str,
+        )
+        workflow_response = self.client.get(
+            f"/api/v1/chat/workflows/{tool_turn.json()['workflow_id']}"
+        )
+        self.assertEqual(workflow_response.status_code, 200)
+        self.assertEqual(
+            [task["task_type"] for task in workflow_response.json()["tasks"]],
+            ["list_projects"],
+        )
+        self.assertEqual(
+            workflow_response.json()["tasks"][0]["status"],
+            "completed",
+        )
+        self.assertEqual(
+            [(message.role, message.content) for message in provider.requests[1].messages[-3:]],
+            [
+                ("user", "Hello"),
+                ("assistant", "Hello from the configured model."),
+                ("user", "List my projects"),
+            ],
+        )
+        self.assertEqual(provider.requests[2].messages[-1].role, "tool")
+        detail = self.client.get(
+            f"/api/v1/chat/conversations/{conversation['id']}"
+        ).json()
+        self.assertEqual(
+            [message["role"] for message in detail["messages"]],
+            ["user", "assistant", "user", "assistant"],
+        )
+
+    def test_dataset_inspection_orchestrator_persists_a_verified_chat_answer(self):
+        conversation = self._create_conversation({"dataset_id": self.dataset_id})
+        registry = FakeRegistry(build_handoff(self.dataset_id))
+        with patch("app.agent.runtime.ToolRegistry", return_value=registry):
+            response = self.client.post(
+                f"/api/v1/chat/conversations/{conversation['id']}/messages",
+                json={"content": "How many rows and columns are in this dataset?"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["execution_status"], "completed")
+        self.assertRegex(body["workflow_id"], r"^[0-9a-f]{32}$")
+        self.assertIn("has 3 rows", body["assistant_message"]["content"])
+        self.assertIn("has 2 columns", body["assistant_message"]["content"])
+        trace = next(
+            result["data"]
+            for result in body["structured_results"]
+            if result["tool"] == "orchestration_trace"
+        )
+        self.assertEqual(trace["dataset_id"], self.dataset_id)
+        self.assertEqual(trace["outcome"], "completed")
+        self.assertEqual(
+            [call[0] for call in registry.calls],
+            ["list_files", "get_inspection_handoff"],
+        )
+        workflow_response = self.client.get(
+            f"/api/v1/chat/workflows/{body['workflow_id']}"
+        )
+        self.assertEqual(workflow_response.status_code, 200, workflow_response.text)
+        workflow = workflow_response.json()
+        self.assertEqual(workflow["status"], "completed")
+        self.assertEqual(workflow["conversation_id"], conversation["id"])
+        self.assertEqual(workflow["source_scope"]["dataset_id"], self.dataset_id)
+        self.assertTrue(workflow["source_scope"]["source_fingerprint"])
+        self.assertEqual(
+            [task["task_type"] for task in workflow["tasks"]],
+            ["list_files", "get_inspection_handoff"],
+        )
+        self.assertTrue(
+            all(task["status"] == "completed" for task in workflow["tasks"])
+        )
+        self.assertTrue(
+            all(task["result_summary"] for task in workflow["tasks"])
+        )
+        self.assertTrue(
+            all(task["input_references"] for task in workflow["tasks"])
+        )
+        self.assertEqual(workflow["tasks"][0]["depends_on"], [])
+        self.assertEqual(
+            workflow["tasks"][1]["depends_on"],
+            [workflow["tasks"][0]["task_id"]],
+        )
+        with self.session_factory() as session:
+            persisted = session.get(WorkflowExecution, body["workflow_id"])
+            self.assertEqual(persisted.objective, "How many rows and columns are in this dataset?")
+            self.assertEqual(session.query(WorkflowTask).filter_by(
+                workflow_id=body["workflow_id"]
+            ).count(), 2)
+        missing_workflow = self.client.get(
+            "/api/v1/chat/workflows/" + ("0" * 32)
+        )
+        self.assertEqual(missing_workflow.status_code, 404)
+
+    def test_scheduler_reuses_completed_read_for_identical_source_identity(self):
+        with self.session_factory() as session:
+            workflow = WorkflowExecution(
+                id="a" * 32,
+                owner_user_id=self.user_id,
+                idempotency_key="b" * 32,
+                objective="Inspect the selected dataset",
+                status="running",
+                current_step=0,
+            )
+            session.add(workflow)
+            session.commit()
+
+        schedule = chat_api._workflow_tool_scheduler(
+            "a" * 32,
+            self.user_id,
+            {"project_id": self.project_id, "dataset_id": self.dataset_id},
+        )
+        executions = []
+
+        def execute():
+            executions.append("ran")
+            result = ToolResult(
+                status="succeeded",
+                summary="Dataset files were listed.",
+                data=[{"id": 1, "status": "Ready"}],
+                references=({"type": "dataset_file", "dataset_id": self.dataset_id},),
+            )
+            return "{}", result, "Listing files"
+
+        first = schedule(
+            "list_files",
+            {"dataset_id": self.dataset_id},
+            execute,
+            idempotent=True,
+            max_retries=1,
+        )
+        second = schedule(
+            "list_files",
+            {"dataset_id": self.dataset_id},
+            execute,
+            idempotent=True,
+            max_retries=1,
+        )
+        with self.session_factory() as session:
+            dataset = session.get(Dataset, self.dataset_id)
+            dataset.updated_at += timedelta(seconds=1)
+            session.commit()
+        third = schedule(
+            "list_files",
+            {"dataset_id": self.dataset_id},
+            execute,
+            idempotent=True,
+            max_retries=1,
+        )
+
+        self.assertEqual(executions, ["ran", "ran"])
+        self.assertEqual(first[1].data, second[1].data)
+        self.assertEqual(first[3], second[3])
+        self.assertNotEqual(second[3], third[3])
+        with self.session_factory() as session:
+            tasks = session.query(WorkflowTask).filter_by(
+                workflow_id="a" * 32
+            ).all()
+            self.assertEqual(len(tasks), 2)
+            self.assertTrue(all(task.status == "completed" for task in tasks))
+            self.assertEqual(
+                tasks[0].output_references[0]["type"],
+                "dataset_file",
+            )
+
+    def test_scheduler_identity_tracks_every_multi_dataset_source(self):
+        with self.session_factory() as session:
+            workflow = WorkflowExecution(
+                id="e" * 32,
+                owner_user_id=self.user_id,
+                idempotency_key="f" * 32,
+                objective="Join selected datasets",
+                status="running",
+                current_step=0,
+            )
+            second_dataset = Dataset(
+                name="Second analytics source",
+                project_id=self.project_id,
+                status="Ready",
+            )
+            session.add_all([workflow, second_dataset])
+            session.flush()
+            second_file = DatasetFile(
+                dataset_id=second_dataset.id,
+                filename="second-source.csv",
+                storage_key=f"{second_dataset.id}/upload/second-source.csv",
+                file_size_bytes=32,
+                checksum="a" * 64,
+                status="Ready",
+            )
+            session.add(second_file)
+            session.commit()
+            second_dataset_id = second_dataset.id
+            second_file_id = second_file.id
+
+        schedule = chat_api._workflow_tool_scheduler(
+            "e" * 32,
+            self.user_id,
+            {"project_id": self.project_id, "dataset_id": self.dataset_id},
+        )
+        arguments = {
+            "sources": [
+                {
+                    "alias": "selected",
+                    "dataset_id": self.dataset_id,
+                    "file_id": 1,
+                    "table_index": 0,
+                },
+                {
+                    "alias": "other",
+                    "dataset_id": second_dataset_id,
+                    "file_id": second_file_id,
+                    "table_index": 0,
+                },
+            ],
+            "joins": [],
+            "dimensions": [],
+            "metrics": [],
+        }
+        executions = []
+
+        def execute():
+            executions.append("ran")
+            return "{}", ToolResult(
+                status="succeeded",
+                summary="Multi-dataset result.",
+                data={"group_count": 1},
+            ), "Analyzing datasets"
+
+        first = schedule(
+            "analyze_multiple_datasets",
+            arguments,
+            execute,
+            idempotent=True,
+            max_retries=1,
+        )
+        repeated = schedule(
+            "analyze_multiple_datasets",
+            arguments,
+            execute,
+            idempotent=True,
+            max_retries=1,
+        )
+        with self.session_factory() as session:
+            source_file = session.get(DatasetFile, second_file_id)
+            source_file.checksum = "b" * 64
+            source_file.updated_at += timedelta(seconds=1)
+            session.commit()
+        stale = schedule(
+            "analyze_multiple_datasets",
+            arguments,
+            execute,
+            idempotent=True,
+            max_retries=1,
+        )
+
+        self.assertEqual(executions, ["ran", "ran"])
+        self.assertEqual(first[1].data, repeated[1].data)
+        self.assertEqual(first[3], repeated[3])
+        self.assertNotEqual(repeated[3], stale[3])
+
+    def test_recovery_endpoint_replays_stale_read_and_is_repeat_safe(self):
+        stale = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)
+        with self.session_factory() as session:
+            workflow = WorkflowExecution(
+                id="c" * 32,
+                owner_user_id=self.user_id,
+                dataset_id=self.dataset_id,
+                idempotency_key="d" * 32,
+                objective="List the selected dataset files",
+                status="running",
+                current_step=0,
+                source_scope={
+                    "project_id": self.project_id,
+                    "dataset_id": self.dataset_id,
+                },
+            )
+            session.add(workflow)
+            session.commit()
+
+        schedule = chat_api._workflow_tool_scheduler(
+            "c" * 32,
+            self.user_id,
+            {"project_id": self.project_id, "dataset_id": self.dataset_id},
+        )
+        schedule(
+            "list_files",
+            {"dataset_id": self.dataset_id},
+            lambda: (
+                "{}",
+                ToolResult(
+                    status="succeeded",
+                    summary="Listed files before interruption.",
+                    data=[],
+                ),
+                "Listing files",
+            ),
+            idempotent=True,
+            max_retries=1,
+        )
+        with self.session_factory() as session:
+            workflow = session.get(WorkflowExecution, "c" * 32)
+            task = session.query(WorkflowTask).filter_by(workflow_id="c" * 32).one()
+            workflow.status = "running"
+            workflow.updated_at = stale
+            task.status = "running"
+            task.updated_at = stale
+            session.commit()
+
+        executions = []
+
+        class RecoveryRegistry:
+            def provider_schemas(self, *, context=None):
+                return ({"function": {"name": "list_files"}},)
+
+            def is_engine_operation(self, name):
+                return False
+
+            def execute(self, name, arguments, *, context=None):
+                executions.append((name, arguments))
+                return (
+                    "{}",
+                    ToolResult(
+                        status="succeeded",
+                        summary="Recovered file listing.",
+                        data=[],
+                        references=({"type": "file_listing"},),
+                    ),
+                    "Listing files",
+                )
+
+        with patch.object(chat_api, "ToolRegistry", RecoveryRegistry):
+            recovered = self.client.post(
+                "/api/v1/chat/workflows/" + "c" * 32 + "/recover"
+            )
+            repeated = self.client.post(
+                "/api/v1/chat/workflows/" + "c" * 32 + "/recover"
+            )
+
+        self.assertEqual(recovered.status_code, 200, recovered.text)
+        self.assertEqual(recovered.json()["status"], "completed")
+        recovered_tasks = recovered.json()["recovery"]["recovered"]
+        self.assertEqual(len(recovered_tasks), 1)
+        self.assertTrue(recovered_tasks[0].startswith("tool:list_files:"))
+        self.assertEqual(repeated.status_code, 200, repeated.text)
+        self.assertEqual(repeated.json()["recovery"]["recovered"], [])
+        self.assertEqual(len(executions), 1)
+
+        with self.session_factory() as session:
+            workflow = session.get(WorkflowExecution, "c" * 32)
+            dataset = session.get(Dataset, self.dataset_id)
+            workflow.status = "running"
+            workflow.updated_at = stale
+            dataset.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.commit()
+        with patch.object(chat_api, "ToolRegistry", RecoveryRegistry):
+            invalidated = self.client.post(
+                "/api/v1/chat/workflows/" + "c" * 32 + "/recover"
+            )
+        self.assertEqual(invalidated.status_code, 200, invalidated.text)
+        self.assertEqual(invalidated.json()["status"], "blocked")
+        self.assertEqual(
+            len(invalidated.json()["recovery"]["invalidated"]),
+            1,
+        )
+        self.assertEqual(len(executions), 1)
+
+    def test_workflow_retrieval_rejects_ambiguous_workspace_ownership(self):
+        conversation = self._create_conversation()
+        with patch.object(
+            chat_api,
+            "execute_agent_request",
+            side_effect=RuntimeError("must not leak"),
+        ):
+            response = self.client.post(
+                f"/api/v1/chat/conversations/{conversation['id']}/messages",
+                json={"content": "Inspect the available data"},
+            )
+        self.assertEqual(response.status_code, 200)
+
+        with self.session_factory() as session:
+            session.add(User(email="second-owner@example.invalid"))
+            session.commit()
+
+        workflow_response = self.client.get(
+            f"/api/v1/chat/workflows/{response.json()['workflow_id']}"
+        )
+        self.assertEqual(workflow_response.status_code, 409)
+        self.assertEqual(
+            workflow_response.json()["detail"]["code"],
+            "authentication_required",
+        )
+        with self.session_factory() as session:
+            other_owner = session.query(User).filter(
+                User.email == "second-owner@example.invalid"
+            ).one()
+        with patch.object(
+            chat_api,
+            "_require_workspace_owner",
+            return_value=other_owner,
+        ):
+            unauthorized_recovery = self.client.post(
+                f"/api/v1/chat/workflows/{response.json()['workflow_id']}/recover"
+            )
+        self.assertEqual(unauthorized_recovery.status_code, 404)
+
     def test_unexpected_agent_failure_is_saved_as_failed_not_success(self):
         conversation = self._create_conversation()
         with patch.object(
@@ -174,6 +727,82 @@ class ConversationApiTests(unittest.TestCase):
             detail.json()["messages"][1]["metadata"]["error_code"],
             "agent_execution_failed",
         )
+
+    def test_empty_model_response_failure_is_saved_with_error_metadata(self):
+        conversation = self._create_conversation()
+        outcome = AgentOutcome(
+            status="failed",
+            assistant_text=(
+                "The configured model returned an empty response. Retry, and check "
+                "the local model if this continues."
+            ),
+            activities=(),
+            structured_results=(),
+            warnings=("The configured model returned an empty response.",),
+            usage=UsageMetadata(),
+            error_code="provider_response_invalid",
+        )
+        with patch.object(
+            chat_api,
+            "execute_agent_request",
+            return_value=outcome,
+        ):
+            response = self.client.post(
+                f"/api/v1/chat/conversations/{conversation['id']}/messages",
+                json={"content": "10+10"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual(result["execution_status"], "failed")
+        self.assertEqual(result["error_code"], "provider_response_invalid")
+        self.assertIn("returned an empty response", result["assistant_message"]["content"])
+        detail = self.client.get(
+            f"/api/v1/chat/conversations/{conversation['id']}"
+        ).json()
+        self.assertEqual(
+            detail["messages"][1]["metadata"]["error_code"],
+            "provider_response_invalid",
+        )
+
+    def test_send_persists_clear_provider_unavailable_error(self):
+        conversation = self._create_conversation()
+        settings = AgentSettings(
+            provider="ollama",
+            base_url="http://127.0.0.1:11434",
+            model="qwen3:4b-instruct",
+            api_key=None,
+            timeout_seconds=1,
+            max_output_tokens=32,
+            max_model_turns=1,
+            max_tool_calls=1,
+            max_history_messages=1,
+        )
+        provider = Mock()
+        provider.complete.side_effect = ProviderError(
+            "provider_unavailable",
+            "The configured model provider is unavailable.",
+            retryable=True,
+        )
+        with patch.object(
+            agent_runtime,
+            "get_agent_settings",
+            return_value=settings,
+        ), patch.object(
+            agent_runtime,
+            "create_provider",
+            return_value=provider,
+        ):
+            response = self.client.post(
+                f"/api/v1/chat/conversations/{conversation['id']}/messages",
+                json={"content": "Hello"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["execution_status"], "provider_unavailable")
+        self.assertEqual(response.json()["error_code"], "provider_unavailable")
+        self.assertIn("provider is unavailable", response.json()["assistant_message"]["content"])
+        self.assertNotIn("fixture-secret", response.text)
 
     def test_active_processing_conversation_rejects_duplicate_send(self):
         conversation = self._create_conversation()
@@ -236,6 +865,13 @@ class ConversationApiTests(unittest.TestCase):
             self.assertEqual(record.status, "Processing")
             self.assertIsNotNone(record.processing_token)
             self.assertEqual(session.query(ConversationMessage).count(), 1)
+            workflow = (
+                session.query(WorkflowExecution)
+                .filter_by(conversation_id=conversation["id"])
+                .one()
+            )
+            self.assertEqual(workflow.status, "cancelled")
+            self.assertEqual(workflow.error_code, "response_superseded")
 
     def test_provider_status_reports_unconfigured_without_claiming_capabilities(self):
         settings = AgentSettings(
@@ -285,8 +921,62 @@ class ConversationApiTests(unittest.TestCase):
             "unverified",
         )
         self.assertEqual(response.json()["capabilities"]["streaming"], "unsupported")
+        self.assertEqual(
+            response.json()["provider_capabilities"]["streaming"],
+            "unsupported",
+        )
         self.assertEqual(response.json()["limits"]["max_output_tokens"], 32)
         self.assertNotIn("localhost", response.text)
+
+    def test_provider_status_exposes_identity_and_declared_adapter_capabilities(self):
+        settings = AgentSettings(
+            provider="ollama",
+            base_url="http://localhost:11434",
+            model="fixture-model",
+            api_key=None,
+            timeout_seconds=1,
+            max_output_tokens=32,
+            max_model_turns=1,
+            max_tool_calls=1,
+            max_history_messages=1,
+        )
+        provider = Mock()
+        provider.check_health.return_value = ProviderHealth(
+            status="healthy",
+            model_identity=ModelIdentity(
+                provider="ollama",
+                model="fixture-model",
+                digest="fixture-digest",
+            ),
+            capabilities=ProviderCapabilities(
+                text_generation="supported",
+                tool_calling="supported",
+                structured_output="supported",
+                streaming="unsupported",
+                local_inference="supported",
+            ),
+        )
+        with patch.object(chat_api, "get_agent_settings", return_value=settings), patch.object(
+            chat_api,
+            "create_provider",
+            return_value=provider,
+        ):
+            response = self.client.get("/api/v1/chat/provider-status")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["model_identity"],
+            {
+                "provider": "ollama",
+                "model": "fixture-model",
+                "digest": "fixture-digest",
+            },
+        )
+        self.assertEqual(
+            response.json()["provider_capabilities"]["tool_calling"],
+            "supported",
+        )
+        self.assertEqual(response.json()["capabilities"]["tool_calling"], "unverified")
 
     def test_provider_status_reports_unavailable_runtime_without_raw_error(self):
         settings = AgentSettings(

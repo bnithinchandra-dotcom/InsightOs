@@ -3,10 +3,19 @@ import unittest
 import pyarrow as pa
 
 from app.provenance import (
+    ASSUMED,
+    COMPUTED,
+    EVIDENCE_CLASSIFICATIONS,
+    FAILED,
+    INFERRED,
+    OBSERVED,
+    UNKNOWN,
     arrow_table_fingerprint,
     build_provenance,
+    normalize_verification_status,
     schema_fingerprint,
     validate_provenance,
+    verification_is_successful,
 )
 
 
@@ -50,6 +59,56 @@ class ProvenanceTests(unittest.TestCase):
         invalid["completed_at"] = "not-a-timestamp"
         with self.assertRaises(ValueError):
             validate_provenance(invalid)
+
+    def test_all_evidence_classifications_round_trip_without_becoming_verified(self):
+        self.assertEqual(
+            EVIDENCE_CLASSIFICATIONS,
+            {OBSERVED, COMPUTED, INFERRED, ASSUMED, UNKNOWN, FAILED},
+        )
+        for classification in EVIDENCE_CLASSIFICATIONS:
+            with self.subTest(classification=classification):
+                check_status = (
+                    classification
+                    if classification == FAILED
+                    else classification.lower()
+                )
+                record = self.build(
+                    verification_status=classification,
+                    checks=[{"name": "evidence", "status": check_status}],
+                )
+                validated = validate_provenance(record)
+                self.assertEqual(
+                    validated["verification"]["status"],
+                    classification,
+                )
+                self.assertEqual(
+                    validated["verification"]["checks"][0]["status"],
+                    classification,
+                )
+                self.assertFalse(verification_is_successful(classification))
+
+    def test_legacy_verification_statuses_keep_their_existing_values(self):
+        for legacy_status in ("verified", "failed", "stale", "unverifiable"):
+            with self.subTest(status=legacy_status):
+                record = validate_provenance(
+                    self.build(
+                        verification_status=legacy_status,
+                        checks=[{"name": "check", "status": legacy_status}],
+                    )
+                )
+                self.assertEqual(record["verification"]["status"], legacy_status)
+                self.assertEqual(
+                    record["verification"]["checks"][0]["status"],
+                    legacy_status,
+                )
+                self.assertEqual(
+                    verification_is_successful(legacy_status),
+                    legacy_status == "verified",
+                )
+
+    def test_unknown_check_statuses_are_rejected(self):
+        with self.assertRaises(ValueError):
+            self.build(checks=[{"name": "checksum", "status": "uncertain"}])
 
     def test_arrow_fingerprint_is_deterministic_and_schema_bound(self):
         table = pa.table({"value": [1, 2], "label": ["a", "b"]})

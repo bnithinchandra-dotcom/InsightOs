@@ -1,0 +1,716 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://insightos.local/schemas/ba-da-diagnostic-v2.json",
+  "title": "InsightOS BA/DA Diagnostic Benchmark",
+  "type": "object",
+  "required": [
+    "benchmark_version",
+    "modes",
+    "diagnostic_pairs",
+    "categories",
+    "context_cards",
+    "tool_contracts",
+    "cases"
+  ],
+  "properties": {
+    "benchmark_version": {
+      "const": "insightos-ba-da-diagnostic-v2"
+    },
+    "modes": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "base",
+          "context_assisted",
+          "tool_assisted"
+        ]
+      },
+      "uniqueItems": true,
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "diagnostic_pairs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "pair_id",
+          "case_id",
+          "compare_modes",
+          "diagnostic_question"
+        ],
+        "properties": {
+          "pair_id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "case_id": {
+            "type": "string"
+          },
+          "compare_modes": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "base",
+                "context_assisted",
+                "tool_assisted"
+              ]
+            },
+            "minItems": 2,
+            "uniqueItems": true
+          },
+          "diagnostic_question": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "categories": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "case_count"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "case_count": {
+            "const": 10
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "context_cards": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/contextCard"
+      }
+    },
+    "tool_contracts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/toolContract"
+      }
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 60,
+      "maxItems": 60,
+      "items": {
+        "$ref": "#/$defs/case"
+      }
+    }
+  },
+  "$defs": {
+    "contextCard": {
+      "type": "object",
+      "required": [
+        "id",
+        "text"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "toolContract": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "description",
+        "arguments_schema"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "arguments_schema": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    },
+    "case": {
+      "type": "object",
+      "required": [
+        "case_id",
+        "family_id",
+        "category",
+        "skill",
+        "difficulty",
+        "split",
+        "prompt",
+        "inputs",
+        "modes",
+        "allowed_context_ids",
+        "allowed_tool_ids",
+        "scoring_dimensions",
+        "likely_failure_categories"
+      ],
+      "properties": {
+        "case_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "family_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "category": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "skill": {
+          "type": "string",
+          "minLength": 1
+        },
+        "difficulty": {
+          "enum": [
+            "introductory",
+            "intermediate",
+            "advanced"
+          ]
+        },
+        "split": {
+          "enum": [
+            "development",
+            "validation",
+            "hidden_test"
+          ]
+        },
+        "prompt": {
+          "type": "string",
+          "minLength": 1
+        },
+        "inputs": {
+          "type": "object"
+        },
+        "modes": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "base",
+              "context_assisted",
+              "tool_assisted"
+            ]
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "allowed_context_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "allowed_tool_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "visible_tool_trace": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "scoring_dimensions": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "conceptual_correctness",
+              "formula_method_selection",
+              "numerical_correctness",
+              "statistical_interpretation",
+              "business_relevance",
+              "evidence_uncertainty",
+              "tool_use_correctness",
+              "output_instruction_compliance",
+              "abstention_accuracy",
+              "unsupported_claims",
+              "sentence_count_compliance",
+              "abbreviation_compliance",
+              "sql_safety",
+              "query_result_correctness",
+              "query_intent",
+              "clarification_completeness",
+              "execution_claim_integrity",
+              "result_interpretation_error"
+            ]
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "likely_failure_categories": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "concept_gap",
+              "formula_selection_error",
+              "arithmetic_error",
+              "statistical_interpretation_error",
+              "missing_context_error",
+              "retrieval_error",
+              "tool_selection_error",
+              "invalid_tool_arguments",
+              "execution_failure",
+              "result_interpretation_error",
+              "output_format_failure",
+              "unsupported_claim",
+              "unsupported_execution_claim",
+              "reference_ambiguity",
+              "scorer_error"
+            ]
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "referenceDocument": {
+      "type": "object",
+      "required": [
+        "reference_version",
+        "score_scale",
+        "failure_categories",
+        "references"
+      ],
+      "properties": {
+        "reference_version": {
+          "const": "insightos-ba-da-references-v3"
+        },
+        "score_scale": {
+          "type": "object",
+          "required": [
+            "0",
+            "1",
+            "2",
+            "NA"
+          ],
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "failure_categories": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "concept_gap",
+              "formula_selection_error",
+              "arithmetic_error",
+              "statistical_interpretation_error",
+              "missing_context_error",
+              "retrieval_error",
+              "tool_selection_error",
+              "invalid_tool_arguments",
+              "execution_failure",
+              "result_interpretation_error",
+              "output_format_failure",
+              "unsupported_claim",
+              "unsupported_execution_claim",
+              "reference_ambiguity",
+              "scorer_error"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reference"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "reference": {
+      "type": "object",
+      "required": [
+        "case_id",
+        "reference_answer",
+        "reference_calculation",
+        "units",
+        "tolerances",
+        "scorer",
+        "dimension_rubric",
+        "human_review_required",
+        "review_status"
+      ],
+      "properties": {
+        "case_id": {
+          "type": "string"
+        },
+        "reference_answer": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reference_calculation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "units": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tolerances": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "scorer": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/humanReviewScorer"
+            },
+            {
+              "$ref": "#/$defs/clarificationScorer"
+            },
+            {
+              "$ref": "#/$defs/numericScorer"
+            },
+            {
+              "$ref": "#/$defs/jsonScorer"
+            },
+            {
+              "$ref": "#/$defs/sentenceScorer"
+            },
+            {
+              "$ref": "#/$defs/sqlScorer"
+            },
+            {
+              "$ref": "#/$defs/toolArgumentsScorer"
+            },
+            {
+              "$ref": "#/$defs/toolTraceScorer"
+            }
+          ]
+        },
+        "dimension_rubric": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "human_review_required": {
+          "type": "boolean"
+        },
+        "review_status": {
+          "enum": [
+            "pending",
+            "approved",
+            "proposed_reference",
+            "revised",
+            "not_required"
+          ]
+        },
+        "previous_review_status": {
+          "enum": [
+            "revised",
+            "not_required"
+          ]
+        },
+        "operational_scoring": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/operationalScoringPolicy"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "review_status": {
+                "const": "proposed_reference"
+              }
+            },
+            "required": [
+              "review_status"
+            ]
+          },
+          "then": {
+            "required": [
+              "previous_review_status",
+              "operational_scoring"
+            ]
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "operationalScoringPolicy": {
+      "type": "object",
+      "required": [
+        "disposition",
+        "scorer",
+        "rationale"
+      ],
+      "properties": {
+        "disposition": {
+          "enum": [
+            "deterministic_component",
+            "not_assessed_by_deterministic_scorer"
+          ]
+        },
+        "scorer": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "humanReviewScorer": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "const": "human_review"
+        }
+      },
+      "additionalProperties": false
+    },
+    "clarificationScorer": {
+      "type": "object",
+      "required": [
+        "type",
+        "required_fields"
+      ],
+      "properties": {
+        "type": {
+          "const": "clarification"
+        },
+        "required_fields": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "numericScorer": {
+      "type": "object",
+      "required": [
+        "type",
+        "expected_values"
+      ],
+      "properties": {
+        "type": {
+          "const": "numeric_values"
+        },
+        "expected_values": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "jsonScorer": {
+      "type": "object",
+      "required": [
+        "type",
+        "expected_object",
+        "exact_keys",
+        "json_only"
+      ],
+      "properties": {
+        "type": {
+          "const": "json_object"
+        },
+        "expected_object": {
+          "type": "object"
+        },
+        "exact_keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "json_only": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "sentenceScorer": {
+      "type": "object",
+      "required": [
+        "type",
+        "expected_count",
+        "terminal_punctuation",
+        "counting_rule",
+        "abbreviation_pattern"
+      ],
+      "properties": {
+        "type": {
+          "const": "sentence_count"
+        },
+        "expected_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "terminal_punctuation": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "counting_rule": {
+          "type": "string",
+          "minLength": 1
+        },
+        "abbreviation_pattern": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "sqlScorer": {
+      "type": "object",
+      "required": [
+        "type",
+        "sql",
+        "expected_columns",
+        "expected_rows"
+      ],
+      "properties": {
+        "type": {
+          "const": "sql_fixture"
+        },
+        "sql": {
+          "type": "string"
+        },
+        "expected_columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "expected_rows": {
+          "type": "array",
+          "items": {
+            "type": "array"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "toolArgumentsScorer": {
+      "type": "object",
+      "required": [
+        "type",
+        "tool_id",
+        "required",
+        "expected_values"
+      ],
+      "properties": {
+        "type": {
+          "const": "tool_arguments"
+        },
+        "tool_id": {
+          "type": "string"
+        },
+        "required": {
+          "type": "object"
+        },
+        "expected_values": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "toolTraceScorer": {
+      "type": "object",
+      "required": [
+        "type",
+        "expected_status",
+        "expected_tool"
+      ],
+      "properties": {
+        "type": {
+          "const": "tool_trace"
+        },
+        "expected_status": {
+          "enum": [
+            "succeeded",
+            "failed"
+          ]
+        },
+        "expected_tool": {
+          "type": "string"
+        },
+        "expected_result": {
+          "type": "object"
+        },
+        "expected_error": {
+          "type": "string"
+        },
+        "must_not_claim_success": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -12,7 +12,10 @@ function jsonResponse(body, status = 200) {
   })
 }
 
-afterEach(() => cleanup())
+afterEach(() => {
+  cleanup()
+  vi.restoreAllMocks()
+})
 
 describe('data workspace upload flow', () => {
   it('creates a local profile and project through the existing APIs', async () => {
@@ -204,6 +207,7 @@ describe('data workspace upload flow', () => {
   })
 
   it('shows an actionable upload error returned by the API', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
     globalThis.fetch = vi.fn(async (input, options = {}) => {
       const url = new URL(String(input), window.location.origin)
       if (url.pathname === '/api/v1/workspace/profile') {
@@ -240,5 +244,8 @@ describe('data workspace upload flow', () => {
     expect(await screen.findByRole('alert')).toBeTruthy()
     expect(screen.getByRole('alert').textContent).toContain('Unsupported file extension.')
     expect(screen.getByRole('alert').textContent).toContain('dataset is retained')
+    expect(consoleError.mock.calls.flat().join(' ')).not.toMatch(
+      /same key|unique "key" prop/i,
+    )
   })
 })

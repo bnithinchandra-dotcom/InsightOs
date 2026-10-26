@@ -11,10 +11,43 @@ import pyarrow.ipc as ipc
 
 
 PROVENANCE_SCHEMA_VERSION = 1
-VERIFICATION_STATUSES = frozenset(
+OBSERVED = "OBSERVED"
+COMPUTED = "COMPUTED"
+INFERRED = "INFERRED"
+ASSUMED = "ASSUMED"
+UNKNOWN = "UNKNOWN"
+FAILED = "FAILED"
+EVIDENCE_CLASSIFICATIONS = frozenset(
+    {OBSERVED, COMPUTED, INFERRED, ASSUMED, UNKNOWN, FAILED}
+)
+LEGACY_VERIFICATION_STATUSES = frozenset(
     {"verified", "failed", "stale", "unverifiable"}
 )
+VERIFICATION_STATUSES = frozenset(
+    LEGACY_VERIFICATION_STATUSES | EVIDENCE_CLASSIFICATIONS
+)
 OPERATION_STATUSES = frozenset({"completed", "partial", "failed"})
+
+
+def normalize_verification_status(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Verification status must be a string.")
+    if value in LEGACY_VERIFICATION_STATUSES:
+        return value
+    upper = value.upper()
+    if upper in EVIDENCE_CLASSIFICATIONS:
+        return upper
+    lowered = value.lower()
+    if lowered in LEGACY_VERIFICATION_STATUSES:
+        return lowered
+    raise ValueError(f"Unsupported verification status: {value!r}.")
+
+
+def verification_is_successful(value: str) -> bool:
+    try:
+        return normalize_verification_status(value) == "verified"
+    except ValueError:
+        return False
 
 
 def canonical_sha256(value: Any) -> str:
@@ -93,6 +126,7 @@ def build_provenance(
     parent_operation_ids: list[str] | None = None,
     completed_at: str | None = None,
 ) -> dict[str, Any]:
+    normalized_verification_status = normalize_verification_status(verification_status)
     if (
         not isinstance(operation_type, str)
         or not operation_type
@@ -102,7 +136,7 @@ def build_provenance(
         or not isinstance(status, str)
         or status not in OPERATION_STATUSES
         or not isinstance(verification_status, str)
-        or verification_status not in VERIFICATION_STATUSES
+        or normalized_verification_status not in VERIFICATION_STATUSES
         or not isinstance(inputs, list)
         or any(not isinstance(item, dict) for item in inputs)
         or not isinstance(outputs, list)
@@ -113,7 +147,8 @@ def build_provenance(
             or set(check) != {"name", "status"}
             or not isinstance(check["name"], str)
             or not isinstance(check["status"], str)
-            or check["status"] not in VERIFICATION_STATUSES
+            or normalize_verification_status(check["status"])
+            not in VERIFICATION_STATUSES
             for check in checks
         )
         or (limitations is not None and (
@@ -142,8 +177,14 @@ def build_provenance(
         "status": status,
         "completed_at": completed_at or datetime.now(timezone.utc).isoformat(),
         "verification": {
-            "status": verification_status,
-            "checks": checks,
+            "status": normalized_verification_status,
+            "checks": [
+                {
+                    "name": check["name"],
+                    "status": normalize_verification_status(check["status"]),
+                }
+                for check in checks
+            ],
             "limitations": limitations or [],
         },
     }
@@ -189,7 +230,7 @@ def validate_provenance(value: Any) -> dict[str, Any]:
         not isinstance(verification, dict)
         or set(verification) != {"status", "checks", "limitations"}
         or not isinstance(verification.get("status"), str)
-        or verification["status"] not in VERIFICATION_STATUSES
+        or normalize_verification_status(verification["status"]) not in VERIFICATION_STATUSES
         or not isinstance(verification["checks"], list)
         or not isinstance(verification["limitations"], list)
         or any(not isinstance(item, str) for item in verification["limitations"])
@@ -215,6 +256,8 @@ def validate_provenance(value: Any) -> dict[str, Any]:
         parent_operation_ids=value["parent_operation_ids"],
         completed_at=value["completed_at"],
     )
+    if verification != rebuilt["verification"]:
+        raise ValueError("Provenance verification details are inconsistent.")
     if rebuilt["operation_id"] != value["operation_id"]:
         raise ValueError("Provenance operation identity does not match its contents.")
     return value

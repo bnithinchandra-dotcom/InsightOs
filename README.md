@@ -40,23 +40,31 @@ the [system architecture](docs/architecture/system-design.md).
   workspace-profile bootstrap, project and dataset creation, supported-file
   upload, ingestion status, normalization, EDA, conversation workflow, and the
   Phase 4 Schema Architect workflow. Dashboards remain unavailable.
-- **Assistant (Phase 5A foundation accepted; live local-model verification pending):**
+- **Assistant (Phase 5A foundation accepted; live local-model inference unverified):**
   persisted conversations and messages,
   bounded Ollama/OpenAI-compatible provider adapters, and a sequential,
   read-only allowlist for existing project, dataset, file, stored profile,
-  quality-report, EDA-result, and schema-analysis discovery/retrieval. The
-  provider defaults to `none`; no provider request occurs until explicitly
-  configured. Starting or recomputing analyses remains available only through
-  their existing direct APIs/UI, not through assistant tools.
+  quality-report, EDA-result, and schema-analysis discovery/retrieval. A
+  bounded inspection orchestrator answers selected stored-profile questions
+  using validated handoffs and existing claim validation. It requires one
+  selected dataset with exactly one ready file; unsupported fresh analyses
+  remain unsupported. The provider defaults to `none`; no provider request
+  occurs for the deterministic inspection path. Starting or recomputing
+  analyses remains available only through their existing direct APIs/UI, not
+  through assistant tools.
 - **Worker:** a Redis connectivity process only. It does not consume or execute
   jobs.
 
 The Compose development environment is supported for access from the local
 machine. Published backend, PostgreSQL, Redis, and MinIO ports bind to
-`127.0.0.1`. The API does not yet implement authentication or project ownership
-authorization; remote or multi-user deployment is unsupported. The
-single-profile bootstrap is a local-development convenience, not an account
-or authentication system.
+`127.0.0.1`. Some project, dataset, file, and conversation routes enforce ownership using
+the single local workspace profile. This is a local-resource guard, not
+authenticated user identity or complete authorization across every route;
+normalization, quality, EDA, schema-analysis, preprocessing, and dataset
+deletion routes do not all apply the same guard. Full tenant isolation is not
+established. Remote or multi-user deployment is unsupported. The single-profile
+bootstrap is a local-development convenience, not an account or authentication
+system.
 
 ## First-time data workflow
 
@@ -68,8 +76,31 @@ stores original bytes, and returns parser/profile metadata; unsupported files
 and operational errors are shown without marking a failed upload as complete.
 Select the resulting file to normalize it, then run univariate EDA on a chosen
 column. The EDA response reports backend placement and the results/provenance
-come from the existing deterministic engine. This workflow is local-only while
-authentication and project ownership authorization are unimplemented.
+come from the existing deterministic engine. In Assistant, select the dataset
+and ask for stored profile facts (counts, missing values, observed types, or
+exact duplicate counts); the current chat inspection path requires exactly one
+ready file and will explicitly decline unsupported fresh analytics. This
+workflow is local-only; the local profile ownership guard is not authentication
+or complete tenant isolation. In particular, analysis, preprocessing, and
+dataset-deletion routes do not all apply the same ownership guard.
+
+## Evidence-backed reports and dashboards
+
+`POST /api/v1/analytics/reports` runs the existing deterministic grouped
+multi-dataset engine and returns measured findings, validated charts,
+source/file references, warnings, and provenance. Join keys must be supplied
+explicitly; supported visualizations are bar, line, scatter, and pie, with
+bounded result points and series. `POST /api/v1/analytics/eda-reports` reports
+an existing completed EDA result, verifies its persisted provenance against
+the current normalized artifact, and does not rerun EDA.
+
+Dashboard definitions are owner-scoped through `GET`, `POST`, `PUT`, and
+`DELETE /api/v1/dashboards`. They store a bounded analytics request, chart
+configuration, and layout—not source data or computed report results.
+Refreshing is explicit and recomputes against current inputs; dashboards do
+not refresh automatically. The additive dashboard migration
+`7a94c21b6e3f` has been created but not applied. As elsewhere in the local
+workspace, the owner guard is not authenticated multi-tenant access.
 
 ## Architecture and development contracts
 
@@ -85,6 +116,7 @@ is a short navigation document. Operation contracts remain in:
 - [Preprocessing operations](backend/PREPROCESSING_ARCHITECTURE.md)
 - [EDA](backend/EDA_ARCHITECTURE.md)
 - [Open model foundation and evaluation](backend/OPEN_MODEL_FOUNDATION.md)
+- [Qwen3 evaluation and fine-tuning preparation](backend/QWEN3_FINE_TUNING_PREPARATION.md)
 
 ## Development roadmap
 
@@ -97,36 +129,49 @@ is a short navigation document. Operation contracts remain in:
 | 3.6. Preprocessing | Partial | Arrow-table transformation registry and orchestration exist as a library; no persisted or API workflow. |
 | 3.7. EDA API and persistence | Partial | Deterministic univariate, bivariate, and multivariate EDA API routes with PostgreSQL execution records, idempotency, and version 1 provenance; the Data Workspace supports normalization and univariate EDA, while broader interactive workflows remain planned. |
 | 4. AI Schema Architect | Partial | Deterministic schema discovery, relationship evidence, and conditional dimensional-model recommendations with PostgreSQL persistence and versioned provenance; the Schema Architect UI and its disposable-service workflow validation are implemented. |
-| 5A. Conversational assistant foundation | Foundation accepted; live local-model verification pending | Bounded model adapters, allowlisted deterministic tools, persisted conversations, and a conversation-first UI; no authentication, dashboards, or approval-gated preprocessing. A separate local-only workspace workflow supports profile/project setup, upload, normalization, and univariate EDA. |
+| 5A. Conversational assistant foundation | Foundation accepted; live local-model inference unverified | Bounded model adapters, allowlisted deterministic tools, persisted conversations, profile inspection, deterministic multi-dataset analytics, and evidence-backed EDA/report tools. The local workspace-owner guard is not authentication or full tenant isolation; approval-gated preprocessing remains unavailable. |
 | 5B. Capability-aware execution foundation | Partial | Typed target/task contracts, privacy/locality-aware placement, the existing read-only agent-tool boundary routed through the backend target, and a bounded browser Web Worker SHA-256 demonstration. No BI analysis has moved to browser/local execution; no cross-environment scheduler or queue exists. |
-| 5C. Open model foundation | Provider health and synthetic evaluation implemented; live model verification pending | Provider-neutral completion, honest health/capability status, and an evaluation harness exist. No runtime or model weights are installed; no real inference has been claimed. |
-| 5-13. Remaining agents, BI, ML, monitoring, governance, production | Planned | Do not treat roadmap descriptions as implemented capabilities. |
+| 5C. Open model foundation | Provider health and synthetic evaluation implemented; live generation unverified | Provider-neutral completion, honest health/capability status, and evaluation harnesses exist. Ollama 0.40.11 listed `qwen3:8b`, `qwen3:4b`, `qwen3:4b-instruct`, and `qwen3:0.6b` locally on 2026-10-26; health is not generation verification. No Qwen3-8B adapter has been trained. |
+| 5-13. Remaining agents, BI, ML, monitoring, governance, production | Partial / planned | Deterministic multi-dataset analytics, evidence-backed reports, and on-demand dashboards exist; forecasting, prediction, broad governance, and production deployment remain planned. Do not treat roadmap descriptions as implemented capabilities. |
 
 ## Assistant configuration
 
-The assistant is disabled by default (`INSIGHTOS_LLM_PROVIDER=none`). To
-enable it, configure `INSIGHTOS_LLM_PROVIDER=ollama` with `OLLAMA_MODEL` and
-an accessible `OLLAMA_BASE_URL`, or
+The assistant is disabled by default (`INSIGHTOS_LLM_PROVIDER=none`). To use
+the local Qwen model, set `INSIGHTOS_LLM_PROVIDER=ollama`,
+`OLLAMA_MODEL=qwen3:4b-instruct`, and an `OLLAMA_BASE_URL` reachable by the
+backend. The Ollama provider needs no API key and does not fall back to a
+remote service. When the backend runs in Docker on Windows, use
+`http://host.docker.internal:11434` instead of `localhost`; when it runs on
+the host, use `http://127.0.0.1:11434`. The `.env.example` model tag is a
+convenience only; the provider remains disabled until explicitly selected.
+Alternatively, configure
 `INSIGHTOS_LLM_PROVIDER=openai_compatible` with the server-side base URL, model,
-and API key. The OpenAI-compatible adapter can send configured prompts and
-tool results to that provider; do not enable it with data unless that transfer
-is acceptable. The provider-status endpoint now checks whether the configured
-runtime lists the selected model; this does not verify generation quality.
-Capabilities remain `unverified` until tested with the selected model. There
-is no automatic provider fallback. Timeout, output-token, model-turn,
-tool-call, and history limits are listed in `.env.example`. See the
+and API key for a local or self-hosted compatible service. The generic
+compatible adapter rejects OpenAI-hosted domains; it can send configured
+prompts and tool results to other explicitly configured endpoints, so do not
+enable it with data unless that transfer is acceptable. The provider-status
+endpoint checks whether the configured runtime lists the selected model; this
+does not verify generation quality. Model capabilities remain `unverified`
+until tested with the selected model. Unsupported adapter features fail
+explicitly. There is no automatic provider fallback. Timeout, output-token,
+model-turn, tool-call, and history limits are listed in `.env.example`. See the
 [open model foundation](backend/OPEN_MODEL_FOUNDATION.md) for the local model
 recommendation, resource constraints, evaluation command, and approval-gated
-setup instructions.
+setup instructions. The [Qwen3 preparation report](backend/QWEN3_FINE_TUNING_PREPARATION.md)
+records prior baseline outcomes, the token-limit diagnostic, the draft SFT
+dataset, and why local Qwen3-8B training has not run.
 
 The assistant only invokes its named read-only discovery and retrieval tools.
 It does not start/recompute quality, EDA, or schema analyses, nor run arbitrary
 code, SQL, shell commands, or filesystem actions. Conversations persist in
-PostgreSQL. These APIs have no authentication or project ownership
-authorization and are supported only in a trusted local development
-environment. A selected project or dataset provides context, not access
-control. Stored EDA results may include data-derived values needed to inspect
-an analysis; file storage keys are omitted.
+PostgreSQL. Some project/dataset/file and conversation paths enforce ownership
+against the single local profile, but this is not authenticated authorization
+or a complete tenant-isolation boundary; coverage is not uniform across every
+data route. Normalization, quality, EDA, schema-analysis, preprocessing, and
+dataset-deletion endpoints are not all protected by the same owner guard. The
+application is supported only in a trusted local development environment.
+Stored EDA results may include data-derived values needed to inspect an
+analysis; file storage keys are omitted.
 
 ### Phase 5A acceptance and remaining gaps
 
@@ -163,10 +208,12 @@ its explicit no-provider failure behavior. Keep live Ollama connectivity and
 model-specific tool-calling compatibility open as a separate gate. The next
 work should continue the autonomous BI roadmap, while validating this local
 model gate before enabling model-backed assistant behavior. Authentication,
-project ownership authorization, dashboards, and approval-gated preprocessing
-remain open. A separate local-only profile/project/upload/normalization/EDA
-workflow is now available; it does not add authentication or change the
-assistant's read-only tool boundary.
+complete ownership authorization, dashboards, and approval-gated preprocessing
+remain open. Selected project/dataset/file and conversation routes check
+ownership using the single local profile; this is not authenticated access and
+does not protect every data route. A separate local-only
+profile/project/upload/normalization/EDA workflow is available; it does not
+change the assistant's read-only tool boundary.
 
 ### Local data-workspace acceptance and remaining gaps
 
@@ -192,8 +239,9 @@ numerically. Numeric EDA was therefore verified with typed JSON, not CSV.
 Changing CSV inference needs an explicit policy that protects identifiers and
 leading-zero values. EDA execution placement is returned on the immediate
 analysis response but is not persisted as execution history. Authentication
-and project ownership authorization are also not implemented; keep this
-workflow confined to a trusted local development environment.
+and complete route-level ownership authorization are not implemented;
+selected local-profile checks are not tenant isolation. Keep this workflow
+confined to a trusted local development environment.
 
 ### Phase 5B capability-aware execution foundation
 

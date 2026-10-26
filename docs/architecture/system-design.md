@@ -32,13 +32,21 @@ UI. The local Data Workspace supports profile/project setup, upload,
 normalization, and univariate EDA; authentication, quality workflows, and
 broader interactive data-analysis workflows remain unimplemented.
 
-Compose-published API and infrastructure ports bind to `127.0.0.1`. The API
-does not implement authentication, authorization, or project ownership checks.
-Accordingly, the supported boundary is a trusted local development machine;
-remote, shared, and multi-user deployments are unsupported. A localhost port
-binding is a development exposure reduction, not API authentication and not a
-security boundary against local processes or a differently configured
-deployment.
+Compose-published API and infrastructure ports bind to `127.0.0.1`. Selected
+project, dataset, file, and conversation routes enforce ownership against the
+single local workspace profile. This is not authenticated user identity, and
+the checks do not establish complete authorization across every data route or
+full tenant isolation. Accordingly, the supported boundary remains a trusted
+local development machine; remote, shared, and multi-user deployments are
+unsupported. A localhost port binding is a development exposure reduction,
+not API authentication and not a security boundary against local processes or
+a differently configured deployment.
+
+The local owner guard is applied to selected profile, project, dataset/file
+discovery and upload, and conversation operations. Normalization, quality,
+EDA, schema-analysis, preprocessing, and dataset deletion do not all apply
+that same guard. Do not treat the selected checks as protection for those
+routes or as an authorization boundary for shared deployments.
 Compose port-binding changes apply when containers are created or recreated;
 already-running containers may retain their previous published interfaces.
 Check the active container bindings when applying this change to an existing
@@ -167,6 +175,15 @@ hypotheses. No arbitrary code, SQL, shell, or filesystem tool is registered.
 Project creation, file upload, dashboard creation, and approval-gated
 preprocessing are not exposed as assistant capabilities.
 
+The bounded inspection orchestrator runs before provider setup for supported
+stored-profile questions. It requires a selected dataset and exactly one ready
+file, resolves only row/column counts, missing-value counts, observed types,
+and exact duplicate-row counts, validates the versioned handoff and claims,
+and returns explicit unsupported or blocked outcomes for unavailable
+measurements and fresh analytics. Exact duplicate counts do not establish
+semantic validity; semantic invalid/suspicious-value analysis is unsupported.
+This route does not run new EDA or other numerical engines.
+
 The conversation-first React workflow retrieves actual project and dataset
 choices, supports saved conversations and bounded history, preserves draft
 text on request errors, and displays provider status and persisted tool
@@ -174,6 +191,40 @@ results. Schema Architect remains independently available. This is a
 local-development feature; authentication, authorization, asynchronous job
 execution, and deployment-scale provider behavior remain unimplemented or
 unverified.
+
+### Structured final-claim validation (partial)
+
+Data-oriented requests and turns that execute an allowlisted tool must return
+a bounded JSON claims envelope. The runtime resolves its handoff identifier
+only against a successful `get_inspection_handoff` result produced by that
+runtime turn, revalidates the handoff schema and content hash, checks dataset
+and file scope, and requires a resolved persisted reference with legacy
+`verified` status for profile, quality, or schema evidence. `UNKNOWN`, `FAILED`,
+the evidence classifications (`OBSERVED`, `COMPUTED`, `INFERRED`, and
+`ASSUMED`), stale, and unverifiable references cannot satisfy this requirement.
+Supported claims are resolved to values already present in the validated
+handoff; the backend constructs the final user-facing wording from those
+values instead of returning the model's prose. A failed or malformed
+envelope produces a sanitized non-success response.
+
+This is not general natural-language or claim-level verification. The current
+claim resolver supports profile-backed table and column facts, verified
+quality findings and schema relationship hypotheses, and preprocessing
+recommendations (not execution claims). EDA statistics, arbitrary metrics,
+predictions, forecasts, causal claims, and other unsupported categories fail
+closed. The request-intent detector is a heuristic, and validated-tool
+execution also triggers the structured envelope requirement; unsupported
+claims therefore may safely degrade to a generic response. Evidence-reference
+resolution is limited to the current turn's registered handoff result. JEV
+syntax and provenance checks do not resolve arbitrary references against a
+general evidence registry. There is no authenticated user principal in the
+chat path. The single-local-profile ownership guard on selected API routes is
+not tenant authorization, and its coverage is not uniform across all data
+operations.
+Profile results are linked to the current persisted file record and its
+checksum, but the profile payload has no independent source fingerprint;
+in-place source replacement therefore cannot be independently ruled out by
+the claim resolver alone.
 
 **Phase 5A integration evidence (2026-10-20):** With explicit authorization,
 the existing `insightos` PostgreSQL database was upgraded from
@@ -397,7 +448,7 @@ backend, and the health check does not mutate storage.
 
 | Module | Status | Entry point and actual responsibility | Limits, failure, provenance, and remaining boundary |
 | --- | --- | --- | --- |
-| Foundation/API | **Partial** | FastAPI in `backend/app/main.py`; SQLAlchemy metadata models and Alembic migrations; health and CRUD/upload/normalize/quality routes. | Local Compose only. No authentication or ownership enforcement. Requests perform significant work synchronously. |
+| Foundation/API | **Partial** | FastAPI in `backend/app/main.py`; SQLAlchemy metadata models and Alembic migrations; health and CRUD/upload/normalize/quality routes. Selected project, dataset, file, and conversation operations check ownership against the single local profile. | Local Compose only. No authenticated principal or complete route-level ownership enforcement; normalization, quality, EDA, schema, preprocessing, and deletion routes do not all apply the same guard. Requests perform significant work synchronously. |
 | Ingestion/parsing | **Partial** | `parse_dataset_file` handles CSV, TSV, XLSX, JSON, Parquet, and XML; validates parsing metadata; stores original bytes and deterministic profile. | Upload size defaults to 150 MiB; row/column and format-specific limits exist. CSV/TSV and Parquet are scanned in bounded records/batches. XML uses secure bounded event passes and materializes at most one record tree at a time; parser profiling rereads the source rather than retaining all parsed rows. JSON uses stdlib whole-document decoding with source-byte and pre-decode depth checks (see JSON boundary below). ZIP/folder/database/API sources are not implemented. |
 | Profiling | **Implemented with documented limits** | `DatasetProfiler` computes missing/empty, exact distinct/duplicate counts and numeric/category summaries within operation-specific budgets. | Distinct values default 100,000; numeric values 250,000; duplicate-row fingerprints 250,000. Per-value estimates and a cumulative 16 MiB estimated-retention budget stop hashing/retaining oversized values and mark exact fields unavailable with warnings. Estimates are not measured heap usage. Profile data does not replace artifact-bound analysis. |
 | Normalization | **Partial** | `normalize_file` hashes and reparses the source, builds normalized Parquet per logical table, validates rows/schema/nulls and stores checksummed objects. | Output defaults to 600 MiB, written in batches. A raw Arrow batch-size estimate is checked before each batch; a write-through reservation enforces the exact resulting temporary Parquet file length, including footer bytes, before writes. Result metadata includes versioned source/configuration/output provenance. Temporary files are removed on success and failure. This is an output-file length cap, not a process-memory or filesystem-allocation quota. |
@@ -405,7 +456,7 @@ backend, and the health check does not mutate storage.
 | Preprocessing | **Partial** | `DEFAULT_TRANSFORMATION_REGISTRY` and `orchestrate_preprocessing` run explicit DA/BA transforms on Arrow tables; business-semantic operations require explicit approvals. | Input cap 64 MiB Arrow buffers, 1,000,000 rows, 256 columns. Python-string estimates are checked before whole-column conversions and share the byte ceiling across selected columns/chunks. Input/output Arrow IPC fingerprints and ordered per-step provenance are returned in memory. This adds bounded full-table passes; it is not streaming or a process-wide memory bound. Output is not persisted; no API. |
 | EDA | **Partial** | FastAPI routes in `backend/app/main.py` (`POST /api/v1/datasets/{dataset_id}/files/{file_id}/eda`, `GET .../eda`, `GET .../eda/{analysis_id}`); deterministic univariate, bivariate, and multivariate analysis of verified normalized Parquet; the POST computation uses the capability-aware backend task boundary, requiring sensitive-data permission and backend locality without transfer; PostgreSQL persistence in `eda_analyses` retains idempotency, version 1 provenance envelope, and backend-only JEV lineage verification. The Data workspace can normalize an ingested file and run univariate analysis on a selected profile column. | Defaults/caps include 1,000,000 rows, 600 MiB selected-column scan metadata, 250,000 numeric values, 50,000 categories, 250,000 grouped values, 50,000 contingency cells, 4,000,000 pairwise work units, 128 MiB estimated decoded strings, and configured result serialization up to 1 MiB. Result records are persisted with bounded pagination (limit 1-100). Placement is reported only on the immediate computation response, not persisted as execution history. |
 | Schema Architect (Phase 4) | **Partial** | `backend/app/schema_architect.py` profiles selected normalized tables, identifies candidate keys, infers or rejects relationship hypotheses with overlap/cardinality/fan-out evidence, and produces conditional star, snowflake, and hybrid recommendations; when evidence does not support those structures, it recommends conservatively preserving the selected tables. Column roles are heuristic candidates only. FastAPI persists results in `schema_analyses` with source and artifact provenance. The React workflow selects projects, datasets, and normalized tables; creates or recomputes analyses; and displays history, relationship evidence, conditional recommendations, warnings, and provenance. | Synchronous and deterministic; accepts at most 20 files/tables and 200 columns per table, scans at most 1,000,000 rows and 1 GiB of selected normalized artifacts, retains at most 100,000 typed values (32 MiB canonical-value bytes; 10,000 values per column; 16 KiB per value), evaluates at most 10,000 relationship comparisons/500 candidates, and returns at most 10 MiB. It streams object downloads in 1 MiB chunks and scans Parquet batches. Exact distinct/overlap statistics become unavailable when retention limits are exceeded. Keys and relationships are never called verified constraints; models, grain, and measure semantics remain conditional. A per-file schema-analysis advisory lock prevents duplicate concurrent runs; existing normalization, quality, EDA, preprocessing, and deletion locks also prevent cross-operation overlap. No LLM, source rewrite, or warehouse materialization is used. Isolated PostgreSQL/MinIO integration tests cover project/dataset/file listing, analysis creation/retrieval/recomputation, history pagination, stale detection, and missing-resource errors; a browser run against the same isolated service flow verified frontend selection, creation, recomputation, retrieval, and stale display. |
-| Frontend | **Partial** | React shell, system-health view, local workspace profile bootstrap, project/dataset creation, supported-file multipart upload, ingestion status, normalization, univariate EDA result display, Phase 4 Schema Architect, conversation workspace, and a feature-probed browser Web Worker SHA-256 demonstration. | The local profile bootstrap is one-time and unauthenticated for local development only; it is not account/authentication support. Browser worker is not integrated with ingestion or BI analysis; no cross-target scheduling. The API does not implement authentication or project ownership authorization; remote/multi-user deployment is unsupported. |
+| Frontend | **Partial** | React shell, system-health view, local workspace profile bootstrap, project/dataset creation, supported-file multipart upload, ingestion status, normalization, univariate EDA result display, Phase 4 Schema Architect, conversation workspace, and a feature-probed browser Web Worker SHA-256 demonstration. | The local profile bootstrap is one-time and unauthenticated for local development only; it is not account/authentication support. Selected API routes check ownership, but route coverage is incomplete and not tenant isolation; remote/multi-user deployment is unsupported. Browser worker is not integrated with ingestion or BI analysis; no cross-target scheduling. |
 | Capability-aware execution (Phase 5B) | **Foundation partial** | `backend/app/task_execution.py` provides typed capabilities, deterministic policy, typed failures, and bounded result validation; existing read-only agent tools and the existing deterministic EDA computation use backend targets with their respective classifications/capabilities. `frontend/src/execution.js` discovers browser worker/Web Crypto support and enforces task timeout/cancellation by terminating the worker. | Backend task execution remains synchronous/cooperative; no backend hard timeout/cancellation, local-runtime target, cross-environment scheduler, persisted execution-placement history, or BI operation on a browser worker. |
 | Worker/queue | **Planned** | Worker starts, checks Redis, and idles. | No queue consumer, retry lifecycle, or execution-budget propagation. The frontend Web Worker is a separate browser-local execution target, not this service. |
 | Agents, semantic layer, NL analytics, ML, monitoring, governance | **Planned** | Product roadmap beyond the Phase 5A assistant and Phase 5B execution foundation. | No claims of autonomous BI implementation until code and tests establish them. |

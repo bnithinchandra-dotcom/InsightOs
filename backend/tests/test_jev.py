@@ -31,6 +31,24 @@ class JEVPolicyTests(unittest.TestCase):
         self.assertEqual(result.selected_value, 3)
         self.assertIsNone(result.correction_metadata)
 
+    def test_computed_result_with_independent_verified_evidence_is_accepted(self):
+        computed_result = 6 * 7
+        evidence = self.evidence(
+            computed_result,
+            42,
+            reference="execution:deterministic-result-42",
+            evidence_kind="deterministic_recomputation",
+        )
+        result = verify_claim(
+            computed_result,
+            evidence,
+            policy_for("count"),
+        )
+        self.assertEqual(result.status, "verified")
+        self.assertEqual(result.decision, "agreed")
+        self.assertEqual(result.selected_value, 42)
+        self.assertEqual(result.evidence_reference, "execution:deterministic-result-42")
+
     def test_floating_difference_within_type_tolerance_retains_primary(self):
         primary = 1.0
         evidence = self.evidence(primary, 1.0 + 5e-10)
@@ -144,6 +162,76 @@ class JEVPolicyTests(unittest.TestCase):
                 self.assertEqual(result.status, status)
                 self.assertEqual(result.reason_code, code)
                 self.assertEqual(result.selected_value, primary)
+
+    def test_legacy_and_evidence_classification_statuses_never_confuse_evidence_with_verification(self):
+        primary = 7
+        cases = (
+            ("verified", "verified"),
+            ("failed", "failed"),
+            ("stale", "stale"),
+            ("unverifiable", "unverifiable"),
+            ("OBSERVED", "unverifiable"),
+            ("COMPUTED", "unverifiable"),
+            ("INFERRED", "unverifiable"),
+            ("ASSUMED", "unverifiable"),
+            ("UNKNOWN", "unverifiable"),
+            ("FAILED", "failed"),
+        )
+        for evidence_status, expected_status in cases:
+            with self.subTest(evidence_status=evidence_status):
+                result = verify_claim(
+                    primary,
+                    self.evidence(primary, primary, status=evidence_status),
+                    policy_for("count"),
+                )
+                self.assertEqual(result.status, expected_status)
+                if expected_status != "verified":
+                    self.assertEqual(result.selected_value, primary)
+
+    def test_llm_generated_evidence_is_not_independent_verification(self):
+        primary = 7
+        evidence = self.evidence(
+            primary,
+            primary,
+            evidence_kind="llm_generated",
+            independent=False,
+            authoritative=False,
+        )
+        result = verify_claim(primary, evidence, policy_for("count"))
+        self.assertEqual(result.status, "unverifiable")
+        self.assertEqual(
+            result.reason_code,
+            "independent_authoritative_evidence_unavailable",
+        )
+        self.assertEqual(result.selected_value, primary)
+
+    def test_nonexistent_reference_without_trust_flags_is_not_verified(self):
+        primary = 7
+        evidence = evidence_for(
+            primary,
+            primary,
+            reference="execution:nonexistent-result-404",
+            evidence_kind="deterministic_recomputation",
+        )
+        result = verify_claim(primary, evidence, policy_for("count"))
+        self.assertEqual(result.status, "unverifiable")
+        self.assertEqual(
+            result.reason_code,
+            "independent_authoritative_evidence_unavailable",
+        )
+        self.assertEqual(result.evidence_reference, "execution:nonexistent-result-404")
+
+    def test_malformed_evidence_reference_remains_unverifiable(self):
+        primary = 7
+        result = verify_claim(
+            primary,
+            self.evidence(primary, primary, reference="model generated evidence"),
+            policy_for("count"),
+        )
+        self.assertEqual(result.status, "unverifiable")
+        self.assertEqual(result.reason_code, "malformed_evidence_reference")
+        self.assertIsNone(result.evidence_reference)
+        self.assertEqual(result.selected_value, primary)
 
     def test_budget_exhaustion_preserves_primary(self):
         primary = 9

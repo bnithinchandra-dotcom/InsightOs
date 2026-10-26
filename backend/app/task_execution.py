@@ -439,7 +439,12 @@ def backend_agent_registry() -> CapabilityRegistry:
             ExecutionTarget(
                 target_id="backend",
                 kind="backend",
-                capabilities=frozenset({"readonly_agent_tool"}),
+                capabilities=frozenset(
+                    {
+                        "readonly_agent_tool",
+                        "registered_dataset_engine",
+                    }
+                ),
                 data_classifications=frozenset({"internal", "sensitive"}),
             ),
         )

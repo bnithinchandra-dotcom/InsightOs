@@ -8,7 +8,7 @@ from sqlalchemy.pool import StaticPool
 
 from app import main
 from app.database import Base
-from app.models import Project, User
+from app.models import Dataset, DatasetFile, Project, User
 
 
 class LocalWorkspaceApiTests(unittest.TestCase):
@@ -124,6 +124,76 @@ class LocalWorkspaceApiTests(unittest.TestCase):
         session = self.session_factory()
         self.assertEqual(session.query(Project).count(), 0)
         session.close()
+
+    def test_project_and_dataset_access_are_scoped_to_the_workspace_owner(self):
+        self.client.post(
+            "/api/v1/workspace/profile",
+            json={"display_name": "Local Analyst", "email": "analyst@example.invalid"},
+        )
+        created = self.client.post("/api/v1/projects", json={"name": "Owned project"})
+        self.assertEqual(created.status_code, 201)
+
+        session = self.session_factory()
+        project = session.get(Project, created.json()["id"])
+        dataset = Dataset(
+            project_id=project.id,
+            name="Owned dataset",
+            status="Ready",
+        )
+        session.add(dataset)
+        session.flush()
+        dataset_file = DatasetFile(
+            dataset_id=dataset.id,
+            filename="source.csv",
+            storage_key="raw/source.csv",
+            file_size_bytes=1,
+            status="Ready",
+            profile_result={"row_count": 1},
+        )
+        session.add(dataset_file)
+        session.flush()
+        dataset_id = dataset.id
+        file_id = dataset_file.id
+        project.user_id = 999
+        session.commit()
+        session.close()
+
+        project_response = self.client.get(f"/api/v1/projects/{created.json()['id']}")
+        self.assertEqual(project_response.status_code, 404)
+
+        dataset_response = self.client.post(
+            f"/api/v1/projects/{created.json()['id']}/datasets",
+            json={"name": "Owned dataset"},
+        )
+        self.assertEqual(dataset_response.status_code, 404)
+
+        self.assertEqual(
+            self.client.get(f"/api/v1/datasets/{dataset_id}").status_code,
+            404,
+        )
+        self.assertEqual(
+            self.client.get(f"/api/v1/datasets/{dataset_id}/files").status_code,
+            404,
+        )
+        self.assertEqual(
+            self.client.get(
+                f"/api/v1/datasets/{dataset_id}/files/{file_id}"
+            ).status_code,
+            404,
+        )
+        self.assertEqual(
+            self.client.get(
+                f"/api/v1/datasets/{dataset_id}/files/{file_id}/profile"
+            ).status_code,
+            404,
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/api/v1/datasets/{dataset_id}/files",
+                files={"file": ("new.csv", b"id\n1\n", "text/csv")},
+            ).status_code,
+            404,
+        )
 
 
 if __name__ == "__main__":

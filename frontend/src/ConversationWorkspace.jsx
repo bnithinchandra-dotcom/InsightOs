@@ -257,30 +257,49 @@ function ConversationWorkspace() {
           {conversation && messages.length === 0 && (
             <p className="muted">Ask a question about your existing projects, datasets, profiles, quality reports, EDA, or schema analyses.</p>
           )}
-          {messages.map((message) => (
-            <article className={`chat-message chat-${message.role}`} key={message.id}>
-              <p className="chat-role">{message.role === 'assistant' ? 'InsightOS' : 'You'}</p>
-              <p className="chat-content">{message.content}</p>
-              {message.metadata?.tool_activities?.map((activity, index) => (
-                <div className={`tool-activity tool-${activity.status}`} key={`${activity.tool_name}-${index}`}>
-                  <strong>{activity.label}</strong>
-                  <span>{activity.summary}</span>
-                </div>
-              ))}
-              {message.metadata?.structured_results?.map((result, index) => (
-                <details className="structured-chat-result" key={`${result.tool}-${index}`}>
-                  <summary>{result.tool.replaceAll('_', ' ')} result</summary>
-                  <p>{result.summary}</p>
-                  {result.data !== null && result.data !== undefined && (
-                    <pre>{JSON.stringify(result.data, null, 2)}</pre>
-                  )}
-                </details>
-              ))}
-              {message.metadata?.warnings?.map((warning, index) => (
-                <p className="chat-warning" key={`${index}-${warning}`}>{warning}</p>
-              ))}
-            </article>
-          ))}
+          {messages.map((message) => {
+            const executionStatus = message.metadata?.execution_status
+            const isFailedAssistantMessage = message.role === 'assistant' && (
+              executionStatus
+                ? executionStatus !== 'completed'
+                : !message.content?.trim()
+            )
+            const content = message.content?.trim()
+              ? message.content
+              : message.role === 'assistant'
+                ? 'No response was generated. Please retry.'
+                : ''
+
+            return (
+              <article className={`chat-message chat-${message.role}`} key={message.id}>
+                <p className="chat-role">{message.role === 'assistant' ? 'InsightOS' : 'You'}</p>
+                <p
+                  className={`chat-content ${isFailedAssistantMessage ? 'chat-error' : ''}`}
+                  role={isFailedAssistantMessage ? 'alert' : undefined}
+                >
+                  {content}
+                </p>
+                {message.metadata?.tool_activities?.map((activity, index) => (
+                  <div className={`tool-activity tool-${activity.status}`} key={`${activity.tool_name}-${index}`}>
+                    <strong>{activity.label}</strong>
+                    <span>{activity.summary}</span>
+                  </div>
+                ))}
+                {message.metadata?.structured_results?.map((result, index) => (
+                  <details className="structured-chat-result" key={`${result.tool}-${index}`}>
+                    <summary>{result.tool.replaceAll('_', ' ')} result</summary>
+                    <p>{result.summary}</p>
+                    {result.data !== null && result.data !== undefined && (
+                      <pre>{JSON.stringify(result.data, null, 2)}</pre>
+                    )}
+                  </details>
+                ))}
+                {message.metadata?.warnings?.map((warning, index) => (
+                  <p className="chat-warning" key={`${index}-${warning}`}>{warning}</p>
+                ))}
+              </article>
+            )
+          })}
           {sending && <p className="muted" role="status">Working on your request…</p>}
         </div>
 

@@ -3,6 +3,7 @@ import { getHealth, getSystemInfo } from './api'
 import BrowserExecution from './BrowserExecution'
 import ConversationWorkspace from './ConversationWorkspace'
 import DataWorkspace from './DataWorkspace'
+import Dashboards from './Dashboards'
 import SchemaArchitect from './SchemaArchitect'
 import './App.css'
 
@@ -141,22 +142,6 @@ function PageHeader({ title, description, children }) {
       </div>
       {children}
     </div>
-  )
-}
-
-function EmptyState({ icon, title, description, action, detail }) {
-  return (
-    <section className="empty-state panel">
-      <div className="empty-icon"><Icon name={icon} size={23} /></div>
-      <h2>{title}</h2>
-      <p>{description}</p>
-      {action && (
-        <button className="button button-primary" type="button" disabled title={detail}>
-          {action}
-        </button>
-      )}
-      {detail && <span className="action-note">{detail}</span>}
-    </section>
   )
 }
 
@@ -358,9 +343,7 @@ function PageContent({ page, props }) {
   if (page === 'analysis') {
     return <SchemaArchitect />
   }
-  if (page === 'dashboards') {
-    return <EmptyState icon="chart" title="No dashboards yet" description="Create analytical views from your future insights. Dashboards will be available when analysis features are in place." detail="No charts or dashboard data are available yet." />
-  }
+  if (page === 'dashboards') return <Dashboards />
   if (page === 'system') return <SystemPage {...props} />
   return <SettingsPage systemInfo={props.systemInfo} />
 }

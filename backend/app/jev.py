@@ -21,7 +21,13 @@ from decimal import (
 from typing import Any, Literal
 
 from app.execution import ExecutionBudget, ExecutionBudgetExceeded
-from app.provenance import canonical_sha256
+from app.provenance import (
+    EVIDENCE_CLASSIFICATIONS,
+    FAILED,
+    canonical_sha256,
+    normalize_verification_status,
+    verification_is_successful,
+)
 
 
 JEV_POLICY_VERSION = "1"
@@ -40,7 +46,18 @@ _ROUNDING_MODES = {
     "ROUND_CEILING": ROUND_CEILING,
 }
 
-VerificationStatus = Literal["verified", "failed", "stale", "unverifiable"]
+VerificationStatus = Literal[
+    "verified",
+    "failed",
+    "stale",
+    "unverifiable",
+    "OBSERVED",
+    "COMPUTED",
+    "INFERRED",
+    "ASSUMED",
+    "UNKNOWN",
+    "FAILED",
+]
 VerificationDecision = Literal[
     "agreed",
     "correction_applied",
@@ -222,8 +239,8 @@ def evidence_for(
     *,
     reference: str,
     evidence_kind: str = "deterministic",
-    independent: bool = True,
-    authoritative: bool = True,
+    independent: bool = False,
+    authoritative: bool = False,
     status: VerificationStatus = "verified",
     currency: str | None = None,
     limitation_code: str | None = None,
@@ -367,17 +384,35 @@ def verify_claim(
             reference,
             primary_value,
         )
-    if not isinstance(evidence.status, str) or evidence.status != "verified":
-        status = evidence.status if isinstance(evidence.status, str) and evidence.status in {
-            "failed",
-            "stale",
-            "unverifiable",
-        } else "unverifiable"
+    try:
+        evidence_status = normalize_verification_status(evidence.status)
+    except ValueError:
+        evidence_status = None
+    if not verification_is_successful(evidence.status):
+        if evidence_status in {"failed", FAILED}:
+            status = "failed"
+            reason_code = (
+                "evidence_classification_failed"
+                if evidence_status == FAILED
+                else _safe_limitation_code(evidence.limitation_code)
+            )
+        elif evidence_status == "stale":
+            status = "stale"
+            reason_code = _safe_limitation_code(evidence.limitation_code)
+        elif evidence_status == "unverifiable":
+            status = "unverifiable"
+            reason_code = _safe_limitation_code(evidence.limitation_code)
+        elif evidence_status in EVIDENCE_CLASSIFICATIONS:
+            status = "unverifiable"
+            reason_code = f"evidence_classification_{evidence_status.lower()}"
+        else:
+            status = "unverifiable"
+            reason_code = "unsupported_evidence_status"
         return _assessment(
             policy,
             status,
             "skipped",
-            _safe_limitation_code(evidence.limitation_code),
+            reason_code,
             claim_hash,
             reference,
             primary_value,

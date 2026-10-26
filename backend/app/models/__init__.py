@@ -5,7 +5,9 @@ from app.models.eda_analysis import EDAAnalysis
 from app.models.preprocessing_execution import PreprocessingExecution
 from app.models.project import Project
 from app.models.schema_analysis import SchemaAnalysis
+from app.models.dashboard import Dashboard
 from app.models.user import User
+from app.models.workflow import WorkflowExecution, WorkflowTask, WorkflowTaskDependency
 
 __all__ = [
     "User",
@@ -17,4 +19,8 @@ __all__ = [
     "EDAAnalysis",
     "PreprocessingExecution",
     "SchemaAnalysis",
+    "Dashboard",
+    "WorkflowExecution",
+    "WorkflowTask",
+    "WorkflowTaskDependency",
 ]

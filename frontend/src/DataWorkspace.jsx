@@ -8,9 +8,11 @@ import {
   getLocalWorkspaceProfile,
   getProjects,
   getProjectDatasets,
+  generateEdaEvidenceReport,
   normalizeDatasetFile,
   uploadDatasetFile,
 } from './api'
+import { ChartCard } from './Dashboards'
 
 const supportedFormats = '.csv, .tsv, .xlsx, .json, .parquet, .xml'
 
@@ -35,6 +37,7 @@ function DataWorkspace({ page }) {
   const [additionalFile, setAdditionalFile] = useState(null)
   const [selectedColumns, setSelectedColumns] = useState({})
   const [analysis, setAnalysis] = useState(null)
+  const [edaReport, setEdaReport] = useState(null)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
@@ -170,7 +173,10 @@ function DataWorkspace({ page }) {
     setNotice('')
     try {
       const created = await createDataset(projectId, { name: datasetName.trim() })
-      setDatasets((current) => [...current, created])
+      setDatasets((current) => [
+        ...current.filter((dataset) => dataset.id !== created.id),
+        created,
+      ])
       setDatasetId(String(created.id))
       setDatasetName('')
       try {
@@ -237,6 +243,7 @@ function DataWorkspace({ page }) {
     setError('')
     setNotice('')
     setAnalysis(null)
+    setEdaReport(null)
     try {
       const result = await createDatasetEda(datasetId, file.id, {
         analysis_type: 'univariate',
@@ -244,6 +251,25 @@ function DataWorkspace({ page }) {
       })
       setAnalysis(result)
       setNotice(`EDA completed on ${file.filename} using the backend execution target.`)
+    } catch (requestError) {
+      setError(errorMessage(requestError))
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function handleEdaReport() {
+    if (!analysis?.id || !analysis.file_id) return
+    setBusy('eda-report')
+    setError('')
+    setEdaReport(null)
+    try {
+      const report = await generateEdaEvidenceReport({
+        dataset_id: Number(datasetId),
+        file_id: analysis.file_id,
+        analysis_id: analysis.id,
+      })
+      setEdaReport(report)
     } catch (requestError) {
       setError(errorMessage(requestError))
     } finally {
@@ -425,6 +451,7 @@ function DataWorkspace({ page }) {
                       onChange={(event) => {
                         setError('')
                         setAnalysis(null)
+                        setEdaReport(null)
                         setDatasetId(event.target.value)
                       }}
                     >
@@ -524,7 +551,46 @@ function DataWorkspace({ page }) {
                 {' '}{analysis.result.source?.artifact_sha256 ? 'normalized artifact checksum recorded' : 'artifact checksum unavailable'}
                 {' '}· execution target: {analysis.execution_placement?.target_id ?? 'unavailable'}
               </p>
+              <button
+                className="button button-secondary"
+                type="button"
+                onClick={handleEdaReport}
+                disabled={Boolean(busy)}
+              >
+                {busy === 'eda-report' ? 'Building report…' : 'Build evidence report'}
+              </button>
               <pre className="data-result-json">{JSON.stringify(analysis.result.columns, null, 2)}</pre>
+              {edaReport && (
+                <section className="eda-evidence-report" aria-live="polite">
+                  <p className="eyebrow">Stored EDA evidence</p>
+                  <h3>{edaReport.summary.findings_count} measured findings</h3>
+                  <p className="muted">
+                    {edaReport.summary.rows_analyzed} rows analyzed · provenance {edaReport.provenance.operation_id.slice(0, 12)}
+                  </p>
+                  {edaReport.warnings.map((warning, index) => (
+                    <p className="dashboard-warning" key={`${warning}-${index}`}>{warning}</p>
+                  ))}
+                  <div className="dashboard-chart-grid">
+                    {edaReport.charts.map((chart) => (
+                      <div
+                        className="dashboard-chart-placement"
+                        key={chart.title}
+                        style={{ gridColumn: 'span 12', gridRow: 'span 6' }}
+                      >
+                        <ChartCard chart={chart} />
+                      </div>
+                    ))}
+                  </div>
+                  <ul className="dashboard-findings">
+                    {edaReport.findings.map((finding) => (
+                      <li key={finding.id}>
+                        <strong>{finding.statement}</strong>
+                        <span>{finding.supporting_metric.valid_count} valid observations · {finding.source_references[0].dataset_id}/{finding.source_references[0].file_id}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              )}
             </section>
           )}
         </>

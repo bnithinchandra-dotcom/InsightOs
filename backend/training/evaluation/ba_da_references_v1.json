@@ -1,0 +1,1911 @@
+{
+  "reference_version": "insightos-ba-da-references-v3",
+  "score_scale": {
+    "0": "Incorrect or unsupported",
+    "1": "Partially correct",
+    "2": "Complete and correct",
+    "NA": "Not tested; excluded from the dimension denominator"
+  },
+  "failure_categories": [
+    "concept_gap",
+    "formula_selection_error",
+    "arithmetic_error",
+    "statistical_interpretation_error",
+    "missing_context_error",
+    "retrieval_error",
+    "tool_selection_error",
+    "invalid_tool_arguments",
+    "execution_failure",
+    "result_interpretation_error",
+    "output_format_failure",
+    "unsupported_claim",
+    "unsupported_execution_claim",
+    "reference_ambiguity",
+    "scorer_error"
+  ],
+  "references": [
+    {
+      "case_id": "ba_requirements_vs_solution",
+      "reference_answer": "Clarify the business outcome or decision the alert should support; the red button is a proposed implementation, not a requirement.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "conceptual_correctness": "Separates desired outcome from interface choice.",
+        "business_relevance": "Asks a useful outcome or decision question.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "ba_stakeholder_authority",
+      "reference_answer": "Consult affected sales, finance, and compliance users; identify the accountable business owner and decision rights before assigning approval.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "conceptual_correctness": "Identifies affected stakeholders without inventing organizational authority.",
+        "evidence_uncertainty": "Requests decision-rights and jurisdiction context.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "ba_retention_kpi",
+      "reference_answer": "Before selecting a retention rate, ask how the eligible cohort is defined, what measurement period applies, and what business rule defines retained/active. Do not assume a convention.",
+      "reference_calculation": null,
+      "units": "percent",
+      "tolerances": {},
+      "scorer": {
+        "type": "clarification",
+        "required_fields": [
+          "eligible_cohort",
+          "measurement_period",
+          "retained_definition"
+        ]
+      },
+      "dimension_rubric": {
+        "clarification_completeness": "Requests each listed missing input before a definitive calculation.",
+        "unsupported_claims": "Does not invent definitions, parameters, or computed results.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty.",
+        "formula_method_selection": "Selects the requested method and applies the stated population, denominator, grain, and assumptions.",
+        "conceptual_correctness": "Accurately explains the core concept and addresses the requested reasoning; a matching number alone is insufficient."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "ba_order_bottleneck",
+      "reference_answer": "Approval has the longest listed wait at 18 hours. This identifies the longest observed delay, not necessarily the operational bottleneck. Ask: does approval constrain throughput or capacity compared with the other stages? Do not recommend a change from duration alone.",
+      "reference_calculation": "max(1, 18, 2) = 18 hours at approval; duration alone does not establish throughput constraint",
+      "units": "hours",
+      "tolerances": {
+        "hours": "0"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "bottleneck_hours": "18"
+        }
+      },
+      "dimension_rubric": {
+        "business_relevance": "Distinguishes longest observed wait from a proven throughput bottleneck and proposes a relevant follow-up.",
+        "evidence_uncertainty": "Does not infer a capacity constraint from duration alone.",
+        "conceptual_correctness": "Accurately explains the core concept and addresses the requested reasoning; a matching number alone is insufficient."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "business_relevance": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Distinguishes longest observed wait from a proven throughput bottleneck and proposes a relevant follow-up."
+        },
+        "evidence_uncertainty": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Does not infer a capacity constraint from duration alone."
+        },
+        "conceptual_correctness": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Accurately explains the core concept and addresses the requested reasoning; a matching number alone is insufficient."
+        }
+      }
+    },
+    {
+      "case_id": "ba_revenue_vs_profit",
+      "reference_answer": "Revenue can rise while profit falls if costs rise faster than revenue, for example due to higher input, labor, fulfillment, or acquisition costs. Do not assert which cause occurred without evidence.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "conceptual_correctness": "Distinguishes sales revenue from profit after costs.",
+        "evidence_uncertainty": "Presents causes as possibilities, not observed facts.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "ba_churn_definition",
+      "reference_answer": "Cannot calculate churn from the supplied statement. Ask for the eligible starting population, the agreed churn definition or required churn count, and the measurement period. Clarify reactivation only if it affects the chosen definition; do not invent a convention.",
+      "reference_calculation": null,
+      "units": "percent",
+      "tolerances": {},
+      "scorer": {
+        "type": "clarification",
+        "required_fields": [
+          "eligible_population",
+          "churn_definition_or_numerator",
+          "measurement_period"
+        ]
+      },
+      "dimension_rubric": {
+        "clarification_completeness": "Requests each listed missing input before a definitive calculation.",
+        "unsupported_claims": "Does not invent definitions, parameters, or computed results.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty.",
+        "formula_method_selection": "Selects the requested method and applies the stated population, denominator, grain, and assumptions.",
+        "abstention_accuracy": "Declines to fabricate a result when required information is absent and asks for the minimum necessary clarification."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "ba_root_cause_correlation",
+      "reference_answer": "Only co-movement in monthly counts is observed; causation is not established. Consider linked customer-level timing, other confounders, and a credible controlled or quasi-experimental analysis.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "statistical_interpretation": "Does not infer causation from simultaneous increases.",
+        "evidence_uncertainty": "Names additional evidence that could test the hypothesis.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts.",
+        "conceptual_correctness": "Accurately explains the core concept and addresses the requested reasoning; a matching number alone is insufficient."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "ba_acceptance_criteria",
+      "reference_answer": "Offer two implementation-neutral templates: (1) at least [agreed percentage] of [target users] complete [priority report task] within [agreed time]; (2) the median time for [target users] to complete [priority report task] is at most [agreed time]. Agree on user/task definitions, any baseline, percentage threshold, and time threshold before treating either criterion as testable; do not invent numeric targets.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "business_relevance": "Provides two measurable, implementation-neutral templates with explicit placeholders.",
+        "evidence_uncertainty": "Requires users, tasks, baselines, and thresholds to be agreed rather than fabricated.",
+        "conceptual_correctness": "Accurately explains the core concept and addresses the requested reasoning; a matching number alone is insufficient."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "business_relevance": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Provides two measurable, implementation-neutral templates with explicit placeholders."
+        },
+        "evidence_uncertainty": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Requires users, tasks, baselines, and thresholds to be agreed rather than fabricated."
+        },
+        "conceptual_correctness": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Accurately explains the core concept and addresses the requested reasoning; a matching number alone is insufficient."
+        }
+      }
+    },
+    {
+      "case_id": "ba_evidence_recommendation",
+      "reference_answer": "In the 12 pilot cases, the observed mean processing time was 2 days lower (20% relative to the 10-day baseline). This is preliminary descriptive evidence. The uncontrolled pilot and missing cost data do not establish causation, generalizability, or net benefit; use a suitable comparison and cost assessment before considering broad rollout.",
+      "reference_calculation": "10 - 8 = 2 days; (2 / 10) * 100 = 20% relative decrease",
+      "units": "days; percent",
+      "tolerances": {
+        "days": "0",
+        "percent": "0"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "difference_days": "2",
+          "relative_reduction_percent": "20"
+        }
+      },
+      "dimension_rubric": {
+        "evidence_uncertainty": "Describes an observed pilot difference and states that no control, small sample, and missing cost data limit causal, generalization, and net-benefit claims.",
+        "business_relevance": "Recommends a bounded next step rather than deployment certainty.",
+        "unsupported_claims": "Makes no claim beyond the supplied evidence or observable trace."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "evidence_uncertainty": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Describes an observed pilot difference and states that no control, small sample, and missing cost data limit causal, generalization, and net-benefit claims."
+        },
+        "business_relevance": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Recommends a bounded next step rather than deployment certainty."
+        },
+        "unsupported_claims": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Makes no claim beyond the supplied evidence or observable trace."
+        }
+      }
+    },
+    {
+      "case_id": "ba_ambiguous_request",
+      "reference_answer": "Ask which performance metric, time period, comparison group, and decision the user has in mind before analyzing or recommending action.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "abstention_accuracy": "Seeks clarification rather than inventing a comparison.",
+        "business_relevance": "Clarification is concise and decision-oriented.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "da_profile_quality",
+      "reference_answer": "Check schema/types, missingness, key uniqueness/duplicates, valid ranges/categories, and distributions; consult a data dictionary before assigning business meaning.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Covers type, missingness, duplicates, validity, and distributions.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts.",
+        "conceptual_correctness": "Accurately explains the core concept and addresses the requested reasoning; a matching number alone is insufficient."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "da_groupby_aggregation",
+      "reference_answer": "Assuming SQLite and that order_date already represents the intended business timezone, group by strftime('%Y-%m', order_date) and calculate SUM(revenue). The year-month key keeps the same month from different years separate.",
+      "reference_calculation": null,
+      "units": "revenue",
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Uses SQLite year-month grouping with SUM(revenue), not month name alone.",
+        "output_instruction_compliance": "States the SQLite and pre-normalized business-timezone assumptions; query syntax must match that dialect if provided.",
+        "tool_use_correctness": "Selects and structures the requested tool use correctly; do not claim execution unless supported by the supplied trace."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Uses SQLite year-month grouping with SUM(revenue), not month name alone."
+        },
+        "output_instruction_compliance": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: States the SQLite and pre-normalized business-timezone assumptions; query syntax must match that dialect if provided."
+        },
+        "tool_use_correctness": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Selects and structures the requested tool use correctly; do not claim execution unless supported by the supplied trace."
+        }
+      }
+    },
+    {
+      "case_id": "da_one_to_many_join",
+      "reference_answer": "The inner join has 4 rows: three for C1 and one for C2. Customer-level values repeat on matching order rows; aggregate at the intended grain and do not blindly sum repeated customer-level values at order grain.",
+      "reference_calculation": "3 matching C1 orders + 1 matching C2 order = 4 joined rows; customer amount repeats at order grain",
+      "units": "rows",
+      "tolerances": {
+        "rows": "0"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "joined_rows": "4"
+        }
+      },
+      "dimension_rubric": {
+        "conceptual_correctness": "Explains join multiplicity, repeated one-side attributes, and aggregation at the intended grain.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "conceptual_correctness": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Explains join multiplicity, repeated one-side attributes, and aggregation at the intended grain."
+        },
+        "business_relevance": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "numeric_values",
+          "rationale": "Deterministic component only: numeric_values checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        }
+      }
+    },
+    {
+      "case_id": "da_eda_order",
+      "reference_answer": "Prioritize schema/types, row counts and keys, missingness, duplicates, ranges/categories, distributions, and date coverage; verify definitions, granularity, and data quality before interpreting trends.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Provides a sensible order and validates meaning/grain before conclusions.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "da_zero_vs_missing",
+      "reference_answer": "Zero is an observed numeric value; blank may mean unknown, not collected, or not applicable. Check source semantics and missingness patterns before recoding.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "conceptual_correctness": "Does not equate zero and missing without evidence.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "da_timeseries_chart",
+      "reference_answer": "A line chart is suitable for weekly time series; use consistent time coverage and axis scale, and account for seasonality or comparable week effects.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "business_relevance": "Selects a time-series view and gives a valid comparison safeguard.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty.",
+        "conceptual_correctness": "Accurately explains the core concept and addresses the requested reasoning; a matching number alone is insufficient."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "da_segment_rates",
+      "reference_answer": "North is 3%; South is 6%; South has the higher rate. Use each region's orders as its denominator.",
+      "reference_calculation": "18 / 600 * 100 = 3%; 12 / 200 * 100 = 6%",
+      "units": "percent",
+      "tolerances": {
+        "percent": "0.01"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "North_percent": "3",
+          "South_percent": "6"
+        }
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Uses orders within the corresponding region as denominator.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "da_weighted_vs_unweighted",
+      "reference_answer": "Transaction-weighted mean is 14; simple mean of store means is 30. The former weights each store by transaction count.",
+      "reference_calculation": "(90*10 + 10*50) / (90+10) = 14; (10+50)/2 = 30",
+      "units": "currency per transaction",
+      "tolerances": {
+        "weighted_mean": "0.0001",
+        "simple_mean": "0.0001"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "weighted_mean": "14",
+          "simple_mean": "30"
+        }
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Distinguishes transaction-weighted result from simple average.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "da_target_leakage",
+      "reference_answer": "Because prediction occurs on the due date, days_past_due measured 30 days afterward is future information and leaks the outcome period. Features must be available at or before the prediction timestamp.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "conceptual_correctness": "Identifies temporal leakage relative to prediction time.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "da_insight_communication",
+      "reference_answer": "Completion rate is 4 percentage points higher this month (72% versus 68%). Without sample sizes or a design, significance and cause cannot be assessed.",
+      "reference_calculation": "72 - 68 = 4 percentage points; relative increase = (72 - 68) / 68 * 100 = 5.882352941176470588...%",
+      "units": "percentage points",
+      "tolerances": {
+        "percentage_points": "0"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "difference_percentage_points": "4"
+        }
+      },
+      "dimension_rubric": {
+        "numerical_correctness": "Distinguishes a 4 percentage-point difference from a relative percent change.",
+        "statistical_interpretation": "Does not claim significance or causality.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "calc_pct_change",
+      "reference_answer": "Percentage change = (100,000 - 80,000) / 80,000 × 100 = 25% increase.",
+      "reference_calculation": "(100000 - 80000) / 80000 * 100 = 25",
+      "units": "percent",
+      "tolerances": {
+        "value": "0.0001"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "percent_change": "25"
+        }
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Uses original value as denominator.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation.",
+        "tool_use_correctness": "Selects and structures the requested tool use correctly; do not claim execution unless supported by the supplied trace."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Uses original value as denominator."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "numeric_values",
+          "rationale": "Deterministic component only: numeric_values checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        },
+        "tool_use_correctness": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Selects and structures the requested tool use correctly; do not claim execution unless supported by the supplied trace."
+        }
+      }
+    },
+    {
+      "case_id": "calc_profit",
+      "reference_answer": "₹125,000 profit.",
+      "reference_calculation": "500000 - 375000 = 125000",
+      "units": "INR",
+      "tolerances": {
+        "value": "0"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "profit": "125000"
+        }
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Subtracts costs from revenue.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+      },
+      "human_review_required": false,
+      "review_status": "proposed_reference",
+      "previous_review_status": "not_required",
+      "operational_scoring": {
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Subtracts costs from revenue."
+        },
+        "business_relevance": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "numeric_values",
+          "rationale": "Deterministic component only: numeric_values checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        }
+      }
+    },
+    {
+      "case_id": "calc_margin",
+      "reference_answer": "15%, using revenue as the denominator.",
+      "reference_calculation": "36000 / 240000 * 100 = 15",
+      "units": "percent",
+      "tolerances": {
+        "value": "0.0001"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "margin_percent": "15"
+        }
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Uses profit divided by revenue.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+      },
+      "human_review_required": false,
+      "review_status": "proposed_reference",
+      "previous_review_status": "not_required",
+      "operational_scoring": {
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Uses profit divided by revenue."
+        },
+        "business_relevance": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "numeric_values",
+          "rationale": "Deterministic component only: numeric_values checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        }
+      }
+    },
+    {
+      "case_id": "calc_conversion_denominator",
+      "reference_answer": "8%; eligible leads are the denominator.",
+      "reference_calculation": "240 / 3000 * 100 = 8",
+      "units": "percent",
+      "tolerances": {
+        "value": "0.0001"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "conversion_percent": "8"
+        }
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Uses eligible leads rather than conversions as denominator.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+      },
+      "human_review_required": false,
+      "review_status": "proposed_reference",
+      "previous_review_status": "not_required",
+      "operational_scoring": {
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Uses eligible leads rather than conversions as denominator."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "numeric_values",
+          "rationale": "Deterministic component only: numeric_values checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        }
+      }
+    },
+    {
+      "case_id": "calc_weighted_avg",
+      "reference_answer": "Combined weighted average is 8.",
+      "reference_calculation": "(20*4 + 80*9) / (20+80) = 8",
+      "units": "same as group means",
+      "tolerances": {
+        "value": "0.0001"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "weighted_average": "8"
+        }
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Weights group means by group sizes.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+      },
+      "human_review_required": false,
+      "review_status": "proposed_reference",
+      "previous_review_status": "not_required",
+      "operational_scoring": {
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Weights group means by group sizes."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "numeric_values",
+          "rationale": "Deterministic component only: numeric_values checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        }
+      }
+    },
+    {
+      "case_id": "calc_region_ratio",
+      "reference_answer": "North is 3%; South is 6%; South is higher.",
+      "reference_calculation": "18/600*100=3; 12/200*100=6",
+      "units": "percent",
+      "tolerances": {
+        "value": "0.0001"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "North_percent": "3",
+          "South_percent": "6"
+        }
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Applies the same numerator/denominator definition to both regions.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+      },
+      "human_review_required": false,
+      "review_status": "proposed_reference",
+      "previous_review_status": "not_required",
+      "operational_scoring": {
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Applies the same numerator/denominator definition to both regions."
+        },
+        "business_relevance": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "numeric_values",
+          "rationale": "Deterministic component only: numeric_values checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        }
+      }
+    },
+    {
+      "case_id": "calc_cagr",
+      "reference_answer": "10% compound annual growth rate.",
+      "reference_calculation": "(121 / 100) ** (1 / 2) - 1 = 0.10",
+      "units": "percent per year",
+      "tolerances": {
+        "value": "0.0001"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "cagr_percent": "10"
+        }
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Annualizes compounded growth over two years, not total growth.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+      },
+      "human_review_required": false,
+      "review_status": "proposed_reference",
+      "previous_review_status": "not_required",
+      "operational_scoring": {
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Annualizes compounded growth over two years, not total growth."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "numeric_values",
+          "rationale": "Deterministic component only: numeric_values checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        }
+      }
+    },
+    {
+      "case_id": "calc_units",
+      "reference_answer": "2.5 metric tonnes × 1,000 kilograms per tonne = 2,500 kilograms.",
+      "reference_calculation": "2.5 metric tonnes * 1000 kilograms/tonne = 2500 kilograms",
+      "units": "kilograms",
+      "tolerances": {
+        "value": "0"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "kilograms": "2500"
+        }
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Uses the supplied metric-tonne conversion factor and labels the result.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation.",
+        "output_instruction_compliance": "Follows the requested format, scope, assumptions, and output constraints."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Uses the supplied metric-tonne conversion factor and labels the result."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "numeric_values",
+          "rationale": "Deterministic component only: numeric_values checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        },
+        "output_instruction_compliance": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Follows the requested format, scope, assumptions, and output constraints."
+        }
+      }
+    },
+    {
+      "case_id": "calc_multistep_profit_margin",
+      "reference_answer": "Revenue ₹10,000; total costs ₹8,000; profit ₹2,000; margin 20%.",
+      "reference_calculation": "80*125=10000; 6400+1600=8000; 10000-8000=2000; 2000/10000*100=20",
+      "units": "INR; percent",
+      "tolerances": {
+        "INR": "0",
+        "percent": "0.0001"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "revenue": "10000",
+          "costs": "8000",
+          "profit": "2000",
+          "margin_percent": "20"
+        }
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Uses the correct order of revenue, cost, profit, and margin computations.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+      },
+      "human_review_required": false,
+      "review_status": "proposed_reference",
+      "previous_review_status": "not_required",
+      "operational_scoring": {
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Uses the correct order of revenue, cost, profit, and margin computations."
+        },
+        "business_relevance": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "numeric_values",
+          "rationale": "Deterministic component only: numeric_values checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        }
+      }
+    },
+    {
+      "case_id": "calc_zero_denominator",
+      "reference_answer": "Profit margin is undefined because revenue is zero and the formula divides by revenue; do not return a numeric percentage.",
+      "reference_calculation": "50 / 0 is undefined",
+      "units": "percent",
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "abstention_accuracy": "Does not fabricate a finite percentage and explains zero denominator.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty.",
+        "unsupported_claims": "Makes no claim beyond the supplied evidence or observable trace.",
+        "formula_method_selection": "Selects the requested method and applies the stated population, denominator, grain, and assumptions."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "stat_mean_median_outlier",
+      "reference_answer": "Mean = 5; median = 4. In this sample, the value 10 raises the mean above the median. The median can also change if values or central ranks change.",
+      "reference_calculation": "(2+4+4+10)/4=5; median=(4+4)/2=4",
+      "units": "same as observations",
+      "tolerances": {
+        "value": "0"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "mean": "5",
+          "median": "4"
+        }
+      },
+      "dimension_rubric": {
+        "statistical_interpretation": "Explains this sample's mean/median relationship without claiming that medians cannot change.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation.",
+        "formula_method_selection": "Selects the requested method and applies the stated population, denominator, grain, and assumptions."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "statistical_interpretation": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Explains this sample's mean/median relationship without claiming that medians cannot change."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "numeric_values",
+          "rationale": "Deterministic component only: numeric_values checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        },
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Selects the requested method and applies the stated population, denominator, grain, and assumptions."
+        }
+      }
+    },
+    {
+      "case_id": "stat_population_sample",
+      "reference_answer": "Mean is 4; population variance is 8/3; sample variance is 4.",
+      "reference_calculation": "Squared deviations are 4,0,4; population variance=8/3; sample variance=8/(3-1)=4",
+      "units": "squared input units",
+      "tolerances": {
+        "population_variance": "0.0001",
+        "sample_variance": "0.0001"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "population_variance": "2.6666666666666667",
+          "sample_variance": "4"
+        }
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Uses N for population and n-1 for sample variance.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation.",
+        "statistical_interpretation": "Interprets the result only to the extent supported by the design, assumptions, and stated population."
+      },
+      "human_review_required": false,
+      "review_status": "proposed_reference",
+      "previous_review_status": "not_required",
+      "operational_scoring": {
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Uses N for population and n-1 for sample variance."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "numeric_values",
+          "rationale": "Deterministic component only: numeric_values checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        },
+        "statistical_interpretation": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Interprets the result only to the extent supported by the design, assumptions, and stated population."
+        }
+      }
+    },
+    {
+      "case_id": "stat_iqr",
+      "reference_answer": "Under the stated median-of-halves convention, Q1=2.5, Q3=6.5, and IQR=4.",
+      "reference_calculation": "Lower half median=(2+3)/2=2.5; upper half median=(6+7)/2=6.5; IQR=4",
+      "units": "same as observations",
+      "tolerances": {
+        "value": "0"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "Q1": "2.5",
+          "Q3": "6.5",
+          "IQR": "4"
+        }
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Applies the stated quartile convention.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation.",
+        "statistical_interpretation": "Interprets the result only to the extent supported by the design, assumptions, and stated population."
+      },
+      "human_review_required": false,
+      "review_status": "proposed_reference",
+      "previous_review_status": "not_required",
+      "operational_scoring": {
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Applies the stated quartile convention."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "numeric_values",
+          "rationale": "Deterministic component only: numeric_values checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        },
+        "statistical_interpretation": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Interprets the result only to the extent supported by the design, assumptions, and stated population."
+        }
+      }
+    },
+    {
+      "case_id": "stat_conditional_probability",
+      "reference_answer": "25%; denominator is the 40 mobile users.",
+      "reference_calculation": "10 / 40 * 100 = 25",
+      "units": "percent",
+      "tolerances": {
+        "value": "0.0001"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "conditional_probability_percent": "25"
+        }
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Conditions on mobile use and uses 40 as denominator.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation.",
+        "statistical_interpretation": "Interprets the result only to the extent supported by the design, assumptions, and stated population."
+      },
+      "human_review_required": false,
+      "review_status": "proposed_reference",
+      "previous_review_status": "not_required",
+      "operational_scoring": {
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Conditions on mobile use and uses 40 as denominator."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "numeric_values",
+          "rationale": "Deterministic component only: numeric_values checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        },
+        "statistical_interpretation": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Interprets the result only to the extent supported by the design, assumptions, and stated population."
+        }
+      }
+    },
+    {
+      "case_id": "stat_correlation_causation",
+      "reference_answer": "Seasonal co-movement does not establish that ice-cream sales cause swimming incidents. Season or temperature could influence both, but neither is proven to be a confounder here; a suitable designed intervention or defensible causal analysis would provide stronger evidence.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "statistical_interpretation": "Rejects causal inference from co-movement and presents season/temperature only as possible, unproven confounders.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty.",
+        "conceptual_correctness": "Accurately explains the core concept and addresses the requested reasoning; a matching number alone is insufficient."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "statistical_interpretation": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Rejects causal inference from co-movement and presents season/temperature only as possible, unproven confounders."
+        },
+        "evidence_uncertainty": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty."
+        },
+        "conceptual_correctness": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Accurately explains the core concept and addresses the requested reasoning; a matching number alone is insufficient."
+        }
+      }
+    },
+    {
+      "case_id": "stat_sampling_bias",
+      "reference_answer": "If the target population includes users who did not log in during the last week, this survey excludes them and may overrepresent recent users. State the target population and sampling frame, compare respondents with that population, and consider broader sampling or justified adjustment; stratification alone does not guarantee bias removal.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "statistical_interpretation": "Explains sampling-frame coverage relative to a stated or clarified target population; does not claim that stratification automatically removes bias.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty.",
+        "conceptual_correctness": "Accurately explains the core concept and addresses the requested reasoning; a matching number alone is insufficient."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "statistical_interpretation": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Explains sampling-frame coverage relative to a stated or clarified target population; does not claim that stratification automatically removes bias."
+        },
+        "evidence_uncertainty": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty."
+        },
+        "conceptual_correctness": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Accurately explains the core concept and addresses the requested reasoning; a matching number alone is insufficient."
+        }
+      }
+    },
+    {
+      "case_id": "stat_ci_interpretation",
+      "reference_answer": "Under the assumptions of the stated 95% confidence procedure, intervals produced by that procedure would contain the fixed population mean about 95% of the time over repeated samples. The reported interval is 2 to 6 days; it does not mean that 95% of individual delivery times fall there.",
+      "reference_calculation": null,
+      "units": "days",
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "statistical_interpretation": "Gives the repeated-sampling coverage interpretation without assuming a specific interval method or confusing parameter coverage with individual outcomes.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "statistical_interpretation": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Gives the repeated-sampling coverage interpretation without assuming a specific interval method or confusing parameter coverage with individual outcomes."
+        },
+        "evidence_uncertainty": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty."
+        },
+        "business_relevance": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+        }
+      }
+    },
+    {
+      "case_id": "stat_pvalue",
+      "reference_answer": "For a specified test and its extremeness rule, if the null model and assumptions hold, p=0.03 is the probability of a result at least as extreme under that null. It is below the prespecified 0.05 threshold, but is not the probability that the null is true and does not measure effect size. The test design is not supplied, so the exact extremeness rule cannot be made more specific.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "statistical_interpretation": "Defines p conditionally on the specified test's statistic/extremeness rule; rejects null-probability and effect-size interpretations.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "statistical_interpretation": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Defines p conditionally on the specified test's statistic/extremeness rule; rejects null-probability and effect-size interpretations."
+        },
+        "evidence_uncertainty": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty."
+        },
+        "numerical_correctness": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        }
+      }
+    },
+    {
+      "case_id": "stat_test_selection",
+      "reference_answer": "For the stated difference in population means, a Welch two-sample t-test is a conditional option for independent groups. Confirm sample sizes, distribution/outliers, and whether the sampling/design assumptions are reasonable. A robust or nonparametric method may target a different estimand and is not automatically interchangeable.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Gives Welch's test only as a conditional method for the stated independent-group mean difference and distinguishes alternatives with different estimands.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty.",
+        "statistical_interpretation": "Interprets the result only to the extent supported by the design, assumptions, and stated population."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Gives Welch's test only as a conditional method for the stated independent-group mean difference and distinguishes alternatives with different estimands."
+        },
+        "evidence_uncertainty": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty."
+        },
+        "statistical_interpretation": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Interprets the result only to the extent supported by the design, assumptions, and stated population."
+        }
+      }
+    },
+    {
+      "case_id": "stat_multiple_comparisons",
+      "reference_answer": "Under the global null and correctly calibrated tests at alpha 0.05, the expected number of false positives across 20 tests is 1. A p-value of 0.04 is not thereby known to be false and does not establish effect size; report the tested family and use a prespecified multiplicity procedure or independent confirmation.",
+      "reference_calculation": "Expected false positives = sum of per-test alpha under the global null = 20 * 0.05 = 1; independence is not required for this expectation",
+      "units": "expected false positives",
+      "tolerances": {
+        "value": "0.0001"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "expected_false_positives": "1"
+        }
+      },
+      "dimension_rubric": {
+        "statistical_interpretation": "Explains expected false-positive count under the global null and does not classify the p=0.04 finding as false.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "statistical_interpretation": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Explains expected false-positive count under the global null and does not classify the p=0.04 finding as false."
+        },
+        "evidence_uncertainty": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty."
+        }
+      }
+    },
+    {
+      "case_id": "data_monthly_margin",
+      "reference_answer": "January profit 30 and margin 30%; February profit 30 and margin 25%; March profit 45 and margin 30%.",
+      "reference_calculation": "Jan:100-70=30;30/100*100=30. Feb:120-90=30;30/120*100=25. Mar:150-105=45;45/150*100=30",
+      "units": "same currency units; percent",
+      "tolerances": {
+        "value": "0.0001"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "January_profit": "30",
+          "January_margin_percent": "30",
+          "February_profit": "30",
+          "February_margin_percent": "25",
+          "March_profit": "45",
+          "March_margin_percent": "30"
+        }
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Uses revenue as denominator for each month's margin.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+      },
+      "human_review_required": false,
+      "review_status": "proposed_reference",
+      "previous_review_status": "not_required",
+      "operational_scoring": {
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Uses revenue as denominator for each month's margin."
+        },
+        "business_relevance": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "numeric_values",
+          "rationale": "Deterministic component only: numeric_values checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        }
+      }
+    },
+    {
+      "case_id": "data_sales_vs_margin",
+      "reference_answer": "North has higher sales (200 versus 100); South has higher margin (30% versus 20%).",
+      "reference_calculation": "North:40/200*100=20; South:30/100*100=30",
+      "units": "currency; percent",
+      "tolerances": {
+        "percent": "0.0001"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "North_margin_percent": "20",
+          "South_margin_percent": "30"
+        }
+      },
+      "dimension_rubric": {
+        "business_relevance": "Distinguishes sales volume from margin ranking.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation.",
+        "formula_method_selection": "Selects the requested method and applies the stated population, denominator, grain, and assumptions."
+      },
+      "human_review_required": false,
+      "review_status": "proposed_reference",
+      "previous_review_status": "not_required",
+      "operational_scoring": {
+        "business_relevance": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Distinguishes sales volume from margin ranking."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "numeric_values",
+          "rationale": "Deterministic component only: numeric_values checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        },
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Selects the requested method and applies the stated population, denominator, grain, and assumptions."
+        }
+      }
+    },
+    {
+      "case_id": "data_missing_required_column",
+      "reference_answer": "The listed columns alone are insufficient. Confirm whether order_value represents revenue, its currency and grain, and obtain compatible cost data or profit for the same population and period. Define profit consistently; when revenue is nonzero, margin is profit divided by revenue, multiplied by 100 if expressed as a percentage. Do not infer missing cost or profit.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "abstention_accuracy": "Does not infer unobserved costs or profit.",
+        "evidence_uncertainty": "Does not assume order_value is revenue; requests compatible cost/profit and matching population/period definitions.",
+        "unsupported_claims": "Makes no claim beyond the supplied evidence or observable trace.",
+        "formula_method_selection": "Selects the requested method and applies the stated population, denominator, grain, and assumptions."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "abstention_accuracy": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Does not infer unobserved costs or profit."
+        },
+        "evidence_uncertainty": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Does not assume order_value is revenue; requests compatible cost/profit and matching population/period definitions."
+        },
+        "unsupported_claims": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Makes no claim beyond the supplied evidence or observable trace."
+        },
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Selects the requested method and applies the stated population, denominator, grain, and assumptions."
+        }
+      }
+    },
+    {
+      "case_id": "data_unequal_group_sizes",
+      "reference_answer": "A rate is 90%; B rate is 45%. A has the higher rate despite fewer total successes; compare successes divided by each segment's trials.",
+      "reference_calculation": "9/10*100=90;90/200*100=45",
+      "units": "percent",
+      "tolerances": {
+        "percent": "0.0001"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "A_percent": "90",
+          "B_percent": "45"
+        }
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Uses within-group denominator and explains why counts alone mislead.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+      },
+      "human_review_required": false,
+      "review_status": "proposed_reference",
+      "previous_review_status": "not_required",
+      "operational_scoring": {
+        "formula_method_selection": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Uses within-group denominator and explains why counts alone mislead."
+        },
+        "business_relevance": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "numeric_values",
+          "rationale": "Deterministic component only: numeric_values checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        }
+      }
+    },
+    {
+      "case_id": "data_outlier_handling",
+      "reference_answer": "Check source record, units, data-entry errors, transaction context, and distribution/robust summaries. Do not delete solely because it is unusual; preserve a documented, justified treatment.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "evidence_uncertainty": "Requests provenance/context and does not automatically remove a valid outlier.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts.",
+        "conceptual_correctness": "Accurately explains the core concept and addresses the requested reasoning; a matching number alone is insufficient."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "data_trend_vs_cause",
+      "reference_answer": "The chart establishes an observed temporal pattern only, not that the price change caused ticket growth. Consider seasonality, volume changes, other events, and a suitable comparison or causal design.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "statistical_interpretation": "Separates temporal association from causation and proposes relevant follow-up.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "data_missingness_impact",
+      "reference_answer": "Because income is missing more often in one region, dropping incomplete records could change regional composition and bias the comparison, depending on the target estimand and missingness mechanism. Profile missingness by region and relevant variables; investigate plausible mechanisms and compare justified sensitivity approaches.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "statistical_interpretation": "Describes possible composition change and bias without asserting a specific missingness mechanism.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "statistical_interpretation": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Describes possible composition change and bias without asserting a specific missingness mechanism."
+        },
+        "evidence_uncertainty": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty."
+        },
+        "business_relevance": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+        }
+      }
+    },
+    {
+      "case_id": "data_simpsons_paradox",
+      "reference_answer": "A's rates are 90% high-risk and 1% low-risk; B's are 80% high-risk and 0% low-risk. Overall A is 10/110 = 9.09%, while B is 80/110 = 72.73%, because group mixes differ. Show stratum and aggregate rates; any standardized comparison should use a prespecified target population, and these data do not establish universal treatment superiority.",
+      "reference_calculation": "A high=9/10=90%; B high=80/100=80%; A low=1/100=1%; B low=0/10=0%; A total=10/110=9.0909%; B total=80/110=72.7273%",
+      "units": "percent",
+      "tolerances": {
+        "percent": "0.0001"
+      },
+      "scorer": {
+        "type": "numeric_values",
+        "expected_values": {
+          "A_high_percent": "90",
+          "B_high_percent": "80",
+          "A_low_percent": "1",
+          "B_low_percent": "0",
+          "A_overall_percent": "9.0909090909",
+          "B_overall_percent": "72.7272727273"
+        }
+      },
+      "dimension_rubric": {
+        "statistical_interpretation": "Explains the aggregate reversal through differing group composition and distinguishes descriptive rates from a target-population-adjusted comparison.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "statistical_interpretation": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Explains the aggregate reversal through differing group composition and distinguishes descriptive rates from a target-population-adjusted comparison."
+        },
+        "business_relevance": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "numeric_values",
+          "rationale": "Deterministic component only: numeric_values checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        },
+        "evidence_uncertainty": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty."
+        }
+      }
+    },
+    {
+      "case_id": "data_misleading_aggregation_chart",
+      "reference_answer": "Raw totals are not per-capita comparable when populations differ; a truncated axis exaggerates visual differences. Consider per-capita rates and a clearly labeled, appropriate axis, while preserving totals as a separate measure.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "statistical_interpretation": "Identifies denominator and axis risks and suggests fair alternatives.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "data_forecast_uncertainty",
+      "reference_answer": "The point forecast is 1,000 units for next quarter, with the stated prediction interval of 800 to 1,250 under the model and interval specification. Actual demand is uncertain. The prompt gives no nominal interval coverage level, so do not assign one.",
+      "reference_calculation": null,
+      "units": "units next quarter",
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "statistical_interpretation": "Reports point estimate and interval, recognizes model uncertainty, and does not invent a coverage level.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty.",
+        "business_relevance": "Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "statistical_interpretation": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Reports point estimate and interval, recognizes model uncertainty, and does not invent a coverage level."
+        },
+        "evidence_uncertainty": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty."
+        },
+        "business_relevance": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Connects the result or recommendation to the stated business decision without introducing unsupported facts."
+        }
+      }
+    },
+    {
+      "case_id": "tool_json_only",
+      "reference_answer": "{\"status\":\"ok\",\"count\":3}",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "json_object",
+        "expected_object": {
+          "status": "ok",
+          "count": 3
+        },
+        "exact_keys": [
+          "status",
+          "count"
+        ],
+        "json_only": true
+      },
+      "dimension_rubric": {
+        "output_instruction_compliance": "Strict JSON parse, exact keys/types/values, no fences or surrounding prose."
+      },
+      "human_review_required": false,
+      "review_status": "proposed_reference",
+      "previous_review_status": "not_required",
+      "operational_scoring": {
+        "output_instruction_compliance": {
+          "disposition": "deterministic_component",
+          "scorer": "json_object",
+          "rationale": "Deterministic component only: json_object checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Strict JSON parse, exact keys/types/values, no fences or surrounding prose."
+        }
+      }
+    },
+    {
+      "case_id": "tool_exact_sentence_count",
+      "reference_answer": "A response must contain exactly two non-empty sentences. One sentence must explain that revenue is before costs; the other must explain that profit is after costs. It must not use abbreviations; sentence-count and abbreviation checks are separate from human semantic review.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "sentence_count",
+        "expected_count": 2,
+        "terminal_punctuation": [
+          ".",
+          "!",
+          "?"
+        ],
+        "counting_rule": "Sentence ends at .?! followed by whitespace or end-of-output; decimals do not end a sentence; ellipsis counts as one terminal boundary; recognized abbreviations are not boundaries and fail abbreviation compliance.",
+        "abbreviation_pattern": "Common dotted abbreviations and all-uppercase tokens are rejected; this heuristic is not exhaustive."
+      },
+      "dimension_rubric": {
+        "sentence_count_compliance": "Exactly two sentences under the documented terminal-punctuation convention.",
+        "abbreviation_compliance": "No detected abbreviations under the documented abbreviation pattern; human review may catch forms outside the detector.",
+        "conceptual_correctness": "A human verifies revenue/profit meaning separately.",
+        "output_instruction_compliance": "Follows the requested format, scope, assumptions, and output constraints."
+      },
+      "human_review_required": true,
+      "review_status": "proposed_reference",
+      "previous_review_status": "revised",
+      "operational_scoring": {
+        "sentence_count_compliance": {
+          "disposition": "deterministic_component",
+          "scorer": "sentence_count",
+          "rationale": "Deterministic component only: sentence_count checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Exactly two sentences under the documented terminal-punctuation convention."
+        },
+        "abbreviation_compliance": {
+          "disposition": "deterministic_component",
+          "scorer": "sentence_count",
+          "rationale": "Deterministic component only: sentence_count checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: No detected abbreviations under the documented abbreviation pattern; human review may catch forms outside the detector."
+        },
+        "conceptual_correctness": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: A human verifies revenue/profit meaning separately."
+        },
+        "output_instruction_compliance": {
+          "disposition": "deterministic_component",
+          "scorer": "sentence_count",
+          "rationale": "Deterministic component only: sentence_count checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Follows the requested format, scope, assumptions, and output constraints."
+        }
+      }
+    },
+    {
+      "case_id": "tool_sql_group_query",
+      "reference_answer": "A valid SQLite SELECT groups by region and sums revenue; results are East=25 and West=12.",
+      "reference_calculation": "SQLite fixture: East 10+15=25; West 12",
+      "units": "revenue",
+      "tolerances": {
+        "value": "0"
+      },
+      "scorer": {
+        "type": "sql_fixture",
+        "sql": "SELECT region, SUM(revenue) AS total_revenue FROM orders GROUP BY region ORDER BY region",
+        "expected_rows": [
+          [
+            "East",
+            25
+          ],
+          [
+            "West",
+            12
+          ]
+        ],
+        "expected_columns": [
+          "region",
+          "total_revenue"
+        ]
+      },
+      "dimension_rubric": {
+        "formula_method_selection": "Human reviewer checks generated query intent and schema grounding.",
+        "output_instruction_compliance": "Query should be read-only and return grouped sums.",
+        "query_result_correctness": "Returns expected column order and fixture rows; matching fixture results do not establish general query intent.",
+        "tool_use_correctness": "Selects and structures the requested tool use correctly; do not claim execution unless supported by the supplied trace.",
+        "sql_safety": "Query executes only within the authorized read-only in-memory SQLite fixture subset; success is not production authorization."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "tool_calculator_choice",
+      "reference_answer": "A deterministic calculator is appropriate after the twelve means and corresponding counts are supplied. Do not report a result before executing it.",
+      "reference_calculation": "weighted_mean = sum(count_i * mean_i) / sum(count_i)",
+      "units": "same as means",
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "tool_use_correctness": "Selects calculation tool and requests complete inputs.",
+        "unsupported_claims": "Does not claim calculation has run.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty.",
+        "formula_method_selection": "Selects the requested method and applies the stated population, denominator, grain, and assumptions."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "tool_statistical_tool_choice",
+      "reference_answer": "Before computing, ask which column to analyze, whether variance is sample or population variance, which confidence-interval method to use, and the confidence level. Do not report uncomputed values or silently choose missing settings.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "clarification",
+        "required_fields": [
+          "column",
+          "variance_convention",
+          "interval_method",
+          "confidence_level"
+        ]
+      },
+      "dimension_rubric": {
+        "clarification_completeness": "Requests each listed missing input before a definitive calculation.",
+        "unsupported_claims": "Does not invent definitions, parameters, or computed results.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty.",
+        "formula_method_selection": "Selects the requested method and applies the stated population, denominator, grain, and assumptions.",
+        "tool_use_correctness": "Selects and structures the requested tool use correctly; do not claim execution unless supported by the supplied trace."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "tool_arguments_valid",
+      "reference_answer": "Reject the proposed numeric expression and extra property. Correct arguments use the single required string property `expression`, with an arithmetic expression equivalent to `(18 / 600) * 100`; expected result is 3%.",
+      "reference_calculation": "18 / 600 * 100 = 3",
+      "units": "percent",
+      "tolerances": {
+        "value": "0.0001"
+      },
+      "scorer": {
+        "type": "tool_arguments",
+        "tool_id": "calculator",
+        "required": {
+          "expression": "(18 / 600) * 100"
+        },
+        "expected_values": {
+          "percent": "3"
+        }
+      },
+      "dimension_rubric": {
+        "tool_use_correctness": "Uses exact allowed tool and arguments satisfy its declared schema.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation.",
+        "formula_method_selection": "Selects the requested method and applies the stated population, denominator, grain, and assumptions.",
+        "conceptual_correctness": "Accurately explains the core concept and addresses the requested reasoning; a matching number alone is insufficient."
+      },
+      "human_review_required": false,
+      "review_status": "proposed_reference",
+      "previous_review_status": "not_required",
+      "operational_scoring": {
+        "tool_use_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "tool_arguments",
+          "rationale": "Deterministic component only: tool_arguments checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Uses exact allowed tool and arguments satisfy its declared schema."
+        },
+        "numerical_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "tool_arguments",
+          "rationale": "Deterministic component only: tool_arguments checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        },
+        "formula_method_selection": {
+          "disposition": "deterministic_component",
+          "scorer": "tool_arguments",
+          "rationale": "Deterministic component only: tool_arguments checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Selects the requested method and applies the stated population, denominator, grain, and assumptions."
+        },
+        "conceptual_correctness": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Accurately explains the core concept and addresses the requested reasoning; a matching number alone is insufficient."
+        }
+      }
+    },
+    {
+      "case_id": "tool_trace_result_grounding",
+      "reference_answer": "The supplied tool result is 18.5%. Do not claim independent execution beyond the visible trace.",
+      "reference_calculation": null,
+      "units": "percent",
+      "tolerances": {
+        "value": "0"
+      },
+      "scorer": {
+        "type": "tool_trace",
+        "expected_status": "succeeded",
+        "expected_tool": "calculate",
+        "expected_result": {
+          "result": 18.5,
+          "unit": "%"
+        }
+      },
+      "dimension_rubric": {
+        "tool_use_correctness": "Uses the observed successful trace.",
+        "unsupported_claims": "Does not alter the returned value or invent further execution.",
+        "execution_claim_integrity": "Claims about execution agree with the supplied trace; caller-supplied traces are not authenticated by this helper.",
+        "numerical_correctness": "Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation.",
+        "result_interpretation_error": "Preserves the observed result or failure and does not invent, alter, or overinterpret it."
+      },
+      "human_review_required": false,
+      "review_status": "proposed_reference",
+      "previous_review_status": "not_required",
+      "operational_scoring": {
+        "tool_use_correctness": {
+          "disposition": "deterministic_component",
+          "scorer": "tool_trace",
+          "rationale": "Deterministic component only: tool_trace checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Uses the observed successful trace."
+        },
+        "unsupported_claims": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Does not alter the returned value or invent further execution."
+        },
+        "execution_claim_integrity": {
+          "disposition": "deterministic_component",
+          "scorer": "tool_trace",
+          "rationale": "Deterministic component only: tool_trace checks the structured observation; this does not validate the reference semantically or score unobserved response content. Rubric: Claims about execution agree with the supplied trace; caller-supplied traces are not authenticated by this helper."
+        },
+        "numerical_correctness": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Reports the independently verified numeric result with the requested units and tolerance; this does not by itself validate interpretation."
+        },
+        "result_interpretation_error": {
+          "disposition": "not_assessed_by_deterministic_scorer",
+          "scorer": null,
+          "rationale": "Not assessed by the deterministic scorer. The existing human rubric remains the scoring contract; do not award credit automatically. Rubric: Preserves the observed result or failure and does not invent, alter, or overinterpret it."
+        }
+      }
+    },
+    {
+      "case_id": "tool_failed_execution",
+      "reference_answer": "The query failed because `net_sales` is not a recognized column in the available schema. Ask for or inspect the schema and do not report a computed result.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "tool_trace",
+        "expected_status": "failed",
+        "expected_tool": "query_readonly_sql",
+        "expected_error": "no such column: net_sales",
+        "must_not_claim_success": true
+      },
+      "dimension_rubric": {
+        "unsupported_claims": "Acknowledges failure and makes no success/result claim.",
+        "evidence_uncertainty": "Requests schema or correct column before retry.",
+        "execution_claim_integrity": "Claims about execution agree with the supplied trace; caller-supplied traces are not authenticated by this helper.",
+        "result_interpretation_error": "Preserves the observed result or failure and does not invent, alter, or overinterpret it.",
+        "tool_use_correctness": "Selects and structures the requested tool use correctly; do not claim execution unless supported by the supplied trace."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "tool_clarify_ambiguous_definition",
+      "reference_answer": "Ask how active customer is defined and which two periods should be compared before calculating.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "abstention_accuracy": "Does not invent definition or periods.",
+        "output_instruction_compliance": "Asks focused questions needed to proceed.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    },
+    {
+      "case_id": "tool_no_execution_claim",
+      "reference_answer": "Describe a plan to inspect headers/schema, verify revenue and cost fields and their types, then report findings only after actual file access. Explicitly do not claim inspection occurred.",
+      "reference_calculation": null,
+      "units": null,
+      "tolerances": {},
+      "scorer": {
+        "type": "human_review"
+      },
+      "dimension_rubric": {
+        "unsupported_claims": "Makes no claim of opening, inspecting, or analyzing the absent file.",
+        "business_relevance": "Gives a safe, relevant validation plan.",
+        "evidence_uncertainty": "Separates observed facts from hypotheses, identifies material missing information, and calibrates uncertainty.",
+        "output_instruction_compliance": "Follows the requested format, scope, assumptions, and output constraints."
+      },
+      "human_review_required": false,
+      "review_status": "approved"
+    }
+  ]
+}

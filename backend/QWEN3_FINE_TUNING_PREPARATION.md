@@ -680,3 +680,56 @@ business policy and division by a negative number is not itself undefined.
 Deterministic prompt tests cover this wording, but prompt v6 has not been
 validated by another model inference. The v10 response must not be attributed
 to prompt v6.
+
+## Qwen3-8B preparation follow-up (2026-10-26)
+
+The local Ollama inventory listed `qwen3:8b`, `qwen3:4b`,
+`qwen3:4b-instruct`, and `qwen3:0.6b` under Ollama 0.40.11. The provider
+health check confirmed model presence, not generation. No Qwen3-8B inference
+or training was run. A later resource check observed 1.29 GiB free physical
+memory out of 15.7 GiB visible RAM, Intel UHD integrated graphics, and
+172.85 GiB free on `C:`. This is insufficient headroom for a safe local 8B
+training smoke test; do not infer training feasibility from the installed
+quantized Ollama artifact.
+
+The output-token default of the Ollama evaluation runner is 512. The saved
+Qwen3:4B seven-case diagnostic remains the historical 192-token run (one pass,
+six failures; the six non-JSON generations were truncated, with median
+completion latency 18.68 seconds and maximum 29.35 seconds). The later 512-token
+default has not been evaluated against a model. It does not establish a
+Qwen3-8B baseline. The separate Hugging Face Qwen3-0.6B offline rescore is
+1 pass, 2 failures, and 4 cases needing human review; its `inference_performed`
+field is false because rescoring did not regenerate outputs.
+
+The initial Qwen3-8B supervised dataset and LoRA configuration are
+preparation-only:
+
+- `training/qwen3-8b/insightos-agent-sft-v1.jsonl` contains 12 original
+  synthetic examples (8 train, 2 validation, 2 test) in 12 disjoint
+  scenario groups. It covers read-only routing, handoffs, prerequisites,
+  strict arguments, bounded retry, stale/missing evidence, unsupported
+  metrics, and execution-state honesty. Negative examples teach rejection,
+  not execution of invalid requests.
+- `training/validate_sft_dataset.py` checks the dataset shape, allowlisted
+  tool schemas and arguments, tool-call/result pairing, and split-group
+  leakage. Run from `backend`:
+
+  ```powershell
+  python training\validate_sft_dataset.py
+  ```
+
+  The structural check passes. All examples remain `draft`, so there are zero
+  human-approved training rows and `training_ready` is false. Confirm approval
+  gating using `python training\validate_sft_dataset.py --require-approved`;
+  this is expected to fail until each train row receives human review.
+- `training/qwen3-8b/training-config.json` records a bounded LoRA preparation
+  configuration, but intentionally has no pinned Hugging Face revision and is
+  marked `preparation_only`. It is not a runnable training command. Pin an
+  immutable model revision, review/approve examples, then run resource and
+  smoke checks on suitable hardware before starting any training.
+
+No checkpoint or dataset was downloaded, no adapter was produced, and no
+training package or production provider setting changed. Ollama's GGUF model
+artifact is not a Transformers checkpoint or a directly loadable PEFT adapter.
+Serving a future adapter requires an explicit compatible merge/export and
+Ollama model-packaging step, followed by its own inference verification.

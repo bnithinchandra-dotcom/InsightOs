@@ -1,4 +1,5 @@
-﻿import torch
+﻿
+import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 MODEL_PATH = "backend/artifacts/qwen3-0.6b-hf-c1899de"
@@ -29,7 +30,7 @@ messages = [
 ]
 
 inputs = tokenizer.apply_chat_template(
-   messages,
+    messages,
     tokenize=True,
     add_generation_prompt=True,
     return_dict=True,

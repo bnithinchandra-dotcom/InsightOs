@@ -131,6 +131,79 @@ describe('conversation workspace', () => {
     await waitFor(() => expect(input.value).toBe('Keep this draft'))
   })
 
+  it('shows model failures as errors and allows another message to recover', async () => {
+    let requestCount = 0
+    globalThis.fetch.mockImplementation(async (input, options = {}) => {
+      const url = new URL(String(input), window.location.origin)
+      if (url.pathname === '/api/v1/chat/conversations' && options.method === 'POST') {
+        return jsonResponse(conversation, 201)
+      }
+      if (url.pathname === '/api/v1/chat/conversations') return jsonResponse([])
+      if (url.pathname === '/api/v1/chat/provider-status') {
+        return jsonResponse({ provider: 'ollama', status: 'healthy', message: '' })
+      }
+      if (url.pathname === '/api/v1/projects') return jsonResponse([])
+      if (url.pathname === `/api/v1/chat/conversations/${conversation.id}`) {
+        return jsonResponse({ ...conversation, total_messages: 0, messages: [], offset: 0 })
+      }
+      if (url.pathname === `/api/v1/chat/conversations/${conversation.id}/messages`) {
+        requestCount += 1
+        const failed = requestCount === 1
+        return jsonResponse({
+          conversation: { ...conversation, status: 'Active' },
+          user_message: {
+            id: 30 + requestCount * 2,
+            sequence: requestCount * 2 - 1,
+            role: 'user',
+            content: JSON.parse(options.body).content,
+            created_at: '2026-10-19T10:01:00',
+          },
+          assistant_message: {
+            id: 31 + requestCount * 2,
+            sequence: requestCount * 2,
+            role: 'assistant',
+            content: failed
+              ? 'The configured model returned an empty response. Retry, and check the local model if this continues.'
+              : '20',
+            metadata: {
+              execution_status: failed ? 'failed' : 'completed',
+              tool_activities: [],
+              structured_results: [],
+              warnings: [],
+            },
+            created_at: '2026-10-19T10:01:01',
+          },
+          execution_status: failed ? 'failed' : 'completed',
+          tool_activities: [],
+          structured_results: [],
+          warnings: [],
+          error_code: failed ? 'provider_response_invalid' : null,
+        })
+      }
+      return jsonResponse({ detail: `Unexpected request: ${url.pathname}` }, 500)
+    })
+
+    render(<ConversationWorkspace />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Start a conversation' }))
+    await screen.findByText('Ask a question about your existing projects, datasets, profiles, quality reports, EDA, or schema analyses.')
+
+    const input = screen.getByLabelText('Your message')
+    fireEvent.change(input, { target: { value: '10+10' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const failure = await screen.findByRole('alert')
+    expect(failure.textContent).toContain('returned an empty response')
+    expect(input.value).toBe('')
+    expect(screen.getByRole('button', { name: 'Send' }).disabled).toBe(true)
+
+    fireEvent.change(input, { target: { value: 'Try again: 10+10' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(await screen.findByText('20')).toBeTruthy()
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+    expect(requestCount).toBe(2)
+  })
+
   it('uses the existing project and dataset APIs for optional conversation context', async () => {
     const createPayloads = []
     globalThis.fetch.mockImplementation(async (input, options = {}) => {

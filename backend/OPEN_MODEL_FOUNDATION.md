@@ -104,6 +104,42 @@ the actual model/runtime. Streaming is unsupported by these adapters.
 Configured output-token limits are reported; context-window size is unknown.
 No remote fallback occurs when a local provider is unavailable.
 
+## Adapter integration follow-up (2026-10-24)
+
+The shared contract now carries model identity and adapter-declared
+capabilities separately from model-level capability verification. Provider
+requests fail explicitly when an adapter declares a requested tool or
+structured-output feature unsupported. Ollama tool calls and tool results use
+Ollama-native message serialization; read-only tool results are normalized to
+JSON-safe values before size checks and persistence. The generic compatible
+adapter rejects `openai.com` and its subdomains, and the local Ollama path
+requires no API key. Provider selection remains explicit and defaults to
+`none`; set `INSIGHTOS_LLM_PROVIDER=ollama` and `OLLAMA_MODEL` to enable it.
+
+On 2026-10-24, Ollama 0.40.10 reported `qwen3:4b-instruct`, `qwen3:4b`, and
+`qwen3:0.6b` installed. A live API/browser smoke test used `qwen3:0.6b` with
+temporary SQLite persistence: greeting and follow-up history passed, and the
+React workspace exchanged messages with FastAPI. The model did not select a
+tool in a direct tool-request prompt. Separately, a live FastAPI tool-loop
+check supplied a read-only `list_projects` call and confirmed that the local
+model could consume the resulting tool message and complete its answer. This
+validates the provider round-trip, not the model's ability to select tools.
+The 4B model was not run: available physical memory was 1.76 GiB while the
+installed model layer is 2.5 GB. No model was downloaded, no paid endpoint was
+called, and Docker was not started. The focused tests and limitations are
+reported with this implementation.
+
+## Empty Qwen3 response follow-up
+
+A later local React → FastAPI → Ollama check reproduced an empty response for
+`10+10` with `qwen3:0.6b` when Ollama's default thinking mode was enabled and
+the test server used a 96-token output limit. The assistant message was saved
+as failed rather than being presented as a successful blank answer. A local
+Ollama request with `think: false` returned `10 + 10 = 20.` in 12 output
+tokens. The adapter now disables separate thinking mode for Qwen3 model names;
+it does not expose internal reasoning. Empty outputs from any provider remain
+explicit failures, and truncated outputs remain partial responses.
+
 ## Synthetic evaluation harness
 
 Run from the `backend` directory after configuring an approved, reachable
@@ -190,3 +226,47 @@ The assistant must not be described as a completed autonomous agent, RAG or
 GraphRAG system, fine-tuned model, or production-grade BI intelligence. Future
 work should compare real model evaluations on synthetic fixtures and keep
 model responses separate from deterministic result verification.
+
+## Dataset inspection orchestration slice (2026-10-26)
+
+The chat runtime now routes a bounded set of dataset inspection questions
+(row/column counts, missing-value counts, observed physical types, and exact
+duplicate-row counts) through the existing read-only `list_files` and
+`get_inspection_handoff` tools. It requires a selected, authorized dataset
+with exactly one ready file, validates the versioned handoff identity, and
+renders answers only through the existing claim validator. The trace records
+the coordinator, Data Intelligence, Analytics & Modelling, Verification, and
+Insights & Visualization stages, along with the task ID, file/dataset scope,
+evidence reference, retry count, and bounded step limit. The profile-based
+inspection route can run without a configured model; other requests continue
+through the configured provider and existing agent runtime.
+
+New totals, rankings, trends, forecasts, predictions, correlations, and
+anomaly analyses are not launched from chat. They return an explicit
+unsupported status rather than implying that the model computed them. A
+request for an absent column is compared against the validated file schema and
+reported as unsupported. This implementation does not add a durable task
+registry, a new evidence registry, file-level conversation persistence, or a
+new analytics engine. The current local owner guard is not authenticated
+multi-user access or tenant isolation.
+
+On 2026-10-26, Ollama 0.40.11 listed `qwen3:8b`, `qwen3:4b`,
+`qwen3:4b-instruct`, and `qwen3:0.6b` as locally installed. The available
+physical memory reading was approximately 0.61 GiB, so no live Qwen inference
+was started during this implementation; provider behavior is covered by fake
+provider tests. No model was pulled, and no Qwen3-8B training or adapter
+creation was attempted.
+
+To enable the existing Ollama provider in a backend PowerShell process:
+
+```powershell
+$env:INSIGHTOS_LLM_PROVIDER = 'ollama'
+$env:OLLAMA_BASE_URL = 'http://127.0.0.1:11434'
+$env:OLLAMA_MODEL = 'qwen3:8b'
+```
+
+Choose another model tag from the local `ollama list` output when memory is
+insufficient for 8B inference. For the dataset-inspection route, create a
+workspace profile, project, dataset, upload one CSV or Excel file through the
+existing UI, then select that dataset in the Assistant context. Real-data
+acceptance still requires a user-supplied file and a live application run.

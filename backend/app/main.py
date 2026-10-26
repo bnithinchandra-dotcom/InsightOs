@@ -14,13 +14,23 @@ from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from email.message import Message
 from os import getenv
+from uuid import uuid4
 
 from fastapi import Body, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
 from minio import Minio
 from minio.deleteobjects import DeleteObject
 from minio.error import MinioException, S3Error
-from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    model_validator,
+)
 import pyarrow as pa
 import pyarrow.parquet as pq
 import sqlalchemy as sa
@@ -41,6 +51,7 @@ from app.jev import (
 from app.models import (
     Dataset,
     DatasetFile,
+    Dashboard,
     EDAAnalysis,
     PreprocessingExecution,
     Project,
@@ -86,6 +97,12 @@ from app.preprocessing import (
 )
 from app.provenance import schema_fingerprint
 from app.provenance import build_provenance, canonical_sha256
+from app.dashboard_insights import (
+    MAX_CHARTS,
+    DashboardAnalyticsError,
+    build_eda_report,
+    build_report,
+)
 from app.schema_architect import (
     MAX_COLUMNS_PER_TABLE as MAX_SCHEMA_COLUMNS,
     MAX_TABLES as MAX_SCHEMA_TABLES,
@@ -118,9 +135,25 @@ from app.quality_planning import (
 )
 from app.quality_rules import MAX_RULE_INPUT_BYTES, run_quality_rules
 from app.service_health import check_database, check_redis, check_storage
+from app.multi_dataset_analytics import (
+    MAX_ANALYTICS_COLUMNS,
+    MAX_ANALYTICS_DECODED_BYTES,
+    MAX_ANALYTICS_ROWS,
+    AnalyticsSource,
+    JoinKey,
+    JoinStep,
+    Metric,
+    MultiDatasetAnalyticsError,
+    execute_join_aggregation,
+    recommend_joins,
+)
 
 
 logger = logging.getLogger(__name__)
+
+MAX_MULTI_DATASET_INPUT_BYTES = 32 * 1024 * 1024
+MAX_MULTI_DATASET_DECODED_BYTES = MAX_ANALYTICS_DECODED_BYTES
+MAX_MULTI_DATASET_RESULT_BYTES = 1024 * 1024
 
 _UPLOAD_CONNECTION_QUARANTINE: list[object] = []
 _UPLOAD_CONNECTION_QUARANTINE_LOCK = Lock()
@@ -130,6 +163,124 @@ app = FastAPI(
     version="0.1.0",
 )
 app.include_router(chat_router)
+
+
+class MultiDatasetSourceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    alias: StrictStr = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
+    dataset_id: StrictInt = Field(gt=0)
+    file_id: StrictInt = Field(gt=0)
+    table_index: StrictInt = Field(default=0, ge=0)
+
+
+class MultiDatasetKeyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    alias: StrictStr = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
+    column: StrictStr = Field(min_length=1, max_length=255)
+
+
+class MultiDatasetJoinRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    left_key: MultiDatasetKeyRequest
+    right_key: MultiDatasetKeyRequest
+    join_type: Literal["inner", "left"]
+    allow_many_to_many: StrictBool = False
+
+
+class MultiDatasetMetricRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    name: StrictStr = Field(min_length=1, max_length=64)
+    operation: Literal[
+        "count",
+        "sum",
+        "average",
+        "minimum",
+        "maximum",
+        "distinct_count",
+    ]
+    column: MultiDatasetKeyRequest | None = None
+
+
+class MultiDatasetRecommendationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    sources: list[MultiDatasetSourceRequest] = Field(min_length=2, max_length=4)
+
+
+class MultiDatasetAnalysisRequest(MultiDatasetRecommendationRequest):
+    joins: list[MultiDatasetJoinRequest] = Field(min_length=1, max_length=3)
+    dimensions: list[MultiDatasetKeyRequest] = Field(default_factory=list, max_length=16)
+    metrics: list[MultiDatasetMetricRequest] = Field(min_length=1, max_length=16)
+
+
+class ChartSpecificationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    title: StrictStr = Field(min_length=1, max_length=120)
+    chart_type: Literal["bar", "line", "scatter", "pie"]
+    x_field: StrictStr = Field(min_length=1, max_length=255)
+    y_field: StrictStr = Field(min_length=1, max_length=64)
+    series_field: StrictStr | None = Field(default=None, min_length=1, max_length=255)
+
+
+class DashboardLayoutItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    chart_index: StrictInt = Field(ge=0, le=7)
+    x: StrictInt = Field(ge=0, le=11)
+    y: StrictInt = Field(ge=0, le=1000)
+    width: StrictInt = Field(ge=1, le=12)
+    height: StrictInt = Field(ge=1, le=30)
+
+
+class MultiDatasetReportRequest(MultiDatasetAnalysisRequest):
+    charts: list[ChartSpecificationRequest] = Field(default_factory=list, max_length=MAX_CHARTS)
+
+
+class DashboardDefinitionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    title: StrictStr = Field(min_length=1, max_length=120)
+    description: StrictStr | None = Field(default=None, max_length=2000)
+    analysis_request: MultiDatasetAnalysisRequest
+    chart_requests: list[ChartSpecificationRequest] = Field(
+        default_factory=list,
+        max_length=MAX_CHARTS,
+    )
+    layout: list[DashboardLayoutItem] = Field(default_factory=list, max_length=MAX_CHARTS)
+
+    @model_validator(mode="after")
+    def validate_layout(self):
+        indexes = [item.chart_index for item in self.layout]
+        if (
+            len(indexes) != len(set(indexes))
+            or any(index >= len(self.chart_requests) for index in indexes)
+            or self.layout
+            and set(indexes) != set(range(len(self.chart_requests)))
+            or any(item.x + item.width > 12 for item in self.layout)
+        ):
+            raise ValueError("Dashboard layout must place each chart within the bounded grid.")
+        for index, item in enumerate(self.layout):
+            for other in self.layout[index + 1 :]:
+                horizontal_overlap = item.x < other.x + other.width and other.x < item.x + item.width
+                vertical_overlap = item.y < other.y + other.height and other.y < item.y + item.height
+                if horizontal_overlap and vertical_overlap:
+                    raise ValueError("Dashboard charts cannot overlap in the layout.")
+        return self
+
+
+class EDAReportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    dataset_id: StrictInt = Field(gt=0)
+    file_id: StrictInt = Field(gt=0)
+    analysis_id: StrictInt = Field(gt=0)
+    chart_columns: list[StrictStr] = Field(default_factory=list, max_length=MAX_CHARTS)
+
 
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 UPLOAD_MIME_TYPES = {
@@ -1002,9 +1153,8 @@ def create_dataset(project_id: int, payload: DatasetCreate):
 
     with SessionLocal() as session:
         try:
-            project = session.get(Project, project_id)
-            if project is None:
-                raise HTTPException(status_code=404, detail="Project not found.")
+            owner = _require_workspace_user(session)
+            project = _require_project_access(session, project_id, owner)
 
             dataset = Dataset(
                 project_id=project.id,
@@ -1134,25 +1284,9 @@ def create_project(payload: ProjectCreate):
 
     with SessionLocal() as session:
         try:
-            users = session.query(User).order_by(User.id.asc()).limit(2).all()
-            if not users:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "workspace_profile_required",
-                        "message": "Create a local workspace profile before creating a project.",
-                    },
-                )
-            if len(users) > 1:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "authentication_required",
-                        "message": "Authentication is required to choose a project owner.",
-                    },
-                )
+            owner = _require_workspace_user(session)
             project = Project(
-                user_id=users[0].id,
+                user_id=owner.id,
                 name=name,
                 description=payload.description,
             )
@@ -1202,7 +1336,10 @@ def upload_dataset_file(
 
     with _pinned_upload_session() as (session, connection), ExitStack() as cleanup:
         try:
-            dataset = session.get(Dataset, dataset_id)
+            owner = _require_workspace_user(session)
+            dataset = _require_dataset_access(session, dataset_id, owner)
+        except HTTPException:
+            raise
         except SQLAlchemyError as error:
             logger.error(
                 "Dataset lookup failed for dataset %s (%s)",
@@ -1213,9 +1350,6 @@ def upload_dataset_file(
                 status_code=500,
                 detail="Dataset could not be checked.",
             ) from None
-
-        if dataset is None:
-            raise HTTPException(status_code=404, detail="Dataset not found.")
 
         try:
             while chunk := file.file.read(UPLOAD_CHUNK_SIZE):
@@ -1719,6 +1853,795 @@ def serialize_project(project: Project) -> dict:
     }
 
 
+def _require_workspace_user(session: Session) -> User:
+    """Resolve the single trusted local workspace profile for protected resources."""
+    users = session.query(User).order_by(User.id.asc()).limit(2).all()
+    if not users:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workspace_profile_required",
+                "message": "Create a local workspace profile before accessing protected workspace data.",
+            },
+        )
+    if len(users) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "authentication_required",
+                "message": "Authentication is required to choose a project owner.",
+            },
+        )
+    return users[0]
+
+
+def _require_project_access(session: Session, project_id: int, owner: User) -> Project:
+    project = session.get(Project, project_id)
+    if project is None or project.user_id != owner.id:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    return project
+
+
+def _require_dataset_access(session: Session, dataset_id: int, owner: User) -> Dataset:
+    dataset = session.get(Dataset, dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+    project = session.get(Project, dataset.project_id)
+    if project is None or project.user_id != owner.id:
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+    return dataset
+
+
+def _load_multi_dataset_sources(
+    session: Session,
+    sources: list[MultiDatasetSourceRequest],
+    owner: User,
+    cleanup: ExitStack,
+) -> list[AnalyticsSource]:
+    for source in sources:
+        _require_dataset_access(session, source.dataset_id, owner)
+        exists = (
+            session.query(DatasetFile.id)
+            .filter(
+                DatasetFile.id == source.file_id,
+                DatasetFile.dataset_id == source.dataset_id,
+            )
+            .one_or_none()
+        )
+        if exists is None:
+            raise HTTPException(status_code=404, detail="Dataset file not found.")
+
+    storage = get_storage_client()
+    raw_bucket = getenv("MINIO_RAW_BUCKET", "insightos-raw")
+    processed_bucket = getenv("MINIO_PROCESSED_BUCKET", "insightos-processed")
+    loaded: list[AnalyticsSource] = []
+    total_artifact_bytes = 0
+    total_decoded_bytes = 0
+    total_uncompressed_bytes = 0
+
+    for source in sources:
+        _require_dataset_access(session, source.dataset_id, owner)
+        dataset_file = (
+            session.query(DatasetFile)
+            .filter(
+                DatasetFile.id == source.file_id,
+                DatasetFile.dataset_id == source.dataset_id,
+            )
+            .one_or_none()
+        )
+        if dataset_file is None:
+            raise HTTPException(status_code=404, detail="Dataset file not found.")
+        if (
+            dataset_file.status != "Ready"
+            or dataset_file.normalization_status != "Ready"
+            or not dataset_file.checksum
+            or not isinstance(dataset_file.parsing_result, dict)
+            or not isinstance(dataset_file.normalization_result, dict)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalized_source_unavailable",
+                    "message": "Multi-dataset analytics requires ready, validated normalized files.",
+                },
+            )
+        if not _verify_stored_object(storage, raw_bucket, dataset_file):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "source_integrity_failed",
+                    "message": "A selected source file failed integrity verification.",
+                },
+            )
+        try:
+            normalized = validate_normalization_result(
+                dataset_file.normalization_result,
+                dataset_file.parsing_result,
+                dataset_file.filename,
+                dataset_file.file_size_bytes,
+                dataset_file.checksum,
+                source.dataset_id,
+                source.file_id,
+            )
+        except NormalizationError:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalization_metadata_invalid",
+                    "message": "A selected source has invalid normalization metadata.",
+                },
+            ) from None
+        tables = normalized.get("tables")
+        if not isinstance(tables, list) or source.table_index >= len(tables):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "unknown_table",
+                    "message": "A selected normalized table does not exist.",
+                },
+            )
+        table_metadata = tables[source.table_index]
+        if not isinstance(table_metadata, dict):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalized_table_invalid",
+                    "message": "Stored normalized table metadata is invalid.",
+                },
+            )
+        row_count = table_metadata.get("row_count")
+        file_size_bytes = table_metadata.get("file_size_bytes")
+        object_key = table_metadata.get("object_key")
+        expected_sha256 = table_metadata.get("sha256")
+        if (
+            not isinstance(row_count, int)
+            or isinstance(row_count, bool)
+            or not 0 <= row_count <= MAX_ANALYTICS_ROWS
+            or not isinstance(file_size_bytes, int)
+            or isinstance(file_size_bytes, bool)
+            or file_size_bytes <= 0
+            or not isinstance(object_key, str)
+            or not isinstance(expected_sha256, str)
+            or len(expected_sha256) != 64
+        ):
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "code": "analytics_source_limit",
+                    "message": "A source exceeds analytics row or artifact limits.",
+                },
+            )
+        total_artifact_bytes += file_size_bytes
+        if total_artifact_bytes > MAX_MULTI_DATASET_INPUT_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "code": "analytics_input_size_limit",
+                    "message": "Selected normalized artifacts exceed the 32 MiB request limit.",
+                },
+            )
+        expected_prefix = (
+            f"{source.dataset_id}/{source.file_id}/{dataset_file.checksum}/"
+            f"{normalized['configuration']['configuration_sha256']}/"
+            f"table-{source.table_index:04d}-"
+        )
+        if not object_key.startswith(expected_prefix) or not object_key.endswith(".parquet"):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalized_artifact_boundary_invalid",
+                    "message": "A selected artifact is outside its managed storage boundary.",
+                },
+            )
+
+        output = tempfile.NamedTemporaryFile(
+            prefix="insightos-multi-analytics-",
+            suffix=".parquet",
+            delete=False,
+        )
+        path = output.name
+        output.close()
+        cleanup.callback(os.unlink, path)
+        response = storage.get_object(processed_bucket, object_key)
+        digest = hashlib.sha256()
+        actual_size = 0
+        try:
+            with open(path, "wb") as destination:
+                while chunk := response.read(UPLOAD_CHUNK_SIZE):
+                    actual_size += len(chunk)
+                    if actual_size > file_size_bytes:
+                        raise OSError("Normalized artifact exceeded its recorded size.")
+                    digest.update(chunk)
+                    destination.write(chunk)
+        finally:
+            response.close()
+            release_connection = getattr(response, "release_conn", None)
+            if release_connection is not None:
+                release_connection()
+        if actual_size != file_size_bytes or digest.hexdigest() != expected_sha256:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalized_artifact_integrity_failed",
+                    "message": "A selected normalized artifact failed integrity verification.",
+                },
+            )
+        try:
+            parquet = pq.ParquetFile(path)
+            metadata = parquet.metadata
+            uncompressed_bytes = sum(
+                metadata.row_group(row_group).column(column).total_uncompressed_size
+                for row_group in range(metadata.num_row_groups)
+                for column in range(metadata.num_columns)
+            )
+            total_uncompressed_bytes += uncompressed_bytes
+            if (
+                metadata.num_rows != row_count
+                or metadata.num_columns > MAX_ANALYTICS_COLUMNS
+                or total_uncompressed_bytes > MAX_MULTI_DATASET_DECODED_BYTES
+            ):
+                raise HTTPException(
+                    status_code=413,
+                    detail={
+                        "code": "analytics_decoded_size_limit",
+                        "message": "A selected table exceeds analytics row, column, or decoded-size limits.",
+                    },
+                )
+            table = parquet.read()
+            total_decoded_bytes += table.nbytes
+            if total_decoded_bytes > MAX_MULTI_DATASET_DECODED_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail={
+                        "code": "analytics_decoded_size_limit",
+                        "message": "Selected tables exceed the decoded-memory limit.",
+                    },
+                )
+        except HTTPException:
+            raise
+        except (OSError, pa.ArrowException, ValueError) as error:
+            logger.warning(
+                "Multi-dataset artifact could not be read (%s)",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalized_artifact_invalid",
+                    "message": "A selected normalized artifact could not be read safely.",
+                },
+            ) from None
+        loaded.append(
+            AnalyticsSource(
+                alias=source.alias,
+                dataset_id=source.dataset_id,
+                file_id=source.file_id,
+                table_index=source.table_index,
+                table=table,
+                checksum=dataset_file.checksum,
+            )
+        )
+    return loaded
+
+
+def _analytics_key(request: MultiDatasetKeyRequest) -> JoinKey:
+    return JoinKey(source_alias=request.alias, column=request.column)
+
+
+def _validate_multi_dataset_request(
+    sources: list[MultiDatasetSourceRequest],
+    joins: list[MultiDatasetJoinRequest] | None = None,
+    dimensions: list[MultiDatasetKeyRequest] | None = None,
+    metrics: list[MultiDatasetMetricRequest] | None = None,
+) -> None:
+    if not 2 <= len(sources) <= 4:
+        raise MultiDatasetAnalyticsError(
+            "invalid_source_count",
+            "Select 2 to 4 dataset files.",
+        )
+    aliases = [source.alias for source in sources]
+    if len(set(aliases)) != len(aliases):
+        raise MultiDatasetAnalyticsError(
+            "duplicate_source_alias",
+            "Source aliases must be unique.",
+        )
+    if joins is None:
+        return
+    if len(joins) != len(sources) - 1:
+        raise MultiDatasetAnalyticsError(
+            "invalid_join_plan",
+            "Provide one join for each source added after the first.",
+        )
+    joined_aliases = {aliases[0]}
+    for source_index, join in enumerate(joins, start=1):
+        if (
+            join.right_key.alias != aliases[source_index]
+            or join.left_key.alias not in joined_aliases
+        ):
+            raise MultiDatasetAnalyticsError(
+                "invalid_join_order",
+                "Join steps must add sources in the selected order.",
+            )
+        joined_aliases.add(join.right_key.alias)
+    for key in dimensions or []:
+        if key.alias not in aliases:
+            raise MultiDatasetAnalyticsError(
+                "unknown_source_alias",
+                "A selected dimension references an unknown source.",
+            )
+    for metric in metrics or []:
+        if metric.column is not None and metric.column.alias not in aliases:
+            raise MultiDatasetAnalyticsError(
+                "unknown_source_alias",
+                "A selected metric references an unknown source.",
+            )
+
+
+def _bounded_multi_dataset_result(result: dict[str, Any]) -> dict[str, Any]:
+    try:
+        encoded = json.dumps(
+            result,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError, OverflowError):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "analytics_result_invalid",
+                "message": "The analytics output could not be represented safely.",
+            },
+        ) from None
+    if len(encoded.encode("utf-8")) > MAX_MULTI_DATASET_RESULT_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "code": "analytics_result_size_limit",
+                "message": "The analytics result exceeds the 1 MiB response limit.",
+            },
+        )
+    return jsonable_encoder(result)
+
+
+def _analytics_result_for_report(
+    session: Session,
+    owner: User,
+    request: MultiDatasetAnalysisRequest,
+    chart_requests: list[ChartSpecificationRequest],
+) -> dict[str, Any]:
+    try:
+        _validate_multi_dataset_request(
+            request.sources,
+            request.joins,
+            request.dimensions,
+            request.metrics,
+        )
+        with ExitStack() as cleanup:
+            sources = _load_multi_dataset_sources(
+                session,
+                request.sources,
+                owner,
+                cleanup,
+            )
+            result = execute_join_aggregation(
+                sources,
+                [
+                    JoinStep(
+                        left=_analytics_key(join.left_key),
+                        right=_analytics_key(join.right_key),
+                        join_type=join.join_type,
+                        allow_many_to_many=join.allow_many_to_many,
+                    )
+                    for join in request.joins
+                ],
+                [_analytics_key(dimension) for dimension in request.dimensions],
+                [
+                    Metric(
+                        name=metric.name,
+                        operation=metric.operation,
+                        column=(
+                            _analytics_key(metric.column)
+                            if metric.column is not None
+                            else None
+                        ),
+                    )
+                    for metric in request.metrics
+                ],
+            )
+        return build_report(
+            request.model_dump(mode="json"),
+            result,
+            [chart.model_dump(mode="json") for chart in chart_requests],
+        )
+    except (MultiDatasetAnalyticsError, DashboardAnalyticsError) as error:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": error.code, "message": error.message},
+        ) from None
+
+
+def _serialize_dashboard(dashboard: Dashboard) -> dict[str, Any]:
+    return {
+        "id": dashboard.id,
+        "title": dashboard.title,
+        "description": dashboard.description,
+        "definition": dashboard.definition,
+        "created_at": dashboard.created_at,
+        "updated_at": dashboard.updated_at,
+        "refresh_policy": "on_demand",
+    }
+
+
+def _dashboard_definition(request: DashboardDefinitionRequest) -> dict[str, Any]:
+    chart_requests = [
+        chart.model_dump(mode="json")
+        for chart in request.chart_requests
+    ]
+    layout = (
+        [item.model_dump(mode="json") for item in request.layout]
+        if request.layout
+        else [
+            {
+                "chart_index": index,
+                "x": 0,
+                "y": index * 6,
+                "width": 12,
+                "height": 6,
+            }
+            for index in range(len(chart_requests))
+        ]
+    )
+    return {
+        "analysis_request": request.analysis_request.model_dump(mode="json"),
+        "chart_requests": chart_requests,
+        "layout": layout,
+    }
+
+
+def _require_dashboard_access(
+    session: Session,
+    dashboard_id: str,
+    owner: User,
+) -> Dashboard:
+    if len(dashboard_id) != 32 or any(
+        character not in "0123456789abcdef" for character in dashboard_id
+    ):
+        raise HTTPException(status_code=404, detail="Dashboard not found.")
+    dashboard = session.get(Dashboard, dashboard_id)
+    if dashboard is None or dashboard.owner_user_id != owner.id:
+        raise HTTPException(status_code=404, detail="Dashboard not found.")
+    return dashboard
+
+
+@app.post("/api/v1/analytics/multi-dataset/relationships")
+def recommend_multi_dataset_relationships(request: MultiDatasetRecommendationRequest):
+    try:
+        _validate_multi_dataset_request(request.sources)
+    except MultiDatasetAnalyticsError as error:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": error.code, "message": error.message},
+        ) from None
+    with SessionLocal() as session, ExitStack() as cleanup:
+        try:
+            owner = _require_workspace_user(session)
+            sources = _load_multi_dataset_sources(
+                session,
+                request.sources,
+                owner,
+                cleanup,
+            )
+            return _bounded_multi_dataset_result(recommend_joins(sources))
+        except HTTPException:
+            raise
+        except MultiDatasetAnalyticsError as error:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": error.code, "message": error.message},
+            ) from None
+        except (SQLAlchemyError, MinioException, OSError) as error:
+            logger.error(
+                "Multi-dataset relationship discovery failed (%s)",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Dataset relationships could not be analyzed.",
+            ) from None
+
+
+@app.post("/api/v1/analytics/multi-dataset/analyze")
+def analyze_multiple_datasets(request: MultiDatasetAnalysisRequest):
+    try:
+        _validate_multi_dataset_request(
+            request.sources,
+            request.joins,
+            request.dimensions,
+            request.metrics,
+        )
+    except MultiDatasetAnalyticsError as error:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": error.code, "message": error.message},
+        ) from None
+    with SessionLocal() as session, ExitStack() as cleanup:
+        try:
+            owner = _require_workspace_user(session)
+            sources = _load_multi_dataset_sources(
+                session,
+                request.sources,
+                owner,
+                cleanup,
+            )
+            result = execute_join_aggregation(
+                sources,
+                [
+                    JoinStep(
+                        left=_analytics_key(join.left_key),
+                        right=_analytics_key(join.right_key),
+                        join_type=join.join_type,
+                        allow_many_to_many=join.allow_many_to_many,
+                    )
+                    for join in request.joins
+                ],
+                [_analytics_key(dimension) for dimension in request.dimensions],
+                [
+                    Metric(
+                        name=metric.name,
+                        operation=metric.operation,
+                        column=(
+                            _analytics_key(metric.column)
+                            if metric.column is not None
+                            else None
+                        ),
+                    )
+                    for metric in request.metrics
+                ],
+            )
+            return _bounded_multi_dataset_result(result)
+        except HTTPException:
+            raise
+        except MultiDatasetAnalyticsError as error:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": error.code, "message": error.message},
+            ) from None
+        except (SQLAlchemyError, MinioException, OSError) as error:
+            logger.error(
+                "Multi-dataset analytics failed (%s)",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="The selected datasets could not be analyzed.",
+            ) from None
+
+
+@app.post("/api/v1/analytics/reports")
+def generate_analytics_report(request: MultiDatasetReportRequest):
+    with SessionLocal() as session:
+        try:
+            owner = _require_workspace_user(session)
+            report = _analytics_result_for_report(
+                session,
+                owner,
+                request,
+                request.charts,
+            )
+            return _bounded_multi_dataset_result(report)
+        except HTTPException:
+            raise
+        except (SQLAlchemyError, MinioException, OSError) as error:
+            logger.error(
+                "Evidence-backed report generation failed (%s)",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="The selected datasets could not be reported.",
+            ) from None
+
+
+@app.post("/api/v1/analytics/eda-reports")
+def generate_eda_evidence_report(request: EDAReportRequest):
+    with SessionLocal() as session:
+        try:
+            owner = _require_workspace_user(session)
+            _require_dataset_access(session, request.dataset_id, owner)
+            dataset_file = (
+                session.query(DatasetFile)
+                .filter(
+                    DatasetFile.id == request.file_id,
+                    DatasetFile.dataset_id == request.dataset_id,
+                )
+                .one_or_none()
+            )
+            if dataset_file is None:
+                raise HTTPException(status_code=404, detail="Dataset file not found.")
+            record = (
+                session.query(EDAAnalysis)
+                .filter(
+                    EDAAnalysis.id == request.analysis_id,
+                    EDAAnalysis.dataset_id == request.dataset_id,
+                    EDAAnalysis.file_id == request.file_id,
+                )
+                .one_or_none()
+            )
+            if record is None:
+                raise HTTPException(status_code=404, detail="EDA analysis not found.")
+            if (
+                record.status not in {"Completed", "PartiallyCompleted"}
+                or not isinstance(record.result, dict)
+                or dataset_file.status != "Ready"
+                or dataset_file.normalization_status != "Ready"
+                or not isinstance(dataset_file.normalization_result, dict)
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "eda_result_unavailable",
+                        "message": "A completed stored EDA result and its normalized source are required.",
+                    },
+                )
+            analysis_source = record.result.get("source")
+            tables = dataset_file.normalization_result.get("tables")
+            table_index = record.table_index
+            current_table = (
+                tables[table_index]
+                if isinstance(tables, list) and 0 <= table_index < len(tables)
+                else None
+            )
+            if (
+                not isinstance(analysis_source, dict)
+                or not isinstance(current_table, dict)
+                or analysis_source.get("artifact_sha256") != current_table.get("sha256")
+                or analysis_source.get("table_index") != table_index
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "eda_result_stale",
+                        "message": "The stored EDA result no longer matches the current normalized source.",
+                    },
+                )
+            if not isinstance(record.provenance, dict):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "eda_provenance_missing",
+                        "message": "The stored EDA result has no provenance record.",
+                    },
+                )
+            report = build_eda_report(
+                {
+                    **record.result,
+                    "id": record.id,
+                },
+                record.provenance,
+                request.chart_columns,
+            )
+            return _bounded_multi_dataset_result(report)
+        except HTTPException:
+            raise
+        except DashboardAnalyticsError as error:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": error.code, "message": error.message},
+            ) from None
+        except SQLAlchemyError as error:
+            logger.error(
+                "EDA evidence report lookup failed (%s)",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="The stored EDA analysis could not be retrieved.",
+            ) from None
+
+
+@app.get("/api/v1/dashboards")
+def list_dashboards():
+    with SessionLocal() as session:
+        owner = _require_workspace_user(session)
+        dashboards = (
+            session.query(Dashboard)
+            .filter(Dashboard.owner_user_id == owner.id)
+            .order_by(Dashboard.updated_at.desc(), Dashboard.id.asc())
+            .all()
+        )
+        return [_serialize_dashboard(dashboard) for dashboard in dashboards]
+
+
+@app.post("/api/v1/dashboards", status_code=201)
+def create_dashboard(request: DashboardDefinitionRequest):
+    with SessionLocal() as session:
+        try:
+            owner = _require_workspace_user(session)
+            _analytics_result_for_report(
+                session,
+                owner,
+                request.analysis_request,
+                request.chart_requests,
+            )
+            dashboard = Dashboard(
+                id=uuid4().hex,
+                owner_user_id=owner.id,
+                title=request.title.strip(),
+                description=request.description,
+                definition=_dashboard_definition(request),
+            )
+            if not dashboard.title:
+                raise HTTPException(status_code=422, detail="Dashboard title is required.")
+            session.add(dashboard)
+            session.commit()
+            session.refresh(dashboard)
+            return _serialize_dashboard(dashboard)
+        except HTTPException:
+            raise
+        except (SQLAlchemyError, MinioException, OSError) as error:
+            logger.error(
+                "Dashboard creation failed (%s)",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="The dashboard could not be saved.",
+            ) from None
+
+
+@app.get("/api/v1/dashboards/{dashboard_id}")
+def get_dashboard(dashboard_id: str):
+    with SessionLocal() as session:
+        owner = _require_workspace_user(session)
+        dashboard = _require_dashboard_access(session, dashboard_id, owner)
+        return _serialize_dashboard(dashboard)
+
+
+@app.put("/api/v1/dashboards/{dashboard_id}")
+def update_dashboard(dashboard_id: str, request: DashboardDefinitionRequest):
+    with SessionLocal() as session:
+        try:
+            owner = _require_workspace_user(session)
+            dashboard = _require_dashboard_access(session, dashboard_id, owner)
+            _analytics_result_for_report(
+                session,
+                owner,
+                request.analysis_request,
+                request.chart_requests,
+            )
+            title = request.title.strip()
+            if not title:
+                raise HTTPException(status_code=422, detail="Dashboard title is required.")
+            dashboard.title = title
+            dashboard.description = request.description
+            dashboard.definition = _dashboard_definition(request)
+            session.commit()
+            session.refresh(dashboard)
+            return _serialize_dashboard(dashboard)
+        except HTTPException:
+            raise
+        except (SQLAlchemyError, MinioException, OSError) as error:
+            logger.error(
+                "Dashboard update failed (%s)",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="The dashboard could not be updated.",
+            ) from None
+
+
+@app.delete("/api/v1/dashboards/{dashboard_id}")
+def delete_dashboard(dashboard_id: str):
+    with SessionLocal() as session:
+        owner = _require_workspace_user(session)
+        dashboard = _require_dashboard_access(session, dashboard_id, owner)
+        session.delete(dashboard)
+        session.commit()
+        return {"deleted": True}
+
+
 def serialize_dataset(dataset: Dataset) -> dict:
     return {
         "id": dataset.id,
@@ -1782,7 +2705,13 @@ def get_quality_rule(rule_id: str):
 def list_projects():
     with SessionLocal() as session:
         try:
-            projects = session.query(Project).order_by(Project.id.asc()).all()
+            owner = _require_workspace_user(session)
+            projects = (
+                session.query(Project)
+                .filter(Project.user_id == owner.id)
+                .order_by(Project.id.asc())
+                .all()
+            )
         except SQLAlchemyError as error:
             logger.error("Project listing failed (%s)", type(error).__name__)
             raise HTTPException(
@@ -1797,7 +2726,10 @@ def list_projects():
 def get_project(project_id: int):
     with SessionLocal() as session:
         try:
-            project = session.get(Project, project_id)
+            owner = _require_workspace_user(session)
+            project = _require_project_access(session, project_id, owner)
+        except HTTPException:
+            raise
         except SQLAlchemyError as error:
             logger.error(
                 "Project lookup failed for project %s (%s)",
@@ -1809,9 +2741,6 @@ def get_project(project_id: int):
                 detail="Project could not be retrieved.",
             ) from None
 
-        if project is None:
-            raise HTTPException(status_code=404, detail="Project not found.")
-
         return serialize_project(project)
 
 
@@ -1819,9 +2748,8 @@ def get_project(project_id: int):
 def list_project_datasets(project_id: int):
     with SessionLocal() as session:
         try:
-            project = session.get(Project, project_id)
-            if project is None:
-                raise HTTPException(status_code=404, detail="Project not found.")
+            owner = _require_workspace_user(session)
+            _require_project_access(session, project_id, owner)
 
             datasets = (
                 session.query(Dataset)
@@ -1849,7 +2777,10 @@ def list_project_datasets(project_id: int):
 def get_dataset(dataset_id: int):
     with SessionLocal() as session:
         try:
-            dataset = session.get(Dataset, dataset_id)
+            owner = _require_workspace_user(session)
+            dataset = _require_dataset_access(session, dataset_id, owner)
+        except HTTPException:
+            raise
         except SQLAlchemyError as error:
             logger.error(
                 "Dataset lookup failed for dataset %s (%s)",
@@ -1861,9 +2792,6 @@ def get_dataset(dataset_id: int):
                 detail="Dataset could not be retrieved.",
             ) from None
 
-        if dataset is None:
-            raise HTTPException(status_code=404, detail="Dataset not found.")
-
         return serialize_dataset(dataset)
 
 
@@ -1871,9 +2799,8 @@ def get_dataset(dataset_id: int):
 def list_dataset_files(dataset_id: int):
     with SessionLocal() as session:
         try:
-            dataset = session.get(Dataset, dataset_id)
-            if dataset is None:
-                raise HTTPException(status_code=404, detail="Dataset not found.")
+            owner = _require_workspace_user(session)
+            _require_dataset_access(session, dataset_id, owner)
 
             dataset_files = (
                 session.query(DatasetFile)
@@ -1901,9 +2828,8 @@ def list_dataset_files(dataset_id: int):
 def get_dataset_file(dataset_id: int, file_id: int):
     with SessionLocal() as session:
         try:
-            dataset = session.get(Dataset, dataset_id)
-            if dataset is None:
-                raise HTTPException(status_code=404, detail="Dataset not found.")
+            owner = _require_workspace_user(session)
+            _require_dataset_access(session, dataset_id, owner)
 
             dataset_file = (
                 session.query(DatasetFile)
@@ -1937,9 +2863,8 @@ def get_dataset_file(dataset_id: int, file_id: int):
 def get_dataset_file_profile(dataset_id: int, file_id: int):
     with SessionLocal() as session:
         try:
-            dataset = session.get(Dataset, dataset_id)
-            if dataset is None:
-                raise HTTPException(status_code=404, detail="Dataset not found.")
+            owner = _require_workspace_user(session)
+            _require_dataset_access(session, dataset_id, owner)
 
             dataset_file = (
                 session.query(DatasetFile)
@@ -2291,6 +3216,8 @@ def _assess_verified_quality_input_lineage(
         claimed_inputs,
         verified_inputs,
         reference="quality-lineage:verified-object-readback",
+        independent=True,
+        authoritative=True,
     )
     budget = ExecutionBudget(
         {
@@ -3294,6 +4221,8 @@ def _assess_verified_eda_input_lineage(
         claimed_inputs,
         verified_inputs,
         reference="eda-lineage:verified-object-readback",
+        independent=True,
+        authoritative=True,
     )
     budget = ExecutionBudget(
         {
@@ -5323,6 +6252,8 @@ def _assess_verified_preprocessing_lineage(
         claimed_inputs,
         verified_inputs,
         reference="preprocessing-lineage:verified-object-readback",
+        independent=True,
+        authoritative=True,
     )
     budget = ExecutionBudget(
         {
