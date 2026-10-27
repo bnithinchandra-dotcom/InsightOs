@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Path, Query, status
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, ValidationError
 from sqlalchemy import func
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -27,6 +27,16 @@ from app.agent.contracts import (
     UsageMetadata,
 )
 from app.agent.providers import create_provider
+from app.agent.model_router import AgentModelRouter
+from app.agent.specialist_agents import (
+    SpecialistAgentError,
+    SpecialistHandoff,
+    build_specialist_handoff,
+    run_analytics_decision,
+    run_data_intelligence,
+    run_presentation,
+    verified_schema_summary,
+)
 from app.agent.runtime import execute_agent_request, public_outcome_metadata
 from app.agent.tools import ToolRegistry
 from app.database import SessionLocal
@@ -44,6 +54,7 @@ from app.models import (
 from app.workflow_execution import (
     MAX_WORKFLOW_TASKS,
     WorkflowPlanError,
+    WorkflowTaskExecutionError,
     persist_workflow_task,
     recover_persisted_workflow,
     run_persisted_workflow,
@@ -56,6 +67,60 @@ PROCESSING_LEASE_SECONDS = 2_460
 MAX_MESSAGES_PER_CONVERSATION = 25
 MAX_PERSISTED_MESSAGE_BYTES = 256 * 1024
 MAX_RECOVERY_AGE_SECONDS = PROCESSING_LEASE_SECONDS
+
+
+def _fingerprint_json(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _persisted_specialist_result(
+    *,
+    stage: str,
+    operation: str,
+    source_fingerprint: str,
+    dataset_id: int | None,
+    file_id: int | None,
+    dependency_task_ids: list[str],
+    output: Any,
+    model_name: str,
+    parameters: dict[str, Any],
+    verified_schema: dict[str, Any] | None = None,
+    actual_operations: list[dict[str, Any]] | None = None,
+    warnings: list[str] | None = None,
+    artifact_references: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    _handoff, envelope, reference = build_specialist_handoff(
+        stage=stage,
+        operation=operation,
+        source_fingerprint=source_fingerprint,
+        dataset_id=dataset_id,
+        file_id=file_id,
+        dependency_task_ids=dependency_task_ids,
+        output=output,
+        model_name=model_name,
+        parameters=parameters,
+        verified_schema=verified_schema,
+        actual_operations=actual_operations,
+        warnings=warnings,
+        artifact_references=artifact_references,
+    )
+    return {
+        "status": "succeeded",
+        "summary": f"{stage} completed with a validated handoff.",
+        "data": envelope,
+        "warnings": [],
+        "references": [reference],
+        "limitations": [],
+        "error_code": None,
+        "label": stage,
+    }
 
 
 def _mark_workflow_failure(
@@ -173,7 +238,7 @@ def _workflow_task_input_is_current(
     workflow: WorkflowExecution,
     task: WorkflowTask,
 ) -> bool:
-    if not task.idempotent or task.dataset_id is None or not task.source_fingerprint:
+    if task.dataset_id is None or not task.source_fingerprint:
         return False
     references = task.input_references
     if not isinstance(references, list):
@@ -230,6 +295,41 @@ def _workflow_task_input_is_current(
     source_fingerprint = hashlib.sha256(encoded_source.encode("utf-8")).hexdigest()
     if source_fingerprint != task.source_fingerprint:
         return False
+    dependency_tasks = (
+        session.query(WorkflowTask)
+        .join(
+            WorkflowTaskDependency,
+            WorkflowTaskDependency.depends_on_task_id == WorkflowTask.id,
+        )
+        .filter(WorkflowTaskDependency.task_id == task.id)
+        .all()
+    )
+    dependency_refs = [
+        item
+        for item in references
+        if isinstance(item, dict) and item.get("type") == "dependency_outputs"
+    ]
+    if dependency_tasks:
+        if len(dependency_refs) != 1 or any(
+            dependency.status != "completed"
+            or not isinstance(dependency.result_summary, dict)
+            for dependency in dependency_tasks
+        ):
+            return False
+        current_fingerprints = [
+            {
+                "task_id": dependency.task_key,
+                "sha256": _fingerprint_json(dependency.result_summary),
+            }
+            for dependency in sorted(
+                dependency_tasks,
+                key=lambda item: item.task_key,
+            )
+        ]
+        if dependency_refs[0].get("fingerprints") != current_fingerprints:
+            return False
+    elif dependency_refs:
+        return False
     identity = json.dumps(
         {
             "tool": task.task_type,
@@ -261,6 +361,7 @@ def _workflow_tool_scheduler(
         idempotent: bool,
         max_retries: int = 0,
         depends_on: list[str] | None = None,
+        agent: str = "registered_tool",
     ) -> tuple[str, ToolResult, str, str | None]:
         try:
             arguments_identity = json.dumps(
@@ -359,7 +460,7 @@ def _workflow_tool_scheduler(
                 dependencies = depends_on or []
                 plan_item = {
                     "task_id": task_key,
-                    "agent": "registered_tool",
+                    "agent": agent,
                     "operation": tool_name,
                     "depends_on": dependencies,
                     "status": "pending",
@@ -416,7 +517,10 @@ def _workflow_tool_scheduler(
             raw_output, result, label = execute()
             last_execution[:] = [(raw_output, result, label)]
             if result.status != "succeeded":
-                raise RuntimeError("Registered tool returned a failed result.")
+                raise WorkflowTaskExecutionError(
+                    result.error_code or "task_execution_failed",
+                    result.summary,
+                )
             return {
                 "status": result.status,
                 "summary": result.summary,
@@ -527,6 +631,387 @@ def _workflow_tool_scheduler(
             )
 
     return schedule
+
+
+def _specialist_recovery_handlers(
+    session: SessionLocal,
+    workflow: WorkflowExecution,
+    registry: ToolRegistry,
+    context: dict[str, Any],
+) -> dict[str, Callable[[WorkflowTask], dict[str, Any]]]:
+    try:
+        settings = get_agent_settings()
+        if settings.provider == "none":
+            return {}
+        router = AgentModelRouter(settings=settings, provider=create_provider(settings))
+    except ProviderError:
+        return {}
+    workflow_id = workflow.id
+    conversation_id = workflow.conversation_id
+    objective = workflow.objective
+    stage_roles = {
+        "specialist_data_intelligence": "data_intelligence",
+        "specialist_analytics_modelling": "analytics_modelling",
+        "specialist_insights_visualization": "insights_visualization",
+    }
+
+    def execute(task: WorkflowTask) -> dict[str, Any]:
+        role = stage_roles[task.task_type]
+        argument_refs = [
+            item
+            for item in task.input_references
+            if isinstance(item, dict)
+            and item.get("type") == "tool_arguments"
+            and item.get("tool") == task.task_type
+        ]
+        if len(argument_refs) != 1 or not isinstance(
+            argument_refs[0].get("arguments"), dict
+        ):
+            raise WorkflowTaskExecutionError(
+                "specialist_input_invalid",
+                "Stored specialist task inputs are missing or ambiguous.",
+            )
+        task_arguments = argument_refs[0]["arguments"]
+        operation = task_arguments.get("requested_operation")
+        requested_arguments = task_arguments.get("requested_arguments")
+        source_fingerprint = task_arguments.get("source_fingerprint")
+        if (
+            not isinstance(operation, str)
+            or not isinstance(requested_arguments, dict)
+            or not isinstance(source_fingerprint, str)
+        ):
+            raise WorkflowTaskExecutionError(
+                "specialist_input_invalid",
+                "Stored specialist task inputs failed validation.",
+            )
+        dependencies = sorted(
+            (
+                session.get(WorkflowTask, edge.depends_on_task_id)
+                for edge in task.dependencies
+            ),
+            key=lambda dependency: dependency.sequence if dependency else 0,
+        )
+        if any(dependency is None for dependency in dependencies):
+            raise WorkflowTaskExecutionError(
+                "specialist_dependency_invalid",
+                "A specialist dependency is no longer available.",
+            )
+        dependency_tasks = [item for item in dependencies if item is not None]
+        dependency_task_ids = [item.task_key for item in dependency_tasks]
+
+        def dependency_handoff(expected_role: str) -> tuple[WorkflowTask, SpecialistHandoff]:
+            matches = [
+                item for item in dependency_tasks if item.agent == expected_role
+            ]
+            if len(matches) != 1:
+                raise WorkflowTaskExecutionError(
+                    "specialist_dependency_invalid",
+                    "The required specialist handoff is missing or ambiguous.",
+                )
+            dependency = matches[0]
+            result = dependency.result_summary
+            data = result.get("data") if isinstance(result, dict) else None
+            try:
+                handoff = SpecialistHandoff.model_validate(
+                    data.get("handoff") if isinstance(data, dict) else None
+                )
+            except (ValidationError, TypeError, ValueError):
+                raise WorkflowTaskExecutionError(
+                    "specialist_handoff_invalid",
+                    "A specialist dependency handoff failed validation.",
+                ) from None
+            dependency_arguments = [
+                item
+                for item in dependency.input_references
+                if isinstance(item, dict)
+                and item.get("type") == "tool_arguments"
+                and item.get("tool") == dependency.task_type
+            ]
+            expected_dependencies = [
+                item.task_key for item in dependency_tasks
+                if any(
+                    edge.depends_on_task_id == item.id
+                    for edge in dependency.dependencies
+                )
+            ]
+            expected_parameters = (
+                dependency_arguments[0]
+                .get("arguments", {})
+                .get("requested_arguments")
+                if len(dependency_arguments) == 1
+                and isinstance(dependency_arguments[0].get("arguments"), dict)
+                else None
+            )
+            if (
+                not handoff.verified
+                or handoff.stage != expected_role
+                or handoff.dataset_id != dependency.dataset_id
+                or handoff.file_id != dependency.file_id
+                or handoff.parameters != expected_parameters
+                or handoff.dependency_task_ids != expected_dependencies
+                or handoff.artifact_references
+                != handoff.output.get("evidence_references")
+                or expected_role == "data_intelligence"
+                and not isinstance(handoff.verified_schema, dict)
+            ):
+                raise WorkflowTaskExecutionError(
+                    "specialist_handoff_invalid",
+                    "A specialist dependency handoff is not verified.",
+                )
+            return dependency, handoff
+
+        inspection_result = None
+        inspection: dict[str, Any] = {}
+        verified_schema = None
+        actual_operations: list[dict[str, Any]] = []
+        handoff_warnings: list[str] = []
+        artifact_references: list[dict[str, Any]] | None = None
+        if role in {"data_intelligence", "analytics_modelling"}:
+            if not registry.is_engine_operation(operation):
+                raise WorkflowTaskExecutionError(
+                    "specialist_operation_invalid",
+                    "The persisted specialist operation is not an allowed engine operation.",
+                )
+            inspection_result = registry.prepare_engine_inspection(
+                operation,
+                requested_arguments,
+                context=context,
+            )
+            if inspection_result.status != "succeeded" or not isinstance(
+                inspection_result.data, dict
+            ):
+                raise WorkflowTaskExecutionError(
+                    "specialist_source_unavailable",
+                    "The selected-file source could not be revalidated.",
+                )
+            inspection = inspection_result.data
+            if inspection.get("source_fingerprint") != source_fingerprint:
+                raise WorkflowTaskExecutionError(
+                    "specialist_source_changed",
+                    "The selected-file source version changed before recovery.",
+                )
+
+        if role == "data_intelligence":
+            if dependency_tasks:
+                raise WorkflowTaskExecutionError(
+                    "specialist_dependency_invalid",
+                    "Data Intelligence cannot depend on a later workflow stage.",
+                )
+            material = {
+                "objective": objective,
+                "operation": operation,
+                "arguments": requested_arguments,
+                "inspection": inspection,
+                "evidence_references": list(inspection_result.references),
+            }
+            if _fingerprint_json(material) != task_arguments.get(
+                "stage_input_fingerprint"
+            ):
+                raise WorkflowTaskExecutionError(
+                    "specialist_source_changed",
+                    "The Data Intelligence inputs no longer match their persisted fingerprint.",
+                )
+            try:
+                verified_schema = verified_schema_summary(inspection)
+            except SpecialistAgentError as error:
+                raise WorkflowTaskExecutionError(error.code, error.message) from None
+            session.commit()
+            try:
+                output, model_name = run_data_intelligence(
+                    router,
+                    objective=objective,
+                    workflow_id=workflow_id,
+                    conversation_id=conversation_id,
+                    inspection=inspection,
+                    operation=operation,
+                    evidence_references=list(inspection_result.references),
+                )
+            except SpecialistAgentError as error:
+                raise WorkflowTaskExecutionError(error.code, error.message) from None
+        elif role == "analytics_modelling":
+            data_task, data_handoff = dependency_handoff("data_intelligence")
+            if (
+                dependency_task_ids != [data_task.task_key]
+                or data_handoff.source_fingerprint != source_fingerprint
+                or data_handoff.dependency_task_ids
+            ):
+                raise WorkflowTaskExecutionError(
+                    "specialist_handoff_stale",
+                    "The Data Intelligence handoff belongs to a different source version.",
+                )
+            data_output = data_handoff.output
+            material = {
+                "objective": objective,
+                "operation": operation,
+                "arguments": requested_arguments,
+                "inspection": inspection,
+                "data_intelligence": data_output,
+            }
+            if _fingerprint_json(material) != task_arguments.get(
+                "stage_input_fingerprint"
+            ):
+                raise WorkflowTaskExecutionError(
+                    "specialist_source_changed",
+                    "The Analytics inputs no longer match their persisted fingerprint.",
+                )
+            session.commit()
+            try:
+                output, model_name = run_analytics_decision(
+                    router,
+                    objective=objective,
+                    workflow_id=workflow_id,
+                    conversation_id=conversation_id,
+                    inspection=inspection,
+                    data_intelligence=data_output,
+                    tool_name=operation,
+                    arguments=requested_arguments,
+                )
+            except SpecialistAgentError as error:
+                raise WorkflowTaskExecutionError(error.code, error.message) from None
+        else:
+            data_task, data_handoff = dependency_handoff("data_intelligence")
+            analytics_task, analytics_handoff = dependency_handoff(
+                "analytics_modelling"
+            )
+            engine_tasks = [
+                item
+                for item in dependency_tasks
+                if item.task_type == operation and item.agent == "registered_tool"
+            ]
+            if len(engine_tasks) != 1:
+                raise WorkflowTaskExecutionError(
+                    "specialist_dependency_invalid",
+                    "The verified deterministic engine result is missing or ambiguous.",
+                )
+            engine_task = engine_tasks[0]
+            stored_engine = engine_task.result_summary
+            if (
+                not isinstance(stored_engine, dict)
+                or stored_engine.get("status") != "succeeded"
+                or not isinstance(stored_engine.get("data"), dict)
+            ):
+                raise WorkflowTaskExecutionError(
+                    "specialist_dependency_invalid",
+                    "The deterministic engine result is not successful.",
+                )
+            engine_data = {
+                **stored_engine["data"],
+                "agent1_model_result": data_handoff.output,
+                "agent2_model_result": analytics_handoff.output,
+                "agent_execution_models": {
+                    "data_intelligence": (
+                        data_task.result_summary.get("data", {}).get("model")
+                        if isinstance(data_task.result_summary, dict)
+                        else None
+                    ),
+                    "analytics_modelling": (
+                        analytics_task.result_summary.get("data", {}).get("model")
+                        if isinstance(analytics_task.result_summary, dict)
+                        else None
+                    ),
+                },
+            }
+            engine_result = {
+                "tool": operation,
+                "status": stored_engine.get("status"),
+                "summary": stored_engine.get("summary"),
+                "data": engine_data,
+                "warnings": stored_engine.get("warnings", []),
+                "references": stored_engine.get("references", []),
+                "limitations": stored_engine.get("limitations", []),
+                "error_code": stored_engine.get("error_code"),
+                "workflow_id": workflow_id,
+            }
+            if (
+                dependency_task_ids
+                != [
+                    data_task.task_key,
+                    analytics_task.task_key,
+                    engine_task.task_key,
+                ]
+                or data_handoff.dependency_task_ids
+                or analytics_handoff.dependency_task_ids
+                != [data_task.task_key]
+                or data_handoff.source_fingerprint != source_fingerprint
+                or analytics_handoff.source_fingerprint != source_fingerprint
+                or requested_arguments.get("dataset_id") != engine_data.get("dataset_id")
+                or requested_arguments.get("file_id") != engine_data.get("file_id")
+            ):
+                raise WorkflowTaskExecutionError(
+                    "specialist_handoff_stale",
+                    "The presentation inputs do not match the recorded source and artifact.",
+                )
+            actual_operations = [
+                {
+                    "operation": operation,
+                    "status": engine_result["status"],
+                    "execution_fingerprint": _fingerprint_json(engine_result),
+                }
+            ]
+            handoff_warnings = [
+                item for item in engine_result["warnings"] if isinstance(item, str)
+            ]
+            artifact_references = [
+                item
+                for item in engine_result["references"]
+                if isinstance(item, dict)
+            ]
+            material = {
+                "objective": objective,
+                "data_intelligence": data_handoff.output,
+                "engine_result": engine_result,
+            }
+            if _fingerprint_json(material) != task_arguments.get(
+                "stage_input_fingerprint"
+            ):
+                raise WorkflowTaskExecutionError(
+                    "specialist_handoff_stale",
+                    "The presentation inputs no longer match their persisted fingerprint.",
+                )
+            session.commit()
+            try:
+                output, model_name = run_presentation(
+                    router,
+                    objective=objective,
+                    workflow_id=workflow_id,
+                    conversation_id=conversation_id,
+                    data_intelligence=data_handoff.output,
+                    engine_result=engine_result,
+                    allowed_references=[
+                        item
+                        for item in engine_result["references"]
+                        if isinstance(item, dict)
+                    ],
+                )
+            except SpecialistAgentError as error:
+                raise WorkflowTaskExecutionError(error.code, error.message) from None
+
+        if output is None:
+            raise WorkflowTaskExecutionError(
+                "specialist_output_invalid",
+                "The specialist returned no validated output.",
+            )
+        return _persisted_specialist_result(
+            stage=role,
+            operation=operation,
+            source_fingerprint=source_fingerprint,
+            dataset_id=task.dataset_id,
+            file_id=task.file_id,
+            dependency_task_ids=dependency_task_ids,
+            output=output,
+            model_name=model_name,
+            parameters=requested_arguments,
+            verified_schema=verified_schema,
+            actual_operations=actual_operations,
+            warnings=handoff_warnings,
+            artifact_references=artifact_references,
+        )
+
+    handlers: dict[str, Callable[[WorkflowTask], dict[str, Any]]] = {}
+    for task in workflow.tasks:
+        if task.task_type in stage_roles and task.agent == stage_roles[task.task_type]:
+            handlers[task.task_type] = execute
+    return handlers
 
 
 def _require_workspace_owner(session: SessionLocal) -> User:
@@ -1493,6 +1978,17 @@ def recover_chat_workflow(workflow_id: str):
 
                 handlers[task.task_type] = execute_recovered_tool
 
+            handlers.update(
+                _specialist_recovery_handlers(
+                    session,
+                    workflow,
+                    registry,
+                    recovery_context,
+                )
+            )
+            requires_conversation_continuation = (
+                workflow.error_code == "specialist_recovery_requires_continuation"
+            )
             workflow, recovery = recover_persisted_workflow(
                 session,
                 workflow.id,
@@ -1501,6 +1997,26 @@ def recover_chat_workflow(workflow_id: str):
                 stale_before=stale_before,
                 max_steps=MAX_WORKFLOW_TASKS,
             )
+            if (
+                workflow.status == "completed"
+                and (
+                    requires_conversation_continuation
+                    or any(
+                        task.task_key in recovery["recovered"]
+                        and task.agent
+                        in {
+                            "data_intelligence",
+                            "analytics_modelling",
+                            "insights_visualization",
+                        }
+                        for task in workflow.tasks
+                    )
+                )
+            ):
+                workflow.status = "partial"
+                workflow.error_code = "specialist_recovery_requires_continuation"
+                workflow.completed_at = _utcnow()
+                session.commit()
             session.refresh(workflow)
             return {
                 "workflow_id": workflow.id,

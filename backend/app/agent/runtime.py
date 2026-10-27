@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
 from dataclasses import replace
@@ -32,10 +33,16 @@ from app.agent.orchestrator import (
 )
 from app.agent.providers import ModelProvider, create_provider
 from app.agent.specialist_agents import (
+    AnalyticsDecision,
+    DataIntelligenceResult,
+    PresentationResult,
     SpecialistAgentError,
+    SpecialistHandoff,
+    build_specialist_handoff,
     run_analytics_decision,
     run_data_intelligence,
     run_presentation,
+    verified_schema_summary,
 )
 from app.agent.tools import TOOL_DEFINITIONS, ToolRegistry
 
@@ -379,10 +386,14 @@ def execute_agent_request(
     max_tool_calls = min(selected_settings.max_tool_calls, MAX_TOOL_CALLS)
     turn_limit_reached = True
     engine_request_scope: dict[str, int | None] | None = None
+    specialist_task_keys: dict[str, str] = {}
+    engine_task_keys: list[str] = []
 
     def execute_registered_tool(
         name: str,
         arguments: dict[str, Any],
+        *,
+        depends_on: list[str] | None = None,
     ) -> tuple[str, ToolResult, str]:
         execute = lambda: selected_registry.execute(
             name,
@@ -398,8 +409,141 @@ def execute_agent_request(
             execute,
             idempotent=is_read_only,
             max_retries=1 if is_read_only else 0,
+            depends_on=depends_on,
         )
+        if selected_registry.is_engine_operation(name) and _task_key is not None:
+            engine_task_keys.append(_task_key)
         return raw_output, result, label
+
+    def run_specialist_stage(
+        *,
+        role: str,
+        operation: str,
+        arguments: dict[str, Any],
+        source_fingerprint: str,
+        dependency_task_ids: list[str],
+        input_material: dict[str, Any],
+        runner: Callable[[], tuple[Any, str]],
+        parameters: dict[str, Any] | None = None,
+        verified_schema: dict[str, Any] | None = None,
+        actual_operations: list[dict[str, Any]] | None = None,
+        handoff_warnings: list[str] | None = None,
+        artifact_references: list[dict[str, Any]] | None = None,
+    ) -> tuple[Any, str, str | None]:
+        stage_fingerprint = hashlib.sha256(
+            json.dumps(
+                input_material,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        task_type = f"specialist_{role}"
+        task_arguments = {
+            "dataset_id": arguments.get("dataset_id", request_context.get("dataset_id")),
+            "file_id": arguments.get("file_id"),
+            "requested_operation": operation,
+            "requested_arguments": arguments,
+            "stage_input_fingerprint": stage_fingerprint,
+            "source_fingerprint": source_fingerprint,
+        }
+
+        def execute_stage() -> tuple[str, ToolResult, str]:
+            try:
+                output, model_name = runner()
+            except SpecialistAgentError as error:
+                return (
+                    "",
+                    ToolResult(
+                        status="failed",
+                        summary=error.message,
+                        error_code=error.code,
+                    ),
+                    role,
+                )
+            _handoff, envelope, reference = build_specialist_handoff(
+                stage=role,
+                operation=operation,
+                source_fingerprint=source_fingerprint,
+                dataset_id=task_arguments["dataset_id"],
+                file_id=task_arguments["file_id"],
+                dependency_task_ids=dependency_task_ids,
+                output=output,
+                model_name=model_name,
+                parameters=parameters or task_arguments["requested_arguments"],
+                verified_schema=verified_schema,
+                actual_operations=actual_operations,
+                warnings=handoff_warnings,
+                artifact_references=artifact_references,
+            )
+            result = ToolResult(
+                status="succeeded",
+                summary=f"{role} completed with a validated handoff.",
+                data=envelope,
+                references=(reference,),
+            )
+            raw = json.dumps(
+                envelope,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            return raw, result, role
+
+        if workflow_scheduler is None:
+            _raw, result, _label = execute_stage()
+            if result.status != "succeeded" or not isinstance(result.data, dict):
+                raise SpecialistAgentError(
+                    result.error_code or "specialist_task_failed",
+                    result.summary or "The specialist stage did not complete.",
+                )
+            return result.data["handoff"]["output"], result.data["model"], None
+
+        raw, result, _label, task_key = workflow_scheduler(
+            task_type,
+            task_arguments,
+            execute_stage,
+            idempotent=True,
+            max_retries=1,
+            depends_on=dependency_task_ids,
+            agent=role,
+        )
+        if result.status != "succeeded" or not isinstance(result.data, dict):
+            raise SpecialistAgentError(
+                result.error_code or "specialist_task_failed",
+                result.summary or "The specialist stage did not complete.",
+            )
+        try:
+            handoff = SpecialistHandoff.model_validate(result.data.get("handoff"))
+            if (
+                handoff.stage != role
+                or handoff.requested_operation != operation
+                or handoff.source_fingerprint != source_fingerprint
+                or handoff.dataset_id != task_arguments["dataset_id"]
+                or handoff.file_id != task_arguments["file_id"]
+                or handoff.dependency_task_ids != dependency_task_ids
+                or handoff.parameters != task_arguments["requested_arguments"]
+                or handoff.artifact_references
+                != handoff.output.get("evidence_references")
+                or role == "data_intelligence"
+                and not isinstance(handoff.verified_schema, dict)
+                or role == "insights_visualization"
+                and (
+                    len(handoff.actual_operations) != 1
+                    or handoff.actual_operations[0].get("operation") != operation
+                    or handoff.actual_operations[0].get("status") != "succeeded"
+                )
+                or not handoff.verified
+            ):
+                raise ValueError("Specialist handoff does not match the scheduled task.")
+        except (TypeError, ValueError):
+            raise SpecialistAgentError(
+                "specialist_handoff_invalid",
+                "The persisted specialist handoff failed validation.",
+            ) from None
+        specialist_task_keys[role] = task_key or ""
+        return handoff.output, str(result.data.get("model") or ""), task_key
 
     for turn in range(selected_settings.max_model_turns):
         try:
@@ -525,7 +669,8 @@ def execute_agent_request(
                 )
 
             tool_calls_used += 1
-            claim_validation_required = True
+            if selected_registry.is_engine_operation(call.name):
+                claim_validation_required = True
             if (
                 selected_registry.is_engine_operation(call.name)
                 and engine_request_scope is None
@@ -567,16 +712,41 @@ def execute_agent_request(
                 specialist_error: SpecialistAgentError | None = None
                 if inspection_result.status == "succeeded":
                     try:
-                        agent1, agent1_model = run_data_intelligence(
-                            model_router,
-                            objective=user_message.strip(),
-                            workflow_id=request_context["workflow_id"],
-                            conversation_id=request_context.get("conversation_id"),
-                            inspection=agent1_data,
+                        source_fingerprint = agent1_data.get("source_fingerprint")
+                        if not isinstance(source_fingerprint, str) or not source_fingerprint:
+                            raise SpecialistAgentError(
+                                "specialist_source_unavailable",
+                                "The selected-file source version could not be verified.",
+                            )
+                        agent1_payload, agent1_model, agent1_task_key = run_specialist_stage(
+                            role="data_intelligence",
                             operation=call.name,
-                            evidence_references=list(inspection_result.references),
+                            arguments=call.arguments,
+                            source_fingerprint=source_fingerprint,
+                            dependency_task_ids=[],
+                            input_material={
+                                "objective": user_message.strip(),
+                                "operation": call.name,
+                                "arguments": call.arguments,
+                                "inspection": agent1_data,
+                                "evidence_references": list(inspection_result.references),
+                            },
+                            runner=lambda: run_data_intelligence(
+                                model_router,
+                                objective=user_message.strip(),
+                                workflow_id=request_context["workflow_id"],
+                                conversation_id=request_context.get("conversation_id"),
+                                inspection=agent1_data,
+                                operation=call.name,
+                                evidence_references=list(inspection_result.references),
+                            ),
+                            parameters=call.arguments,
+                            verified_schema=verified_schema_summary(agent1_data),
                         )
+                        agent1 = DataIntelligenceResult.model_validate(agent1_payload)
                         agent1_output = agent1.model_dump(mode="json")
+                        if agent1_task_key is not None:
+                            specialist_task_keys["data_intelligence"] = agent1_task_key
                         structured_results.append(
                             _specialist_result(
                                 tool_name="agent1_data_intelligence",
@@ -622,17 +792,42 @@ def execute_agent_request(
                     )
                 else:
                     try:
-                        analytics_decision, agent2_model = run_analytics_decision(
-                            model_router,
-                            objective=user_message.strip(),
-                            workflow_id=request_context["workflow_id"],
-                            conversation_id=request_context.get("conversation_id"),
-                            inspection=agent1_data,
-                            data_intelligence=agent1_output,
-                            tool_name=call.name,
+                        analytics_dependencies = (
+                            [specialist_task_keys["data_intelligence"]]
+                            if specialist_task_keys.get("data_intelligence")
+                            else []
+                        )
+                        analytics_payload, agent2_model, agent2_task_key = run_specialist_stage(
+                            role="analytics_modelling",
+                            operation=call.name,
                             arguments=call.arguments,
+                            source_fingerprint=source_fingerprint,
+                            dependency_task_ids=analytics_dependencies,
+                            input_material={
+                                "objective": user_message.strip(),
+                                "operation": call.name,
+                                "arguments": call.arguments,
+                                "inspection": agent1_data,
+                                "data_intelligence": agent1_output,
+                            },
+                            runner=lambda: run_analytics_decision(
+                                model_router,
+                                objective=user_message.strip(),
+                                workflow_id=request_context["workflow_id"],
+                                conversation_id=request_context.get("conversation_id"),
+                                inspection=agent1_data,
+                                data_intelligence=agent1_output,
+                                tool_name=call.name,
+                                arguments=call.arguments,
+                            ),
+                            parameters=call.arguments,
+                        )
+                        analytics_decision = AnalyticsDecision.model_validate(
+                            analytics_payload
                         )
                         analytics_output = analytics_decision.model_dump(mode="json")
+                        if agent2_task_key is not None:
+                            specialist_task_keys["analytics_modelling"] = agent2_task_key
                         structured_results.append(
                             _specialist_result(
                                 tool_name="agent2_analytics_decision",
@@ -673,6 +868,11 @@ def execute_agent_request(
                         _tool_output, result, label = execute_registered_tool(
                             call.name,
                             call.arguments,
+                            depends_on=(
+                                [specialist_task_keys["analytics_modelling"]]
+                                if specialist_task_keys.get("analytics_modelling")
+                                else None
+                            ),
                         )
                 if isinstance(result.data, dict) and inspection_result.status == "succeeded":
                     result = replace(
@@ -824,18 +1024,87 @@ def execute_agent_request(
                     dict,
                 ):
                     try:
-                        presentation, presentation_model = run_presentation(
-                            model_router,
-                            objective=user_message.strip(),
-                            workflow_id=request_context["workflow_id"],
-                            conversation_id=request_context.get("conversation_id"),
-                            data_intelligence=data_intelligence_result,
-                            engine_result=engine_results[0],
-                            allowed_references=[
+                        presentation_source = workflow_trace["data"].get(
+                            "source_identity"
+                        )
+                        presentation_source_fingerprint = (
+                            presentation_source.get("source_fingerprint")
+                            if isinstance(presentation_source, dict)
+                            else None
+                        )
+                        if not isinstance(presentation_source_fingerprint, str):
+                            raise SpecialistAgentError(
+                                "specialist_source_unavailable",
+                                "The engine result source version could not be verified.",
+                            )
+                        presentation_dependencies = [
+                            task_key
+                            for task_key in (
+                                specialist_task_keys.get("data_intelligence"),
+                                specialist_task_keys.get("analytics_modelling"),
+                                engine_task_keys[-1] if engine_task_keys else None,
+                            )
+                            if task_key
+                        ]
+                        presentation_payload, presentation_model, _ = run_specialist_stage(
+                            role="insights_visualization",
+                            operation=str(engine_results[0].get("tool", "")),
+                            arguments={
+                                "dataset_id": engine_request_scope.get("dataset_id"),
+                                "file_id": engine_request_scope.get("file_id"),
+                            },
+                            source_fingerprint=presentation_source_fingerprint,
+                            dependency_task_ids=presentation_dependencies,
+                            input_material={
+                                "objective": user_message.strip(),
+                                "data_intelligence": data_intelligence_result,
+                                "engine_result": engine_results[0],
+                            },
+                            runner=lambda: run_presentation(
+                                model_router,
+                                objective=user_message.strip(),
+                                workflow_id=request_context["workflow_id"],
+                                conversation_id=request_context.get("conversation_id"),
+                                data_intelligence=data_intelligence_result,
+                                engine_result=engine_results[0],
+                                allowed_references=[
+                                    item
+                                    for item in engine_results[0].get("references", [])
+                                    if isinstance(item, dict)
+                                ],
+                            ),
+                            parameters={
+                                "dataset_id": engine_request_scope.get("dataset_id"),
+                                "file_id": engine_request_scope.get("file_id"),
+                            },
+                            actual_operations=[
+                                {
+                                    "operation": str(engine_results[0].get("tool", "")),
+                                    "status": engine_results[0].get("status"),
+                                    "execution_fingerprint": hashlib.sha256(
+                                        json.dumps(
+                                            engine_results[0],
+                                            ensure_ascii=False,
+                                            allow_nan=False,
+                                            sort_keys=True,
+                                            separators=(",", ":"),
+                                        ).encode("utf-8")
+                                    ).hexdigest(),
+                                }
+                            ],
+                            handoff_warnings=[
+                                warning
+                                for warning in engine_results[0].get("warnings", [])
+                                if isinstance(warning, str)
+                            ],
+                            artifact_references=[
                                 item
                                 for item in engine_results[0].get("references", [])
                                 if isinstance(item, dict)
                             ],
+                        )
+                        presentation = PresentationResult.model_validate(
+                            presentation_payload
                         )
                         presentation_data = presentation.model_dump(mode="json")
                         structured_results.append(

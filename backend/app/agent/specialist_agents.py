@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -78,6 +79,29 @@ class PresentationResult(_StrictContract):
     visualization_specification: dict[str, Any] | None = None
 
 
+class SpecialistHandoff(_StrictContract):
+    contract_version: Literal[1]
+    stage: Literal[
+        "data_intelligence",
+        "analytics_modelling",
+        "insights_visualization",
+    ]
+    requested_operation: StrictStr = Field(min_length=1, max_length=96)
+    recommended_operation: StrictStr | None = Field(default=None, max_length=96)
+    executed_operation: StrictStr | None = Field(default=None, max_length=96)
+    verified: bool
+    source_fingerprint: StrictStr = Field(min_length=1, max_length=128)
+    dataset_id: StrictInt | None
+    file_id: StrictInt | None
+    dependency_task_ids: list[StrictStr] = Field(max_length=8)
+    parameters: dict[str, Any]
+    verified_schema: dict[str, Any] | None
+    actual_operations: list[dict[str, Any]] = Field(max_length=8)
+    warnings: list[StrictStr] = Field(max_length=32)
+    artifact_references: list[dict[str, Any]] = Field(max_length=32)
+    output: dict[str, Any]
+
+
 _NUMERIC_ASSERTION = re.compile(r"\b\d+(?:\.\d+)?\b")
 
 
@@ -86,6 +110,150 @@ class SpecialistAgentError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+def verified_schema_summary(inspection: dict[str, Any]) -> dict[str, Any]:
+    profile = inspection.get("profile")
+    tables = profile.get("tables") if isinstance(profile, dict) else None
+    if not isinstance(tables, list):
+        raise SpecialistAgentError(
+            "specialist_schema_unavailable",
+            "A verified profile is unavailable for the selected file.",
+        )
+    summary = {"tables": []}
+    for table_index, table in enumerate(tables[:12]):
+        if not isinstance(table, dict):
+            continue
+        columns = table.get("columns")
+        if not isinstance(columns, list):
+            continue
+        column_summaries = []
+        for column in columns[:64]:
+            if not isinstance(column, dict) or not isinstance(column.get("name"), str):
+                continue
+            physical_types = column.get("physical_types", [])
+            column_summary = {
+                "name": column["name"],
+                "physical_types": [
+                    item
+                    for item in physical_types[:4]
+                    if isinstance(item, str)
+                ]
+                if isinstance(physical_types, list)
+                else [],
+            }
+            for count_name in (
+                "missing_value_count",
+                "empty_value_count",
+                "distinct_value_count",
+            ):
+                count = column.get(count_name)
+                if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+                    column_summary[count_name] = count
+            column_summaries.append(column_summary)
+        table_summary = {
+            "table_index": table_index,
+            "columns": column_summaries,
+        }
+        for count_name in ("row_count", "column_count"):
+            count = table.get(count_name)
+            if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+                table_summary[count_name] = count
+        summary["tables"].append(table_summary)
+    try:
+        encoded = json.dumps(
+            summary,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError, OverflowError):
+        raise SpecialistAgentError(
+            "specialist_schema_invalid",
+            "The verified profile could not be safely encoded.",
+        ) from None
+    if not summary["tables"] or len(encoded) > 8 * 1024:
+        raise SpecialistAgentError(
+            "specialist_schema_too_large",
+            "The verified profile exceeded its safe handoff limit.",
+        )
+    return summary
+
+
+def build_specialist_handoff(
+    *,
+    stage: str,
+    operation: str,
+    source_fingerprint: str,
+    dataset_id: int | None,
+    file_id: int | None,
+    dependency_task_ids: list[str],
+    output: BaseModel,
+    model_name: str,
+    parameters: dict[str, Any],
+    verified_schema: dict[str, Any] | None = None,
+    actual_operations: list[dict[str, Any]] | None = None,
+    warnings: list[str] | None = None,
+    artifact_references: list[dict[str, Any]] | None = None,
+) -> tuple[SpecialistHandoff, dict[str, Any], dict[str, Any]]:
+    recommended_operation = (
+        output.recommended_operation
+        if isinstance(output, DataIntelligenceResult)
+        else output.tool_name
+        if isinstance(output, AnalyticsDecision)
+        else None
+    )
+    executed_operation = (
+        operation if isinstance(output, PresentationResult) else None
+    )
+    if artifact_references is None:
+        output_references = getattr(output, "evidence_references", [])
+        artifact_references = (
+            [dict(item) for item in output_references if isinstance(item, dict)]
+            if isinstance(output_references, list)
+            else []
+        )
+    handoff = SpecialistHandoff.model_validate(
+        {
+            "contract_version": 1,
+            "stage": stage,
+            "requested_operation": operation,
+            "recommended_operation": recommended_operation,
+            "executed_operation": executed_operation,
+            "verified": True,
+            "source_fingerprint": source_fingerprint,
+            "dataset_id": dataset_id,
+            "file_id": file_id,
+            "dependency_task_ids": dependency_task_ids,
+            "parameters": parameters,
+            "verified_schema": verified_schema,
+            "actual_operations": actual_operations or [],
+            "warnings": warnings or [],
+            "artifact_references": artifact_references,
+            "output": output.model_dump(mode="json"),
+        }
+    )
+    envelope = {
+        "handoff": handoff.model_dump(mode="json"),
+        "model": model_name,
+    }
+    reference = {
+        "type": "specialist_handoff",
+        "stage": stage,
+        "source_fingerprint": source_fingerprint,
+        "dataset_id": dataset_id,
+        "file_id": file_id,
+        "sha256": hashlib.sha256(
+            json.dumps(
+                envelope,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+    return handoff, envelope, reference
 
 
 def _invoke(

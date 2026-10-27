@@ -20,6 +20,7 @@ from app.agent.contracts import (
     ToolResult,
     UsageMetadata,
 )
+from app.agent.model_router import AgentModelRouter
 from app.agent.providers import OpenAICompatibleProvider, OllamaProvider, create_provider
 from app.agent.runtime import SYSTEM_INSTRUCTIONS, execute_agent_request
 from app.agent.tools import StrictArguments, ToolDefinition, ToolRegistry
@@ -185,6 +186,54 @@ class AgentProviderTests(unittest.TestCase):
         self.assertEqual(response.usage, UsageMetadata(4, 2))
         self.assertEqual(client.request[1], "http://provider.invalid/api/chat")
         self.assertNotIn("think", client.request[2])
+
+    def test_ollama_uses_role_routed_model_for_generation(self):
+        client = FakeHttpClient(
+            FakeHttpResponse({
+                "message": {"role": "assistant", "content": "Ready."},
+                "done_reason": "stop",
+            })
+        )
+        router = AgentModelRouter(
+            settings=settings(model="qwen3:8b"),
+            provider=OllamaProvider(settings(model="qwen3:8b")),
+        )
+        with patch("app.agent.providers.httpx2.Client", return_value=client):
+            with patch.dict(
+                os.environ,
+                {"INSIGHTOS_LLM_MODEL_DATA_INTELLIGENCE": "qwen3:0.6b"},
+            ):
+                router.complete(
+                    "data_intelligence",
+                    ModelRequest("ignored", (), (), 32),
+                )
+
+        self.assertEqual(client.request[2]["model"], "qwen3:0.6b")
+
+    def test_ollama_default_model_fallback_reaches_generation_payload(self):
+        client = FakeHttpClient(
+            FakeHttpResponse({
+                "message": {"role": "assistant", "content": "Ready."},
+                "done_reason": "stop",
+            })
+        )
+        configured = settings(model="qwen3:8b")
+        router = AgentModelRouter(
+            settings=configured,
+            provider=OllamaProvider(configured),
+        )
+        with patch("app.agent.providers.httpx2.Client", return_value=client):
+            with patch.dict(
+                os.environ,
+                {"INSIGHTOS_LLM_MODEL_DATA_INTELLIGENCE": ""},
+            ):
+                selected = router.complete(
+                    "data_intelligence",
+                    ModelRequest("ignored", (), (), 32),
+                )
+
+        self.assertEqual(selected.model, "qwen3:8b")
+        self.assertEqual(client.request[2]["model"], "qwen3:8b")
 
     def test_ollama_disables_thinking_for_qwen3_models(self):
         client = FakeHttpClient(
@@ -375,6 +424,67 @@ class AgentProviderTests(unittest.TestCase):
         self.assertEqual(response.message.tool_calls[0].arguments, {})
         self.assertEqual(response.usage, UsageMetadata(5, 3))
         self.assertEqual(client.request[3]["Authorization"], "Bearer fixture-secret")
+
+    def test_openai_compatible_uses_role_routed_model_for_generation(self):
+        client = FakeHttpClient(
+            FakeHttpResponse({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "Ready."},
+                    "finish_reason": "stop",
+                }],
+            })
+        )
+        configured = settings(
+            "openai_compatible",
+            model="default-model",
+            api_key="fixture-secret",
+        )
+        router = AgentModelRouter(
+            settings=configured,
+            provider=OpenAICompatibleProvider(configured),
+        )
+        with patch("app.agent.providers.httpx2.Client", return_value=client):
+            with patch.dict(
+                os.environ,
+                {"INSIGHTOS_LLM_MODEL_DATA_INTELLIGENCE": "role-specific-model"},
+            ):
+                router.complete(
+                    "data_intelligence",
+                    ModelRequest("ignored", (), (), 32),
+                )
+
+        self.assertEqual(client.request[2]["model"], "role-specific-model")
+
+    def test_openai_default_model_fallback_reaches_generation_payload(self):
+        client = FakeHttpClient(
+            FakeHttpResponse({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "Ready."},
+                    "finish_reason": "stop",
+                }],
+            })
+        )
+        configured = settings(
+            "openai_compatible",
+            model="default-model",
+            api_key="fixture-secret",
+        )
+        router = AgentModelRouter(
+            settings=configured,
+            provider=OpenAICompatibleProvider(configured),
+        )
+        with patch("app.agent.providers.httpx2.Client", return_value=client):
+            with patch.dict(
+                os.environ,
+                {"INSIGHTOS_LLM_MODEL_DATA_INTELLIGENCE": ""},
+            ):
+                selected = router.complete(
+                    "data_intelligence",
+                    ModelRequest("ignored", (), (), 32),
+                )
+
+        self.assertEqual(selected.model, "default-model")
+        self.assertEqual(client.request[2]["model"], "default-model")
 
     def test_openai_json_mode_is_forwarded_to_provider(self):
         client = FakeHttpClient(
@@ -919,23 +1029,33 @@ class AgentProviderTests(unittest.TestCase):
         self.assertEqual(outcome.error_code, "response_truncated")
         self.assertEqual(outcome.assistant_text, "The answer is")
 
-    def test_runtime_executes_allowlisted_tool_then_returns_answer(self):
-        class Registry(ToolRegistry):
-            def __init__(self):
-                super().__init__((
-                    ToolDefinition(
-                        name="list_projects",
-                        label="Finding projects",
-                        description="List projects.",
-                        arguments_model=EmptyArguments,
-                        execute=lambda _args: ToolResult(
-                            status="succeeded",
-                            summary="Found one project.",
-                            data=[{"id": 1, "name": "Project"}],
-                        ),
-                    ),
-                ))
+    def _run_list_projects_tool(
+        self,
+        projects,
+        *,
+        user_message="List projects",
+        context=None,
+        final_text,
+    ):
+        executed = []
 
+        def list_projects(_args):
+            executed.append(True)
+            return ToolResult(
+                status="succeeded",
+                summary=f"Found {len(projects)} project(s).",
+                data=projects,
+            )
+
+        registry = ToolRegistry((
+            ToolDefinition(
+                name="list_projects",
+                label="Finding projects",
+                description="List projects.",
+                arguments_model=EmptyArguments,
+                execute=list_projects,
+            ),
+        ))
         provider = SequenceProvider([
             ModelResponse(
                 ProviderMessage(
@@ -946,23 +1066,85 @@ class AgentProviderTests(unittest.TestCase):
                 finish_reason="tool_calls",
             ),
             ModelResponse(
-                ProviderMessage(role="assistant", content="There is one project."),
+                ProviderMessage(role="assistant", content=final_text),
                 finish_reason="stop",
             ),
         ])
         outcome = execute_agent_request(
-            user_message="List projects",
+            user_message=user_message,
             history=[],
             settings=settings(),
             provider=provider,
-            registry=Registry(),
+            registry=registry,
+            context=context,
         )
-        self.assertEqual(outcome.status, "partial")
-        self.assertEqual(len(outcome.activities), 1)
-        self.assertEqual(outcome.structured_results[0]["data"], [{"id": 1, "name": "Project"}])
-        self.assertEqual(provider.requests[1].messages[-1].role, "tool")
-        self.assertNotIn("There is one project", outcome.assistant_text)
 
+        self.assertEqual(len(executed), 1)
+        self.assertEqual(len(outcome.activities), 1)
+        self.assertEqual(outcome.activities[0].tool_name, "list_projects")
+        self.assertEqual(outcome.activities[0].status, "succeeded")
+        self.assertEqual(
+            outcome.structured_results[0]["data"],
+            projects,
+        )
+        self.assertEqual(len(provider.requests), 2)
+        self.assertEqual(provider.requests[1].messages[-1].role, "tool")
+        return outcome, provider
+
+    def test_runtime_finalizes_successful_project_listing_once(self):
+        projects = [
+            {"id": 1, "name": "Project One"},
+            {"id": 2, "name": "Project Two"},
+        ]
+        outcome, provider = self._run_list_projects_tool(
+            projects,
+            final_text="The available projects are Project One and Project Two.",
+        )
+
+        self.assertEqual(outcome.status, "completed")
+        self.assertEqual(
+            outcome.assistant_text,
+            "The available projects are Project One and Project Two.",
+        )
+        self.assertIsNone(provider.requests[1].response_format)
+        self.assertFalse(
+            any(
+                result.get("tool") == "claim_validator"
+                for result in outcome.structured_results
+            )
+        )
+
+    def test_runtime_finalizes_empty_project_listing_truthfully(self):
+        outcome, _provider = self._run_list_projects_tool(
+            [],
+            final_text="There are no projects available.",
+        )
+
+        self.assertEqual(outcome.status, "completed")
+        self.assertEqual(
+            outcome.assistant_text,
+            "There are no projects available.",
+        )
+
+    def test_dataset_numerical_claim_after_read_only_tool_still_requires_evidence(self):
+        outcome, provider = self._run_list_projects_tool(
+            [{"id": 1, "name": "Project One"}],
+            user_message="How many rows are in the selected dataset?",
+            context={"dataset_id": 1},
+            final_text="The selected dataset has 999 rows.",
+        )
+
+        self.assertEqual(outcome.status, "partial")
+        self.assertEqual(outcome.error_code, "claim_validation_incomplete")
+        self.assertIn("couldn't validate", outcome.assistant_text)
+        self.assertNotIn("999", outcome.assistant_text)
+        self.assertEqual(provider.requests[0].response_format, "json")
+        self.assertEqual(provider.requests[1].response_format, "json")
+        self.assertEqual(outcome.structured_results[-1]["tool"], "claim_validator")
+        self.assertEqual(
+            outcome.structured_results[-1]["data"]["claims"][0]["reason_code"],
+            "claim_envelope_invalid",
+        )
 
     def test_no_provider_returns_explicit_unavailable_outcome(self):
         outcome = execute_agent_request(

@@ -372,20 +372,20 @@ class OllamaProvider(_HttpProvider):
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         self._validate_request_capabilities(request)
-        if not self.settings.model:
+        if not isinstance(request.model, str) or not request.model.strip():
             raise ProviderError(
                 "provider_not_configured",
-                "Configure OLLAMA_MODEL before using the local model provider.",
+                "Configure a model before using the local model provider.",
             )
         thinking_options = (
             {"think": False}
-            if self.settings.model.casefold().startswith("qwen3")
+            if request.model.casefold().startswith("qwen3")
             else {}
         )
         payload = self._post(
             f"{self.settings.base_url}/api/chat",
             {
-                "model": self.settings.model,
+                "model": request.model,
                 "messages": [
                     _ollama_message_dict(message) for message in request.messages
                 ],
@@ -486,16 +486,20 @@ class OpenAICompatibleProvider(_HttpProvider):
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         self._validate_request_capabilities(request)
-        if not self.settings.model or not self.settings.api_key:
+        if (
+            not isinstance(request.model, str)
+            or not request.model.strip()
+            or not self.settings.api_key
+        ):
             raise ProviderError(
                 "provider_not_configured",
-                "Configure OPENAI_COMPATIBLE_MODEL and OPENAI_COMPATIBLE_API_KEY before using this provider.",
+                "A model and API key are required for the OpenAI-compatible provider.",
             )
         endpoint = self._endpoint("chat/completions")
         payload = self._post(
             endpoint,
             {
-                "model": self.settings.model,
+                "model": request.model,
                 "messages": [_message_dict(message) for message in request.messages],
                 "tools": list(request.tools),
                 "tool_choice": "auto",

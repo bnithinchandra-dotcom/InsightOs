@@ -1,10 +1,13 @@
+import threading
 import unittest
+from dataclasses import replace
 from unittest.mock import Mock, patch
 
 from app.agent.config import AgentSettings
 from app.agent.contracts import (
     ModelRequest,
     ModelResponse,
+    ProviderError,
     ProviderMessage,
 )
 from app.agent.model_router import AgentModelRouter
@@ -100,6 +103,56 @@ class ModelRouterTests(unittest.TestCase):
                 ),
             )
         self.assertEqual(selected.model, "qwen3:4b")
+
+    def test_waiting_for_inference_slot_times_out_without_calling_provider(self):
+        lock = threading.BoundedSemaphore(1)
+        self.assertTrue(lock.acquire(blocking=False))
+        router = AgentModelRouter(
+            settings=replace(_settings(), timeout_seconds=0.01),
+            provider=self.provider,
+        )
+        request = ModelRequest(
+            model="ignored",
+            messages=(ProviderMessage(role="user", content="wait"),),
+            tools=(),
+            max_output_tokens=16,
+        )
+
+        with patch.object(AgentModelRouter, "_generation_lock", lock):
+            with self.assertRaises(ProviderError) as raised:
+                router.complete("orchestrator", request)
+
+        self.assertEqual(raised.exception.code, "provider_timeout")
+        self.assertTrue(raised.exception.retryable)
+        self.provider.complete.assert_not_called()
+        lock.release()
+
+    def test_inference_slot_is_released_when_provider_raises(self):
+        lock = threading.BoundedSemaphore(1)
+        failing_provider = Mock()
+        failing_provider.complete.side_effect = RuntimeError("provider failure")
+        router = AgentModelRouter(settings=_settings(), provider=failing_provider)
+        request = ModelRequest(
+            model="ignored",
+            messages=(ProviderMessage(role="user", content="release"),),
+            tools=(),
+            max_output_tokens=16,
+        )
+
+        with patch.object(AgentModelRouter, "_generation_lock", lock):
+            with self.assertRaisesRegex(RuntimeError, "provider failure"):
+                router.complete("orchestrator", request)
+            self.provider.complete.return_value = ModelResponse(
+                message=ProviderMessage(role="assistant", content="{}"),
+                finish_reason="stop",
+            )
+            succeeding_router = AgentModelRouter(
+                settings=_settings(),
+                provider=self.provider,
+            )
+            result = succeeding_router.complete("orchestrator", request)
+
+        self.assertEqual(result.response.message.content, "{}")
 
 
 if __name__ == "__main__":

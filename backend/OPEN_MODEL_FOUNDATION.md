@@ -227,7 +227,7 @@ GraphRAG system, fine-tuned model, or production-grade BI intelligence. Future
 work should compare real model evaluations on synthetic fixtures and keep
 model responses separate from deterministic result verification.
 
-## Dataset inspection orchestration slice (2026-10-26)
+## Dataset inspection orchestration slice (2026-10-26 snapshot)
 
 The chat runtime now routes a bounded set of dataset inspection questions
 (row/column counts, missing-value counts, observed physical types, and exact
@@ -241,14 +241,15 @@ evidence reference, retry count, and bounded step limit. The profile-based
 inspection route can run without a configured model; other requests continue
 through the configured provider and existing agent runtime.
 
-New totals, rankings, trends, forecasts, predictions, correlations, and
-anomaly analyses are not launched from chat. They return an explicit
-unsupported status rather than implying that the model computed them. A
-request for an absent column is compared against the validated file schema and
-reported as unsupported. This implementation does not add a durable task
-registry, a new evidence registry, file-level conversation persistence, or a
-new analytics engine. The current local owner guard is not authenticated
-multi-user access or tenant isolation.
+In this 2026-10-26 inspection-only snapshot, new totals, rankings, trends,
+forecasts, predictions, correlations, and anomaly analyses were not launched
+from chat. A request for an absent column was compared against the validated
+file schema and reported as unsupported. At that point the inspection slice
+did not add durable task records or a new analytics engine. The follow-up chat
+engine integration below adds bounded deterministic analytics/report tools
+and persisted workflow tasks; forecasts and predictions remain unsupported.
+The current local owner guard is not authenticated multi-user access or tenant
+isolation.
 
 On 2026-10-26, Ollama 0.40.11 listed `qwen3:8b`, `qwen3:4b`,
 `qwen3:4b-instruct`, and `qwen3:0.6b` as locally installed. The available
@@ -270,3 +271,35 @@ insufficient for 8B inference. For the dataset-inspection route, create a
 workspace profile, project, dataset, upload one CSV or Excel file through the
 existing UI, then select that dataset in the Assistant context. Real-data
 acceptance still requires a user-supplied file and a live application run.
+
+## Chat workflow and runtime configuration follow-up (2026-10-27)
+
+The current chat integration includes explicitly requested normalization,
+quality-analysis, and EDA operations, plus bounded deterministic
+multi-dataset analytics and evidence-backed reports. Registered tool tasks and
+validated arguments are persisted before execution. An explicit recovery
+endpoint can reuse valid completed read-only tasks and retry eligible stale,
+idempotent read-only tasks after validating their inputs. It does not replay
+engine operations or specialist model calls and does not run automatically at
+startup; this is not full crash recovery. See
+[`CHAT_ENGINE_INTEGRATION.md`](./CHAT_ENGINE_INTEGRATION.md) for tool and
+workflow limits.
+
+The ignored root `.env` observed on 2026-10-27 declares
+`INSIGHTOS_LLM_PROVIDER=ollama`, `OLLAMA_MODEL=qwen3:8b`,
+`INSIGHTOS_LLM_TIMEOUT_SECONDS=300`, and
+`INSIGHTOS_LLM_MAX_OUTPUT_TOKENS=512`. No role-specific model overrides were
+present in that file or the current PowerShell process, so when the `.env`
+values are supplied to the backend, all four roles inherit `qwen3:8b`.
+`ollama list` reported `qwen3:8b`, `qwen3:4b-instruct`, `qwen3:4b`, and
+`qwen3:0.6b`; the latter three are installed but not assigned to specialist
+roles. `ollama ps` showed no loaded model, and free physical memory was 1.72
+GiB. No inference was attempted because that reading does not establish
+sufficient headroom for loading the 8B or 4B model. Model generation,
+structured output, and model-selected tool use therefore remain unverified
+for this current configuration.
+
+The application reads configuration from its process environment and does not
+load `.env` itself; the effective provider still depends on how the backend is
+launched. No provider settings were changed, no model was downloaded or
+loaded, and no credentials were recorded in this report.

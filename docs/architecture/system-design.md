@@ -135,18 +135,19 @@ does not require parser-profile duplicate statistics.
 
 The assistant uses a provider-neutral request/response contract with Ollama
 and OpenAI-compatible chat-completions adapters. Provider selection defaults
-to `none`; provider configuration is checked without a network request, and
-network access occurs only when a user sends a message. Timeout, streamed
-provider response bytes, output tokens, model turns, tool calls, conversation
-history, tool output, and persisted response size have explicit bounds. A
-request runs synchronously in the API process; these limits are not
-process-wide memory or availability guarantees.
+to `none`; reading settings does not make a network request. The provider
+status endpoint checks runtime/model availability, while generation occurs
+only when a user sends a message. Timeout, streamed provider response bytes,
+output tokens, model turns, tool calls, conversation history, tool output, and
+persisted response size have explicit bounds. A request runs synchronously in
+the API process; these limits are not process-wide memory or availability
+guarantees.
 
 The API persists conversations and ordered user/assistant messages in
 `conversations` and `conversation_messages`. The endpoints are:
 
-- `GET /api/v1/chat/provider-status` — provider configuration state; does not
-  test network connectivity.
+- `GET /api/v1/chat/provider-status` — checks provider configuration and
+  runtime/model availability; it does not test generation or model capability.
 - `POST /api/v1/chat/conversations` — create a conversation with an optional
   title and optional existing project/dataset context.
 - `GET /api/v1/chat/conversations?limit=&offset=` — list conversations.
@@ -155,34 +156,68 @@ The API persists conversations and ordered user/assistant messages in
 - `POST /api/v1/chat/conversations/{conversation_id}/messages` — synchronously
   execute one bounded assistant turn and persist the resulting assistant
   message, tool activity, structured results, warnings, and sanitized status.
+- `GET /api/v1/chat/workflows/{workflow_id}` — retrieve the persisted workflow
+  objective, status, selected source scope, task trace, evidence references,
+  and final response after checking workspace ownership.
+- `POST /api/v1/chat/workflows/{workflow_id}/recover` — explicitly recover a
+  stale workflow by reusing valid completed read-only tasks and retrying
+  eligible idempotent read-only tasks.
 
 Concurrent sends for the same conversation are rejected while it is being
 processed. An unexpected execution failure produces a sanitized failed
 outcome rather than a success. If persisting the outcome fails, the API returns
-an error and does not claim the response was saved. No authenticated user
-identity exists yet, so conversation/project/dataset identifiers do not
-authorize access; database foreign keys are lifecycle constraints only.
+an error and does not claim the response was saved. Conversation and selected
+project/dataset operations use the local workspace-owner checks described
+above. This is not authenticated user identity or complete authorization;
+database foreign keys remain lifecycle constraints only.
 
-The allowlist wraps only existing read-only project/dataset/file discovery,
-stored profile and quality-report retrieval, and EDA/schema result
-retrieval/history. These tools call existing backend handlers rather than
-duplicating analysis engines. The assistant does not start or recompute
-quality, EDA, or schema analyses. File results omit storage keys; profile and
-quality summaries omit sample values. Stored EDA results may include
-data-derived values needed to inspect an analysis. Dataset-derived text is
-untrusted model input, and schema/key/relationship/model outputs remain
-hypotheses. No arbitrary code, SQL, shell, or filesystem tool is registered.
-Project creation, file upload, dashboard creation, and approval-gated
-preprocessing are not exposed as assistant capabilities.
+The typed tool registry includes existing read-only project/dataset/file
+discovery, stored profile and quality-report retrieval, and EDA/schema
+result-history retrieval. It also exposes explicit normalization,
+quality-analysis, and EDA engine operations, deterministic multi-dataset join
+recommendations and analysis, and evidence-backed reports from analytics or
+completed EDA results. Each operation delegates to the existing backend
+handler or deterministic engine; it does not duplicate numerical logic.
+Engine operations require explicit scope and validated arguments, and at most
+one engine operation is permitted per chat request. Multi-dataset joins
+require explicit keys; many-to-many joins require explicit approval and remain
+row-limited. File results omit storage keys; profile and quality summaries
+omit sample values. Stored EDA results may include data-derived values needed
+to inspect an analysis. Dataset-derived text is untrusted model input, and
+schema/key/relationship/model outputs remain hypotheses. No arbitrary code,
+SQL, shell, or filesystem tool is registered. Project creation, file upload,
+dashboard CRUD, and approval-gated preprocessing are not exposed as assistant
+capabilities.
+
+For explicit engine requests, the orchestrator validates a tool selection,
+then sequentially runs Data Intelligence and Analytics & Modelling against
+the selected-file handoff and exact arguments before deterministic execution.
+Insights & Visualization receives the actual engine result and can only return
+validated claims and supported chart specifications. Failures remain explicit;
+model output cannot substitute for engine results. These are bounded logical
+specialist stages using the shared configured provider, not independent
+services. Their model identities and the execution trace are recorded with
+the workflow.
+
+Chat requests create a durable `WorkflowExecution` linked to the owning
+workspace user and conversation. Registered tool tasks and their validated
+arguments are persisted before execution and dispatched through the bounded
+dependency-aware scheduler. The explicit recovery endpoint validates source
+freshness, reuses completed idempotent read-only results, and can retry
+eligible stale idempotent read-only tasks. It does not replay engine
+operations or specialist model calls, does not run automatically at startup,
+and does not forcibly interrupt synchronous handlers. It is limited recovery,
+not full crash recovery.
 
 The bounded inspection orchestrator runs before provider setup for supported
 stored-profile questions. It requires a selected dataset and exactly one ready
 file, resolves only row/column counts, missing-value counts, observed types,
 and exact duplicate-row counts, validates the versioned handoff and claims,
 and returns explicit unsupported or blocked outcomes for unavailable
-measurements and fresh analytics. Exact duplicate counts do not establish
-semantic validity; semantic invalid/suspicious-value analysis is unsupported.
-This route does not run new EDA or other numerical engines.
+measurements. This fast path does not run new analyses; separately, explicit
+registered tools can invoke the bounded engines and evidence-backed reporting
+described above. Exact duplicate counts do not establish semantic validity;
+semantic invalid/suspicious-value analysis remains unsupported.
 
 The conversation-first React workflow retrieves actual project and dataset
 choices, supports saved conversations and bounded history, preserves draft
@@ -295,16 +330,17 @@ and structured results. Its in-memory capability registry and deterministic
 placement policy reject unavailable/incompatible targets, unmeasured memory
 requirements, disallowed data classifications, and cross-locality placement
 without explicit transfer permission. Local-only data cannot select a backend.
-The backend agent registry advertises the existing read-only-agent-tool
-capability. A separate backend EDA registry advertises only deterministic EDA
-for sensitive data; neither registry claims a local-runtime or browser target
-exists on the server.
+The backend agent registry advertises registered read-only tools and the
+explicit dataset-engine capability. A separate backend EDA registry advertises
+deterministic EDA for sensitive data; neither registry claims a local-runtime
+or browser target exists on the server.
 
-The existing allowlisted agent tools now pass through the task boundary and
-include the selected backend target and placement rationale in tool result
-references. Existing tool names, schemas, read-only behavior, argument/result
-bounds, and underlying API handlers remain unchanged. There is no new route,
-database table, migration, or queued execution lifecycle.
+Registered read-only tools and explicit dataset-engine tools pass through the
+task boundary and include the selected backend target and placement rationale
+in tool result references. Existing discovery-tool behavior, argument/result
+bounds, and underlying handlers remain intact; explicitly registered
+normalization, quality, and EDA operations use their deterministic handlers.
+There is no browser execution of BI operations and no backend job queue.
 
 The React System page feature-probes a real module Web Worker and the Web
 Crypto SHA-256 digest API before reporting those browser capabilities. A
@@ -457,9 +493,9 @@ backend, and the health check does not mutate storage.
 | EDA | **Partial** | FastAPI routes in `backend/app/main.py` (`POST /api/v1/datasets/{dataset_id}/files/{file_id}/eda`, `GET .../eda`, `GET .../eda/{analysis_id}`); deterministic univariate, bivariate, and multivariate analysis of verified normalized Parquet; the POST computation uses the capability-aware backend task boundary, requiring sensitive-data permission and backend locality without transfer; PostgreSQL persistence in `eda_analyses` retains idempotency, version 1 provenance envelope, and backend-only JEV lineage verification. The Data workspace can normalize an ingested file and run univariate analysis on a selected profile column. | Defaults/caps include 1,000,000 rows, 600 MiB selected-column scan metadata, 250,000 numeric values, 50,000 categories, 250,000 grouped values, 50,000 contingency cells, 4,000,000 pairwise work units, 128 MiB estimated decoded strings, and configured result serialization up to 1 MiB. Result records are persisted with bounded pagination (limit 1-100). Placement is reported only on the immediate computation response, not persisted as execution history. |
 | Schema Architect (Phase 4) | **Partial** | `backend/app/schema_architect.py` profiles selected normalized tables, identifies candidate keys, infers or rejects relationship hypotheses with overlap/cardinality/fan-out evidence, and produces conditional star, snowflake, and hybrid recommendations; when evidence does not support those structures, it recommends conservatively preserving the selected tables. Column roles are heuristic candidates only. FastAPI persists results in `schema_analyses` with source and artifact provenance. The React workflow selects projects, datasets, and normalized tables; creates or recomputes analyses; and displays history, relationship evidence, conditional recommendations, warnings, and provenance. | Synchronous and deterministic; accepts at most 20 files/tables and 200 columns per table, scans at most 1,000,000 rows and 1 GiB of selected normalized artifacts, retains at most 100,000 typed values (32 MiB canonical-value bytes; 10,000 values per column; 16 KiB per value), evaluates at most 10,000 relationship comparisons/500 candidates, and returns at most 10 MiB. It streams object downloads in 1 MiB chunks and scans Parquet batches. Exact distinct/overlap statistics become unavailable when retention limits are exceeded. Keys and relationships are never called verified constraints; models, grain, and measure semantics remain conditional. A per-file schema-analysis advisory lock prevents duplicate concurrent runs; existing normalization, quality, EDA, preprocessing, and deletion locks also prevent cross-operation overlap. No LLM, source rewrite, or warehouse materialization is used. Isolated PostgreSQL/MinIO integration tests cover project/dataset/file listing, analysis creation/retrieval/recomputation, history pagination, stale detection, and missing-resource errors; a browser run against the same isolated service flow verified frontend selection, creation, recomputation, retrieval, and stale display. |
 | Frontend | **Partial** | React shell, system-health view, local workspace profile bootstrap, project/dataset creation, supported-file multipart upload, ingestion status, normalization, univariate EDA result display, Phase 4 Schema Architect, conversation workspace, and a feature-probed browser Web Worker SHA-256 demonstration. | The local profile bootstrap is one-time and unauthenticated for local development only; it is not account/authentication support. Selected API routes check ownership, but route coverage is incomplete and not tenant isolation; remote/multi-user deployment is unsupported. Browser worker is not integrated with ingestion or BI analysis; no cross-target scheduling. |
-| Capability-aware execution (Phase 5B) | **Foundation partial** | `backend/app/task_execution.py` provides typed capabilities, deterministic policy, typed failures, and bounded result validation; existing read-only agent tools and the existing deterministic EDA computation use backend targets with their respective classifications/capabilities. `frontend/src/execution.js` discovers browser worker/Web Crypto support and enforces task timeout/cancellation by terminating the worker. | Backend task execution remains synchronous/cooperative; no backend hard timeout/cancellation, local-runtime target, cross-environment scheduler, persisted execution-placement history, or BI operation on a browser worker. |
+| Capability-aware execution (Phase 5B) | **Foundation partial** | `backend/app/task_execution.py` provides typed capabilities, deterministic policy, typed failures, and bounded result validation; registered agent tools and deterministic EDA computation use backend targets with their respective classifications/capabilities. `frontend/src/execution.js` discovers browser worker/Web Crypto support and enforces task timeout/cancellation by terminating the worker. | Backend task execution remains synchronous/cooperative; no backend hard timeout/cancellation, local-runtime target, cross-environment scheduler, persisted execution-placement history, or BI operation on a browser worker. |
 | Worker/queue | **Planned** | Worker starts, checks Redis, and idles. | No queue consumer, retry lifecycle, or execution-budget propagation. The frontend Web Worker is a separate browser-local execution target, not this service. |
-| Agents, semantic layer, NL analytics, ML, monitoring, governance | **Planned** | Product roadmap beyond the Phase 5A assistant and Phase 5B execution foundation. | No claims of autonomous BI implementation until code and tests establish them. |
+| Bounded assistant specialists and deterministic analytics/report tools | **Partial** | Sequential logical specialists validate explicit registered operations; deterministic multi-dataset analytics and evidence-backed reports are available through typed chat tools. | Not a general autonomous BI system: forecasting, prediction, broad NL analytics, semantic layer, monitoring, governance, and production deployment remain planned or unverified. |
 
 ### JSON expansion boundary
 

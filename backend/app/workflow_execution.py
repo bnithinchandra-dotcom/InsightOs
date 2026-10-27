@@ -42,6 +42,13 @@ class WorkflowPlanError(ValueError):
     pass
 
 
+class WorkflowTaskExecutionError(RuntimeError):
+    def __init__(self, code: str, summary: str):
+        super().__init__(summary)
+        self.code = code
+        self.summary = summary
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -264,6 +271,57 @@ def persist_workflow_task(
         or len(set(depends_on)) != len(depends_on)
     ):
         raise WorkflowPlanError("Workflow task dependencies are invalid.")
+    dependency_tasks = (
+        session.query(WorkflowTask)
+        .filter(
+            WorkflowTask.workflow_id == workflow.id,
+            WorkflowTask.task_key.in_(depends_on),
+        )
+        .all()
+        if depends_on
+        else []
+    )
+    if {dependency.task_key for dependency in dependency_tasks} != set(depends_on):
+        raise WorkflowPlanError(
+            "Workflow task dependencies must reference persisted tasks in this workflow."
+        )
+    input_references = task.get("input_references", [])
+    if not isinstance(input_references, list):
+        raise WorkflowPlanError("Workflow task inputs must be a list of references.")
+    input_references = list(input_references)
+    if dependency_tasks:
+        if any(
+            dependency.status != "completed"
+            or not isinstance(dependency.result_summary, dict)
+            for dependency in dependency_tasks
+        ):
+            raise WorkflowPlanError(
+                "Workflow task dependencies must be completed before dependent inputs are persisted."
+            )
+        input_references.append(
+            {
+                "type": "dependency_outputs",
+                "fingerprints": [
+                    {
+                        "task_id": dependency.task_key,
+                        "sha256": hashlib.sha256(
+                            json.dumps(
+                                dependency.result_summary,
+                                ensure_ascii=False,
+                                allow_nan=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                        ).hexdigest(),
+                    }
+                    for dependency in sorted(
+                        dependency_tasks,
+                        key=lambda item: item.task_key,
+                    )
+                ],
+            }
+        )
+    task["input_references"] = input_references
     validated_task = {**task, "depends_on": []}
     validate_task_plan([validated_task])
     task_key = task["task_id"]
@@ -303,21 +361,6 @@ def persist_workflow_task(
                 "A workflow task key cannot be reused with different dependencies."
             )
         return existing
-    dependency_tasks = (
-        session.query(WorkflowTask)
-        .filter(
-            WorkflowTask.workflow_id == workflow.id,
-            WorkflowTask.task_key.in_(depends_on),
-        )
-        .all()
-        if depends_on
-        else []
-    )
-    if {dependency.task_key for dependency in dependency_tasks} != set(depends_on):
-        raise WorkflowPlanError(
-            "Workflow task dependencies must reference persisted tasks in this workflow."
-        )
-
     sequence = (
         session.query(WorkflowTask.sequence)
         .filter(WorkflowTask.workflow_id == workflow.id)
@@ -517,6 +560,28 @@ def recover_persisted_workflow(
             report["recovered"].append(task.task_key)
             continue
 
+        if task.status == "failed":
+            if not task.idempotent or task.task_type not in handlers:
+                report["not_replayed"].append(task.task_key)
+                continue
+            if task.retry_count >= task.max_retries:
+                report["not_replayed"].append(task.task_key)
+                continue
+            if not input_validity[task_id] or not dependencies_valid:
+                task.status = "blocked"
+                task.error_code = "recovery_source_changed"
+                task.result_summary = None
+                task.output_references = []
+                task.completed_at = now
+                report["invalidated"].append(task.task_key)
+                continue
+            task.status = "pending"
+            task.retry_count += 1
+            task.error_code = None
+            task.completed_at = None
+            report["recovered"].append(task.task_key)
+            continue
+
         if task.status == "pending":
             if not task.idempotent:
                 task.status = "blocked"
@@ -659,14 +724,33 @@ def run_persisted_workflow(
                     "Workflow task failed (%s)",
                     type(error).__name__,
                 )
-                if task.idempotent and task.retry_count < task.max_retries:
+                if (
+                    task.idempotent
+                    and not task.task_type.startswith("specialist_")
+                    and task.retry_count < task.max_retries
+                ):
                     task.retry_count += 1
                     task.status = "pending"
                     task.error_code = "retryable_task_failure"
                     session.commit()
                     continue
                 task.status = "failed"
-                task.error_code = "task_execution_failed"
+                code = getattr(error, "code", None)
+                summary = getattr(error, "summary", None)
+                task.error_code = (
+                    code
+                    if isinstance(code, str)
+                    and code.isascii()
+                    and code.replace("_", "").isalnum()
+                    and 1 <= len(code) <= 64
+                    else "task_execution_failed"
+                )
+                if isinstance(summary, str) and summary:
+                    task.result_summary = {
+                        "status": "failed",
+                        "summary": summary[:1000],
+                        "error_code": task.error_code,
+                    }
                 task.completed_at = _utcnow()
                 session.flush()
                 break

@@ -39,6 +39,8 @@ class AnalyticsSource:
     table_index: int
     table: pa.Table
     checksum: str
+    artifact_sha256: str | None = None
+    normalization_configuration_sha256: str | None = None
 
 
 @dataclass(frozen=True)

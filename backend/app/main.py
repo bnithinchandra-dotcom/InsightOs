@@ -57,6 +57,8 @@ from app.models import (
     Project,
     SchemaAnalysis,
     User,
+    WorkflowExecution,
+    WorkflowTask,
 )
 from app.eda import (
     EDAConfiguration,
@@ -146,6 +148,13 @@ from app.multi_dataset_analytics import (
     MultiDatasetAnalyticsError,
     execute_join_aggregation,
     recommend_joins,
+)
+from app.ml_forecasting import MAX_HORIZON, ForecastError, train_monthly_forecast
+from app.workflow_execution import (
+    WorkflowPlanError,
+    WorkflowTaskExecutionError,
+    persist_workflow_task,
+    run_persisted_workflow,
 )
 
 
@@ -280,6 +289,23 @@ class EDAReportRequest(BaseModel):
     file_id: StrictInt = Field(gt=0)
     analysis_id: StrictInt = Field(gt=0)
     chart_columns: list[StrictStr] = Field(default_factory=list, max_length=MAX_CHARTS)
+
+
+class MonthlyForecastRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    dataset_id: StrictInt = Field(gt=0)
+    file_id: StrictInt = Field(gt=0)
+    table_index: StrictInt = Field(default=0, ge=0)
+    date_column: StrictStr = Field(min_length=1, max_length=255)
+    target_column: StrictStr = Field(min_length=1, max_length=255)
+    horizon: StrictInt = Field(default=3, ge=1, le=MAX_HORIZON)
+
+    @model_validator(mode="after")
+    def validate_columns(self):
+        if self.date_column == self.target_column:
+            raise ValueError("Date and target columns must be different.")
+        return self
 
 
 UPLOAD_CHUNK_SIZE = 1024 * 1024
@@ -2119,9 +2145,53 @@ def _load_multi_dataset_sources(
                 table_index=source.table_index,
                 table=table,
                 checksum=dataset_file.checksum,
+                artifact_sha256=expected_sha256,
+                normalization_configuration_sha256=normalized[
+                    "configuration"
+                ]["configuration_sha256"],
             )
         )
     return loaded
+
+
+def _monthly_forecast_source_fingerprint(source: AnalyticsSource) -> str:
+    if (
+        not isinstance(source.checksum, str)
+        or not re.fullmatch(r"[a-fA-F0-9]{64}", source.checksum)
+        or not isinstance(source.artifact_sha256, str)
+        or not re.fullmatch(r"[a-fA-F0-9]{64}", source.artifact_sha256)
+        or not isinstance(source.normalization_configuration_sha256, str)
+        or not re.fullmatch(
+            r"[a-fA-F0-9]{64}",
+            source.normalization_configuration_sha256,
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "forecast_source_version_unavailable",
+                "message": "The normalized source version could not be verified.",
+            },
+        )
+    identity = {
+        "dataset_id": source.dataset_id,
+        "file_id": source.file_id,
+        "table_index": source.table_index,
+        "source_sha256": source.checksum,
+        "normalized_artifact_sha256": source.artifact_sha256,
+        "normalization_configuration_sha256": (
+            source.normalization_configuration_sha256
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _analytics_key(request: MultiDatasetKeyRequest) -> JoinKey:
@@ -2416,6 +2486,324 @@ def analyze_multiple_datasets(request: MultiDatasetAnalysisRequest):
                 status_code=503,
                 detail="The selected datasets could not be analyzed.",
             ) from None
+
+
+@app.post("/api/v1/analytics/forecasts/monthly")
+def create_monthly_forecast(request: MonthlyForecastRequest):
+    workflow_id = uuid4().hex
+    task_id: str | None = None
+    try:
+        with SessionLocal() as session, ExitStack() as cleanup:
+            owner = _require_workspace_user(session)
+            source = _load_multi_dataset_sources(
+                session,
+                [
+                    MultiDatasetSourceRequest(
+                        alias="forecast",
+                        dataset_id=request.dataset_id,
+                        file_id=request.file_id,
+                        table_index=request.table_index,
+                    )
+                ],
+                owner,
+                cleanup,
+            )[0]
+            if (
+                request.date_column not in source.table.column_names
+                or request.target_column not in source.table.column_names
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "forecast_column_not_found",
+                        "message": "The selected date or target column is not in the normalized table.",
+                    },
+                )
+
+            source_fingerprint = _monthly_forecast_source_fingerprint(source)
+            dates = source.table[request.date_column].to_pylist()
+            targets = source.table[request.target_column].to_pylist()
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            workflow = WorkflowExecution(
+                id=workflow_id,
+                owner_user_id=owner.id,
+                dataset_id=request.dataset_id,
+                idempotency_key=hashlib.sha256(
+                    f"monthly-forecast:{workflow_id}".encode("utf-8")
+                ).hexdigest(),
+                objective=(
+                    f"Monthly forecast of {request.target_column} "
+                    f"by {request.date_column}"
+                ),
+                status="queued",
+                current_step=0,
+                source_scope={
+                    "dataset_id": request.dataset_id,
+                    "file_id": request.file_id,
+                    "table_index": request.table_index,
+                    "source_fingerprint": source_fingerprint,
+                    "normalized_artifact_sha256": source.artifact_sha256,
+                },
+                started_at=now,
+            )
+            session.add(workflow)
+            session.flush()
+            plan_item = {
+                "task_id": "monthly_forecast",
+                "agent": "analytics_modelling",
+                "operation": "monthly_forecast_v1",
+                "depends_on": [],
+                "status": "pending",
+                "dataset_id": request.dataset_id,
+                "file_id": request.file_id,
+                "source_fingerprint": source_fingerprint,
+                "input_references": [
+                    {
+                        "type": "normalized_parquet",
+                        "table_index": request.table_index,
+                        "artifact_sha256": source.artifact_sha256,
+                        "normalization_configuration_sha256": (
+                            source.normalization_configuration_sha256
+                        ),
+                        "source_sha256": source.checksum,
+                    },
+                    {
+                        "type": "forecast_parameters",
+                        "date_column": request.date_column,
+                        "target_column": request.target_column,
+                        "horizon": request.horizon,
+                    },
+                ],
+                "output_references": [],
+                "idempotent": True,
+                "max_retries": 0,
+                "timeout_seconds": 300,
+            }
+            task = persist_workflow_task(session, workflow, plan_item)
+            task_id = task.id
+            session.commit()
+    except HTTPException:
+        raise
+    except ForecastError as error:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": error.code, "message": error.message},
+        ) from None
+    except (SQLAlchemyError, MinioException, OSError, WorkflowPlanError) as error:
+        logger.error(
+            "Monthly forecast could not be prepared (%s)",
+            type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="The selected normalized dataset could not be prepared for forecasting.",
+        ) from None
+
+    if task_id is None:
+        raise HTTPException(
+            status_code=503,
+            detail="The monthly forecast task could not be persisted.",
+        )
+
+    def execute_forecast(_task: WorkflowTask) -> dict[str, Any]:
+        try:
+            result = train_monthly_forecast(
+                dates=dates,
+                targets=targets,
+                date_column=request.date_column,
+                target_column=request.target_column,
+                dataset_id=request.dataset_id,
+                file_id=request.file_id,
+                source_fingerprint=source_fingerprint,
+                horizon=request.horizon,
+                artifact_id=f"forecast-{workflow_id}",
+            )
+        except ForecastError as error:
+            raise WorkflowTaskExecutionError(error.code, error.message) from error
+        return {
+            "status": "succeeded",
+            "summary": "Monthly forecast trained and chronologically evaluated.",
+            "model_artifact": result["artifact"],
+            "model_artifact_sha256": result["artifact_sha256"],
+            "forecast": result["forecast"]["forecast"],
+            "references": [
+                {
+                    "type": "normalized_source",
+                    "dataset_id": request.dataset_id,
+                    "file_id": request.file_id,
+                    "table_index": request.table_index,
+                    "source_fingerprint": source_fingerprint,
+                    "artifact_sha256": source.artifact_sha256,
+                },
+                {
+                    "type": "forecast_model_artifact",
+                    "sha256": result["artifact_sha256"],
+                    "storage": "workflow_task_result",
+                },
+            ],
+        }
+
+    try:
+        with SessionLocal() as session:
+            run_persisted_workflow(
+                session,
+                workflow_id,
+                {"monthly_forecast_v1": execute_forecast},
+                max_steps=1,
+            )
+        with SessionLocal() as session:
+            workflow = session.get(WorkflowExecution, workflow_id)
+            task = session.get(WorkflowTask, task_id)
+            if (
+                workflow is None
+                or task is None
+                or task.workflow_id != workflow_id
+                or workflow.status != "completed"
+                or task.status != "completed"
+                or not isinstance(task.result_summary, dict)
+            ):
+                code = (
+                    task.error_code
+                    if task is not None
+                    else "forecast_task_missing"
+                )
+                summary = (
+                    task.result_summary.get("summary")
+                    if task is not None and isinstance(task.result_summary, dict)
+                    else "The persisted monthly forecast task did not complete."
+                )
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": code or "forecast_task_failed",
+                        "message": summary,
+                        "workflow_id": workflow_id,
+                        "task_id": task_id,
+                    },
+                )
+            return {
+                "workflow_id": workflow_id,
+                "task_id": task.id,
+                "status": task.status,
+                "result": task.result_summary,
+            }
+    except HTTPException:
+        raise
+    except (SQLAlchemyError, LookupError) as error:
+        logger.error(
+            "Monthly forecast task could not be completed (%s)",
+            type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "forecast_workflow_unavailable",
+                "message": "The monthly forecast was persisted but its workflow status could not be confirmed.",
+                "workflow_id": workflow_id,
+                "task_id": task_id,
+            },
+        ) from None
+
+
+@app.get("/api/v1/analytics/forecasts/monthly/{workflow_id}")
+def get_monthly_forecast(workflow_id: str):
+    if not re.fullmatch(r"[a-fA-F0-9]{32}", workflow_id):
+        raise HTTPException(status_code=404, detail="Forecast workflow not found.")
+    with SessionLocal() as session:
+        owner = _require_workspace_user(session)
+        workflow = (
+            session.query(WorkflowExecution)
+            .filter(
+                WorkflowExecution.id == workflow_id,
+                WorkflowExecution.owner_user_id == owner.id,
+            )
+            .one_or_none()
+        )
+        if workflow is None:
+            raise HTTPException(status_code=404, detail="Forecast workflow not found.")
+        task = (
+            session.query(WorkflowTask)
+            .filter(
+                WorkflowTask.workflow_id == workflow.id,
+                WorkflowTask.task_type == "monthly_forecast_v1",
+            )
+            .one_or_none()
+        )
+        if task is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Forecast task is not available for this workflow.",
+            )
+        result = task.result_summary
+        if task.status == "completed":
+            artifact = (
+                result.get("model_artifact")
+                if isinstance(result, dict)
+                else None
+            )
+            expected_sha256 = (
+                result.get("model_artifact_sha256")
+                if isinstance(result, dict)
+                else None
+            )
+            artifact_source = (
+                artifact.get("source")
+                if isinstance(artifact, dict)
+                else None
+            )
+            references = result.get("references") if isinstance(result, dict) else None
+            source_reference = (
+                references[0]
+                if isinstance(references, list)
+                and references
+                and isinstance(references[0], dict)
+                else None
+            )
+            try:
+                encoded_artifact = json.dumps(
+                    artifact,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            except (TypeError, ValueError, UnicodeError):
+                encoded_artifact = b""
+            if (
+                not isinstance(artifact, dict)
+                or not isinstance(expected_sha256, str)
+                or hashlib.sha256(encoded_artifact).hexdigest() != expected_sha256
+                or not isinstance(workflow.source_scope, dict)
+                or not isinstance(artifact_source, dict)
+                or artifact_source.get("dataset_id") != workflow.dataset_id
+                or artifact_source.get("file_id") != task.file_id
+                or artifact_source.get("fingerprint") != task.source_fingerprint
+                or task.source_fingerprint
+                != workflow.source_scope.get("source_fingerprint")
+                or not isinstance(source_reference, dict)
+                or source_reference.get("artifact_sha256")
+                != workflow.source_scope.get("normalized_artifact_sha256")
+                or source_reference.get("source_fingerprint")
+                != task.source_fingerprint
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "forecast_artifact_integrity_failed",
+                        "message": "The stored model artifact failed integrity verification.",
+                    },
+                )
+        return {
+            "workflow_id": workflow.id,
+            "status": workflow.status,
+            "source_scope": workflow.source_scope,
+            "task": {
+                "id": task.id,
+                "status": task.status,
+                "error_code": task.error_code,
+                "result": result,
+            },
+        }
 
 
 @app.post("/api/v1/analytics/reports")

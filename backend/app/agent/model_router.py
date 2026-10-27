@@ -86,6 +86,17 @@ class AgentModelRouter:
                 "agent_context_too_large",
                 "The specialist request exceeded the configured message limit.",
             )
-        with self._generation_lock:
+        acquired = self._generation_lock.acquire(
+            timeout=self._settings.timeout_seconds,
+        )
+        if not acquired:
+            raise ProviderError(
+                "provider_timeout",
+                "The model request timed out waiting for an available inference slot.",
+                retryable=True,
+            )
+        try:
             response = self._provider.complete(bounded_request)
+        finally:
+            self._generation_lock.release()
         return RoutedCompletion(role=role, model=model, response=response)

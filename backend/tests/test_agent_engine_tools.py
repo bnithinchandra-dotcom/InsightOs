@@ -10,6 +10,7 @@ from app.agent.contracts import (
     ModelResponse,
     ProviderMessage,
     ToolCall,
+    ToolResult,
     UsageMetadata,
 )
 from app.agent.runtime import execute_agent_request
@@ -360,6 +361,7 @@ class DatasetEngineToolTests(unittest.TestCase):
             presentation_context["engine_result"]["data"]["id"],
             91,
         )
+
         self.assertEqual(
             presentation_context["data_intelligence"]["observed_fields"],
             ["sales"],
@@ -422,6 +424,142 @@ class DatasetEngineToolTests(unittest.TestCase):
             registry=ToolRegistry(),
         )
         self.assertEqual(mismatched_file.error_code, "engine_result_scope_mismatch")
+
+    def test_specialist_stages_are_scheduled_before_execution_with_validated_handoffs(self):
+        provider = EngineRequestProvider(
+            "run_eda_analysis",
+            {
+                "dataset_id": 42,
+                "file_id": 7,
+                "analysis_type": "univariate",
+                "table_index": 0,
+                "selected_columns": ["sales"],
+            },
+        )
+        scheduled = []
+        completed_keys = set()
+
+        def scheduler(name, arguments, execute, **kwargs):
+            task_key = f"task-{len(scheduled) + 1}"
+            dependencies = kwargs.get("depends_on") or []
+            self.assertTrue(set(dependencies).issubset(completed_keys))
+            provider_calls_before_execute = len(provider.requests)
+            scheduled.append((name, arguments, dependencies, provider_calls_before_execute))
+            raw, result, label = execute()
+            self.assertEqual(result.status, "succeeded", result.summary)
+            if name.startswith("specialist_"):
+                handoff = result.data["handoff"]
+                self.assertTrue(handoff["verified"])
+                self.assertEqual(handoff["source_fingerprint"], "source-checksum")
+                self.assertEqual(handoff["dataset_id"], 42)
+                self.assertEqual(handoff["file_id"], 7)
+                self.assertEqual(handoff["parameters"]["file_id"], 7)
+                self.assertEqual(
+                    handoff["artifact_references"],
+                    handoff["output"]["evidence_references"],
+                )
+                if handoff["stage"] == "data_intelligence":
+                    self.assertIn(
+                        "sales",
+                        [
+                            column["name"]
+                            for table in handoff["verified_schema"]["tables"]
+                            for column in table["columns"]
+                        ],
+                    )
+                if handoff["stage"] == "insights_visualization":
+                    self.assertEqual(
+                        handoff["actual_operations"][0]["operation"],
+                        "run_eda_analysis",
+                    )
+                    self.assertEqual(
+                        len(
+                            handoff["actual_operations"][0][
+                                "execution_fingerprint"
+                            ]
+                        ),
+                        64,
+                    )
+            completed_keys.add(task_key)
+            return raw, result, label, task_key
+
+        outcome = execute_agent_request(
+            user_message="Run EDA on the sales column.",
+            history=[],
+            context={"dataset_id": 42, "conversation_id": 301},
+            settings=_settings(),
+            provider=provider,
+            registry=ToolRegistry(),
+            workflow_scheduler=scheduler,
+        )
+
+        self.assertEqual(outcome.status, "completed")
+        self.assertEqual(
+            [item[0] for item in scheduled],
+            [
+                "specialist_data_intelligence",
+                "specialist_analytics_modelling",
+                "run_eda_analysis",
+                "specialist_insights_visualization",
+            ],
+        )
+        self.assertEqual(scheduled[0][2], [])
+        self.assertEqual(scheduled[1][2], ["task-1"])
+        self.assertEqual(scheduled[2][2], ["task-2"])
+        self.assertEqual(scheduled[3][2], ["task-1", "task-2", "task-3"])
+        self.assertEqual([item[3] for item in scheduled[:2]], [1, 2])
+
+    def test_malformed_specialist_handoff_blocks_all_dependent_execution(self):
+        provider = EngineRequestProvider(
+            "run_eda_analysis",
+            {
+                "dataset_id": 42,
+                "file_id": 7,
+                "analysis_type": "univariate",
+                "table_index": 0,
+                "selected_columns": ["sales"],
+            },
+        )
+        scheduled = []
+
+        def scheduler(name, _arguments, execute, **kwargs):
+            scheduled.append((name, kwargs.get("depends_on") or []))
+            raw, result, label = execute()
+            if name == "specialist_data_intelligence":
+                result = ToolResult(
+                    status="succeeded",
+                    summary=result.summary,
+                    data={
+                        **result.data,
+                        "handoff": {
+                            **result.data["handoff"],
+                            "dataset_id": 999,
+                        },
+                    },
+                    references=result.references,
+                )
+            return raw, result, label, f"task-{len(scheduled)}"
+
+        outcome = execute_agent_request(
+            user_message="Run EDA on the sales column.",
+            history=[],
+            context={"dataset_id": 42, "conversation_id": 301},
+            settings=_settings(),
+            provider=provider,
+            registry=ToolRegistry(),
+            workflow_scheduler=scheduler,
+        )
+
+        self.assertEqual([item[0] for item in scheduled], ["specialist_data_intelligence"])
+        self.assertEqual(outcome.error_code, "engine_execution_incomplete")
+        self.assertFalse(self.main.analyze_dataset_file_eda.called)
+        failed = next(
+            item
+            for item in outcome.structured_results
+            if item["tool"] == "agent1_data_intelligence"
+        )
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["error_code"], "specialist_handoff_invalid")
 
     def test_engine_result_with_mismatched_source_identity_is_not_presented(self):
         engine_data = self.main.analyze_dataset_file_eda.return_value.copy()

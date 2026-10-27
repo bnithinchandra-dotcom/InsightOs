@@ -14,6 +14,7 @@ from app.migrations.versions import e4a2d7c91b60_add_durable_workflows as workfl
 from app.models import User, WorkflowExecution, WorkflowTask
 from app.workflow_execution import (
     WorkflowPlanError,
+    WorkflowTaskExecutionError,
     persist_trace_plan,
     recover_persisted_workflow,
     run_persisted_workflow,
@@ -208,6 +209,106 @@ class WorkflowExecutionTests(unittest.TestCase):
             self.assertEqual(task.retry_count, 2)
             self.assertEqual(task.result_summary, {"ok": True})
         self.assertEqual(len(attempts), 3)
+
+    def test_failed_specialist_stage_is_visible_and_recovers_only_explicitly(self):
+        self._persist_plan(
+            [
+                {
+                    "task_id": "specialist-data",
+                    "agent": "data_intelligence",
+                    "operation": "specialist_data_intelligence",
+                    "depends_on": [],
+                    "status": "pending",
+                    "dataset_id": None,
+                    "file_id": None,
+                    "input_references": [],
+                    "output_references": [],
+                    "idempotent": True,
+                    "max_retries": 1,
+                }
+            ]
+        )
+        with self.session_factory() as session:
+            workflow = run_persisted_workflow(
+                session,
+                self.workflow_id,
+                {
+                    "specialist_data_intelligence": lambda _task: (
+                        (_ for _ in ()).throw(
+                            WorkflowTaskExecutionError(
+                                "provider_timeout",
+                                "The specialist provider timed out.",
+                            )
+                        )
+                    )
+                },
+            )
+            task = workflow.tasks[0]
+            self.assertEqual(workflow.status, "failed")
+            self.assertEqual(task.status, "failed")
+            self.assertEqual(task.error_code, "provider_timeout")
+            self.assertEqual(
+                task.result_summary,
+                {
+                    "status": "failed",
+                    "summary": "The specialist provider timed out.",
+                    "error_code": "provider_timeout",
+                },
+            )
+
+        with self.session_factory() as session:
+            workflow, recovery = recover_persisted_workflow(
+                session,
+                self.workflow_id,
+                {"specialist_data_intelligence": lambda _task: {"verified": True}},
+                lambda _session, _workflow, _task: True,
+                stale_before=datetime.now(timezone.utc).replace(tzinfo=None),
+            )
+            task = workflow.tasks[0]
+            self.assertEqual(recovery["recovered"], ["specialist-data"])
+            self.assertEqual(task.status, "completed")
+            self.assertEqual(task.retry_count, 1)
+            self.assertEqual(task.result_summary, {"verified": True})
+
+    def test_failed_required_specialist_blocks_dependent_stages_and_success(self):
+        plan = self._plan()[:2]
+        plan[0] = {
+            **plan[0],
+            "task_id": "specialist-data",
+            "agent": "data_intelligence",
+            "operation": "specialist_data_intelligence",
+            "idempotent": True,
+            "max_retries": 1,
+        }
+        plan[1] = {
+            **plan[1],
+            "task_id": "specialist-analytics",
+            "agent": "analytics_modelling",
+            "operation": "specialist_analytics_modelling",
+            "depends_on": ["specialist-data"],
+            "idempotent": True,
+            "max_retries": 1,
+        }
+        self._persist_plan(plan)
+        analytics_calls = []
+        with self.session_factory() as session:
+            workflow = run_persisted_workflow(
+                session,
+                self.workflow_id,
+                {
+                    "specialist_data_intelligence": lambda _task: (_ for _ in ()).throw(
+                        RuntimeError("stage failed")
+                    ),
+                    "specialist_analytics_modelling": lambda _task: (
+                        analytics_calls.append("ran") or {"approved": True}
+                    ),
+                },
+            )
+            tasks = {task.task_key: task for task in workflow.tasks}
+            self.assertEqual(workflow.status, "failed")
+            self.assertEqual(tasks["specialist-data"].status, "failed")
+            self.assertEqual(tasks["specialist-analytics"].status, "blocked")
+        self.assertEqual(analytics_calls, [])
 
     def test_scheduler_does_not_implicitly_replay_running_tasks(self):
         self._persist_plan(self._plan()[:2])

@@ -1,5 +1,6 @@
 import unittest
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
@@ -23,6 +24,7 @@ from app.agent.contracts import (
     ToolResult,
     UsageMetadata,
 )
+from app.agent.specialist_agents import DataIntelligenceResult
 from app.agent import runtime as agent_runtime
 from app.database import Base
 from app.migrations.versions import (
@@ -238,7 +240,10 @@ class ConversationApiTests(unittest.TestCase):
                     ModelResponse(
                         ProviderMessage(
                             role="assistant",
-                            content="I found the available projects.",
+                            content=(
+                                "The available projects are Assistant fixture "
+                                "and Other assistant fixture."
+                            ),
                         ),
                         finish_reason="stop",
                     ),
@@ -285,9 +290,10 @@ class ConversationApiTests(unittest.TestCase):
             "Hello from the configured model.",
         )
         self.assertEqual(tool_turn.status_code, 200, tool_turn.text)
-        self.assertIn(
-            "couldn't validate a data-specific response",
+        self.assertEqual(tool_turn.json()["execution_status"], "completed")
+        self.assertEqual(
             tool_turn.json()["assistant_message"]["content"],
+            "The available projects are Assistant fixture and Other assistant fixture.",
         )
         self.assertEqual(
             tool_turn.json()["tool_activities"][0]["tool_name"],
@@ -464,6 +470,274 @@ class ConversationApiTests(unittest.TestCase):
                 tasks[0].output_references[0]["type"],
                 "dataset_file",
             )
+
+    def test_specialist_tasks_persist_role_dependencies_and_versioned_handoffs(self):
+        with self.session_factory() as session:
+            workflow = WorkflowExecution(
+                id="9" * 32,
+                owner_user_id=self.user_id,
+                dataset_id=self.dataset_id,
+                idempotency_key="8" * 32,
+                objective="Run selected-file analysis",
+                status="running",
+                current_step=0,
+            )
+            session.add(workflow)
+            session.commit()
+
+        schedule = chat_api._workflow_tool_scheduler(
+            "9" * 32,
+            self.user_id,
+            {"project_id": self.project_id, "dataset_id": self.dataset_id},
+        )
+        executions = []
+
+        def stage_execution(role, task_type):
+            def execute():
+                executions.append(role)
+                with self.session_factory() as session:
+                    persisted = (
+                        session.query(WorkflowTask)
+                        .filter_by(
+                            workflow_id="9" * 32,
+                            task_type=task_type,
+                            agent=role,
+                            status="running",
+                        )
+                        .order_by(WorkflowTask.sequence.desc())
+                        .first()
+                    )
+                    self.assertIsNotNone(persisted)
+                    self.assertIsNotNone(persisted.started_at)
+                    for edge in persisted.dependencies:
+                        dependency = session.get(
+                            WorkflowTask,
+                            edge.depends_on_task_id,
+                        )
+                        self.assertEqual(dependency.status, "completed")
+                return "{}", ToolResult(
+                    status="succeeded",
+                    summary=f"{role} completed.",
+                    data={
+                        "handoff": {
+                            "stage": role,
+                            "source_fingerprint": "source-v1",
+                            "dataset_id": self.dataset_id,
+                            "file_id": 1,
+                            "verified": True,
+                        }
+                    },
+                    references=(
+                        {
+                            "type": "specialist_handoff",
+                            "source_fingerprint": "source-v1",
+                            "dataset_id": self.dataset_id,
+                            "file_id": 1,
+                        },
+                    ),
+                ), role
+
+            return execute
+
+        data_arguments = {
+            "dataset_id": self.dataset_id,
+            "file_id": 1,
+            "requested_operation": "run_eda_analysis",
+            "stage_input_fingerprint": "a" * 64,
+        }
+        data_task = schedule(
+            "specialist_data_intelligence",
+            data_arguments,
+            stage_execution("data_intelligence", "specialist_data_intelligence"),
+            idempotent=True,
+            max_retries=1,
+            agent="data_intelligence",
+        )
+        reused_data_task = schedule(
+            "specialist_data_intelligence",
+            data_arguments,
+            stage_execution("data_intelligence", "specialist_data_intelligence"),
+            idempotent=True,
+            max_retries=1,
+            agent="data_intelligence",
+        )
+        changed_data_task = schedule(
+            "specialist_data_intelligence",
+            {**data_arguments, "stage_input_fingerprint": "b" * 64},
+            stage_execution("data_intelligence", "specialist_data_intelligence"),
+            idempotent=True,
+            max_retries=1,
+            agent="data_intelligence",
+        )
+        analytics_task = schedule(
+            "specialist_analytics_modelling",
+            {
+                **data_arguments,
+                "stage_input_fingerprint": "c" * 64,
+            },
+            stage_execution("analytics_modelling", "specialist_analytics_modelling"),
+            idempotent=True,
+            max_retries=1,
+            depends_on=[data_task[3]],
+            agent="analytics_modelling",
+        )
+
+        self.assertEqual(len(executions), 3)
+        self.assertEqual(data_task[3], reused_data_task[3])
+        self.assertNotEqual(data_task[3], changed_data_task[3])
+        with self.session_factory() as session:
+            tasks = {
+                task.task_key: task
+                for task in session.query(WorkflowTask).filter_by(
+                    workflow_id="9" * 32
+                )
+            }
+            data = tasks[data_task[3]]
+            analytics = tasks[analytics_task[3]]
+            self.assertEqual(data.agent, "data_intelligence")
+            self.assertEqual(data.task_type, "specialist_data_intelligence")
+            self.assertEqual(data.status, "completed")
+            self.assertEqual(data.output_references[0]["source_fingerprint"], "source-v1")
+            self.assertEqual(analytics.agent, "analytics_modelling")
+            self.assertEqual(analytics.status, "completed")
+            dependency = session.query(chat_api.WorkflowTaskDependency).filter_by(
+                task_id=analytics.id
+            ).one()
+            self.assertEqual(dependency.depends_on_task_id, data.id)
+
+    def test_explicit_recovery_revalidates_and_resumes_failed_specialist(self):
+        stale = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)
+        objective = "Run EDA on the selected file."
+        inspection = {
+            "dataset_id": self.dataset_id,
+            "file_id": 1,
+            "source_fingerprint": "source-v1",
+            "profile": {"tables": [{"columns": [{"name": "sales"}]}]},
+        }
+        evidence = [{"type": "dataset_file_inspection", "source_fingerprint": "source-v1"}]
+        arguments = {
+            "dataset_id": self.dataset_id,
+            "file_id": 1,
+            "analysis_type": "univariate",
+            "selected_columns": ["sales"],
+        }
+        material = {
+            "objective": objective,
+            "operation": "run_eda_analysis",
+            "arguments": arguments,
+            "inspection": inspection,
+            "evidence_references": evidence,
+        }
+        with self.session_factory() as session:
+            workflow = WorkflowExecution(
+                id="7" * 32,
+                owner_user_id=self.user_id,
+                dataset_id=self.dataset_id,
+                idempotency_key="6" * 32,
+                objective=objective,
+                status="running",
+                current_step=0,
+                source_scope={
+                    "project_id": self.project_id,
+                    "dataset_id": self.dataset_id,
+                },
+            )
+            session.add(workflow)
+            session.commit()
+
+        schedule = chat_api._workflow_tool_scheduler(
+            "7" * 32,
+            self.user_id,
+            {"project_id": self.project_id, "dataset_id": self.dataset_id},
+        )
+        failed_task = schedule(
+            "specialist_data_intelligence",
+            {
+                **arguments,
+                "requested_operation": "run_eda_analysis",
+                "requested_arguments": arguments,
+                "stage_input_fingerprint": chat_api._fingerprint_json(material),
+                "source_fingerprint": "source-v1",
+            },
+            lambda: (
+                "",
+                ToolResult(
+                    status="failed",
+                    summary="The provider timed out.",
+                    error_code="provider_timeout",
+                ),
+                "data_intelligence",
+            ),
+            idempotent=True,
+            max_retries=1,
+            agent="data_intelligence",
+        )
+        self.assertEqual(failed_task[1].status, "failed")
+
+        class RecoveryRegistry:
+            def provider_schemas(self, *, context=None):
+                return ()
+
+            def is_engine_operation(self, name):
+                return name == "run_eda_analysis"
+
+            def prepare_engine_inspection(self, name, tool_arguments, *, context=None):
+                self_name = name
+                if self_name != "run_eda_analysis" or tool_arguments != arguments:
+                    return ToolResult(
+                        status="failed",
+                        summary="Unexpected recovery inputs.",
+                        error_code="invalid_recovery_inputs",
+                    )
+                return ToolResult(
+                    status="succeeded",
+                    summary="Current selected-file inspection.",
+                    data=inspection,
+                    references=tuple(evidence),
+                )
+
+        result = DataIntelligenceResult(
+            contract_version=1,
+            status="completed",
+            summary="The selected sales field is present.",
+            observed_fields=["sales"],
+            recommended_operation="run_eda_analysis",
+            evidence_references=evidence,
+        )
+        with patch.object(chat_api, "ToolRegistry", RecoveryRegistry), patch.object(
+            chat_api, "get_agent_settings", return_value=SimpleNamespace(provider="ollama")
+        ), patch.object(chat_api, "create_provider", return_value=object()), patch.object(
+            chat_api, "AgentModelRouter", return_value=object()
+        ), patch.object(
+            chat_api, "run_data_intelligence", return_value=(result, "fixture-model")
+        ):
+            with self.session_factory() as session:
+                workflow = session.get(WorkflowExecution, "7" * 32)
+                workflow.status = "failed"
+                workflow.updated_at = stale
+                task = session.query(WorkflowTask).filter_by(
+                    workflow_id="7" * 32
+                ).one()
+                task.updated_at = stale
+                session.commit()
+            recovered = self.client.post(
+                "/api/v1/chat/workflows/" + "7" * 32 + "/recover"
+            )
+
+        self.assertEqual(recovered.status_code, 200, recovered.text)
+        self.assertEqual(recovered.json()["status"], "partial")
+        self.assertEqual(
+            recovered.json()["recovery"]["recovered"],
+            [failed_task[3]],
+        )
+        with self.session_factory() as session:
+            task = session.query(WorkflowTask).filter_by(
+                workflow_id="7" * 32
+            ).one()
+            self.assertEqual(task.status, "completed")
+            handoff = task.result_summary["data"]["handoff"]
+            self.assertEqual(handoff["source_fingerprint"], "source-v1")
+            self.assertEqual(handoff["output"]["observed_fields"], ["sales"])
 
     def test_scheduler_identity_tracks_every_multi_dataset_source(self):
         with self.session_factory() as session:
@@ -666,6 +940,175 @@ class ConversationApiTests(unittest.TestCase):
             1,
         )
         self.assertEqual(len(executions), 1)
+
+    def test_recovery_preserves_current_completed_non_idempotent_engine_task(self):
+        stale = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)
+        with self.session_factory() as session:
+            workflow = WorkflowExecution(
+                id="5" * 32,
+                owner_user_id=self.user_id,
+                dataset_id=self.dataset_id,
+                idempotency_key="4" * 32,
+                objective="Run deterministic analysis",
+                status="running",
+                current_step=0,
+                source_scope={
+                    "project_id": self.project_id,
+                    "dataset_id": self.dataset_id,
+                },
+            )
+            session.add(workflow)
+            session.commit()
+
+        schedule = chat_api._workflow_tool_scheduler(
+            "5" * 32,
+            self.user_id,
+            {"project_id": self.project_id, "dataset_id": self.dataset_id},
+        )
+        executions = []
+
+        def execute():
+            executions.append("engine")
+            return "{}", ToolResult(
+                status="succeeded",
+                summary="Deterministic result was persisted.",
+                data={"dataset_id": self.dataset_id, "file_id": 1, "rows": 3},
+            ), "Run analysis"
+
+        scheduled = schedule(
+            "run_eda_analysis",
+            {"dataset_id": self.dataset_id, "file_id": 1},
+            execute,
+            idempotent=False,
+        )
+        with self.session_factory() as session:
+            workflow = session.get(WorkflowExecution, "5" * 32)
+            workflow.status = "running"
+            workflow.updated_at = stale
+            task = session.query(WorkflowTask).filter_by(
+                workflow_id="5" * 32
+            ).one()
+            task.updated_at = stale
+            session.commit()
+
+        class RecoveryRegistry:
+            def provider_schemas(self, *, context=None):
+                return ({"function": {"name": "run_eda_analysis"}},)
+
+            def is_engine_operation(self, name):
+                return name == "run_eda_analysis"
+
+        with patch.object(chat_api, "ToolRegistry", RecoveryRegistry):
+            recovered = self.client.post(
+                "/api/v1/chat/workflows/" + "5" * 32 + "/recover"
+            )
+
+        self.assertEqual(recovered.status_code, 200, recovered.text)
+        self.assertEqual(recovered.json()["status"], "completed")
+        self.assertEqual(recovered.json()["recovery"]["reused"], [scheduled[3]])
+        self.assertEqual(executions, ["engine"])
+        with self.session_factory() as session:
+            task = session.query(WorkflowTask).filter_by(
+                workflow_id="5" * 32
+            ).one()
+            self.assertEqual(task.status, "completed")
+            self.assertFalse(task.idempotent)
+            self.assertEqual(task.result_summary["data"]["rows"], 3)
+
+    def test_recovery_invalidates_dependent_task_when_upstream_output_changes(self):
+        stale = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)
+        with self.session_factory() as session:
+            workflow = WorkflowExecution(
+                id="3" * 32,
+                owner_user_id=self.user_id,
+                dataset_id=self.dataset_id,
+                idempotency_key="2" * 32,
+                objective="Inspect selected files",
+                status="running",
+                current_step=0,
+                source_scope={
+                    "project_id": self.project_id,
+                    "dataset_id": self.dataset_id,
+                },
+            )
+            session.add(workflow)
+            session.commit()
+
+        schedule = chat_api._workflow_tool_scheduler(
+            "3" * 32,
+            self.user_id,
+            {"project_id": self.project_id, "dataset_id": self.dataset_id},
+        )
+        first = schedule(
+            "list_files",
+            {"dataset_id": self.dataset_id},
+            lambda: (
+                "{}",
+                ToolResult(
+                    status="succeeded",
+                    summary="Files listed.",
+                    data=[{"id": 1}],
+                ),
+                "Listing files",
+            ),
+            idempotent=True,
+            max_retries=1,
+        )
+        second = schedule(
+            "get_inspection_handoff",
+            {"dataset_id": self.dataset_id, "file_id": 1},
+            lambda: (
+                "{}",
+                ToolResult(
+                    status="succeeded",
+                    summary="Inspection handoff saved.",
+                    data={"fingerprint": "upstream-v1"},
+                ),
+                "Inspecting file",
+            ),
+            idempotent=True,
+            max_retries=1,
+            depends_on=[first[3]],
+        )
+        with self.session_factory() as session:
+            workflow = session.get(WorkflowExecution, "3" * 32)
+            workflow.status = "running"
+            workflow.updated_at = stale
+            upstream = session.query(WorkflowTask).filter_by(
+                workflow_id="3" * 32,
+                task_key=first[3],
+            ).one()
+            upstream.result_summary = {
+                **upstream.result_summary,
+                "data": [{"id": 99}],
+            }
+            session.commit()
+
+        class RecoveryRegistry:
+            def provider_schemas(self, *, context=None):
+                return (
+                    {"function": {"name": "list_files"}},
+                    {"function": {"name": "get_inspection_handoff"}},
+                )
+
+            def is_engine_operation(self, name):
+                return False
+
+        with patch.object(chat_api, "ToolRegistry", RecoveryRegistry):
+            recovered = self.client.post(
+                "/api/v1/chat/workflows/" + "3" * 32 + "/recover"
+            )
+
+        self.assertEqual(recovered.status_code, 200, recovered.text)
+        self.assertEqual(recovered.json()["recovery"]["reused"], [first[3]])
+        self.assertEqual(recovered.json()["recovery"]["invalidated"], [second[3]])
+        with self.session_factory() as session:
+            downstream = session.query(WorkflowTask).filter_by(
+                workflow_id="3" * 32,
+                task_key=second[3],
+            ).one()
+            self.assertEqual(downstream.status, "blocked")
+            self.assertEqual(downstream.error_code, "recovery_source_changed")
 
     def test_workflow_retrieval_rejects_ambiguous_workspace_ownership(self):
         conversation = self._create_conversation()
