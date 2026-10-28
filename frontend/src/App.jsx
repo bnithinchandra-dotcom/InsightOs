@@ -69,7 +69,7 @@ function subscribeToHash(callback) {
 }
 
 function getCurrentHash() {
-  return window.location.hash.slice(1)
+  return window.location.hash.slice(1).split('?')[0].split('/')[0]
 }
 
 async function fetchSystemStatus(signal) {

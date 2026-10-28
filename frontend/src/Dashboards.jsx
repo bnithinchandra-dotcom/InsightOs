@@ -3,9 +3,11 @@ import {
   createDashboard,
   deleteDashboard,
   generateAnalyticsReport,
+  getAnalyticsWorkflowResult,
   getDashboard,
   getDashboards,
   getDatasetFiles,
+  getMonthlyForecast,
   getProjectDatasets,
   getProjects,
 } from './api'
@@ -89,32 +91,44 @@ function chartPoints(chart) {
   const maxX = Math.max(...xNumbers)
   const lineX = (index) => 36 + ((xNumbers[index] - minX) / (maxX - minX || 1)) * 580
   return (
-    <svg className="dashboard-chart-svg" viewBox="0 0 640 220" role="img" aria-label={chart.title}>
-      <title>{chart.title}</title>
-      <line x1="36" y1={baseline} x2="616" y2={baseline} />
-      {chart.chart_type === 'line' ? series.map((item, seriesIndex) => {
-        const points = item.values.map((value, index) => (
-          typeof value === 'number' ? `${lineX(index)},${y(value)}` : null
-        )).filter(Boolean).join(' ')
-        return <polyline key={item.name} points={points} fill="none" stroke={palette[seriesIndex % palette.length]} strokeWidth="3" />
-      }) : series.flatMap((item, seriesIndex) => item.values.map((value, index) => {
-        if (typeof value !== 'number') return null
-        const x = 36 + groupWidth * index + seriesWidth * seriesIndex + 3
-        return (
-          <rect
-            key={`${item.name}-${index}`}
-            x={x}
-            y={Math.min(y(value), baseline)}
-            width={Math.max(2, seriesWidth - 6)}
-            height={Math.max(1, Math.abs(baseline - y(value)))}
-            fill={palette[seriesIndex % palette.length]}
-          />
-        )
-      }))}
-      {labels.map((label, index) => (
-        <text key={`${label}-${index}`} x={36 + groupWidth * index + groupWidth / 2} y="210" textAnchor="middle">{label.slice(0, 14)}</text>
-      ))}
-    </svg>
+    <>
+      <svg className="dashboard-chart-svg" viewBox="0 0 640 220" role="img" aria-label={chart.title}>
+        <title>{chart.title}</title>
+        <line x1="36" y1={baseline} x2="616" y2={baseline} />
+        {chart.chart_type === 'line' ? series.map((item, seriesIndex) => {
+          const points = item.values.map((value, index) => (
+            typeof value === 'number' ? `${lineX(index)},${y(value)}` : null
+          )).filter(Boolean).join(' ')
+          return <polyline key={item.name} points={points} fill="none" stroke={palette[seriesIndex % palette.length]} strokeWidth="3" />
+        }) : series.flatMap((item, seriesIndex) => item.values.map((value, index) => {
+          if (typeof value !== 'number') return null
+          const x = 36 + groupWidth * index + seriesWidth * seriesIndex + 3
+          return (
+            <rect
+              key={`${item.name}-${index}`}
+              x={x}
+              y={Math.min(y(value), baseline)}
+              width={Math.max(2, seriesWidth - 6)}
+              height={Math.max(1, Math.abs(baseline - y(value)))}
+              fill={palette[seriesIndex % palette.length]}
+            />
+          )
+        }))}
+        {labels.map((label, index) => (
+          <text key={`${label}-${index}`} x={36 + groupWidth * index + groupWidth / 2} y="210" textAnchor="middle">{label.slice(0, 14)}</text>
+        ))}
+      </svg>
+      {chart.chart_type === 'line' && (
+        <ul className="dashboard-chart-legend" aria-label={`${chart.title} series`}>
+          {series.map((item, index) => (
+            <li key={item.name}>
+              <span style={{ backgroundColor: palette[index % palette.length] }} />
+              {item.name}
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
   )
 }
 
@@ -125,6 +139,142 @@ export function ChartCard({ chart }) {
       <p className="muted">{chart.chart_type} · {chart.x_field} / {chart.y_field}</p>
       {chartPoints(chart) ?? <p className="muted">No chartable values are available.</p>}
       {chart.warnings?.map((warning) => <p className="dashboard-warning" key={warning}>{warning}</p>)}
+    </article>
+  )
+}
+
+function SavedForecast({ entry }) {
+  const { component } = entry
+  if (entry.error) {
+    return (
+      <article className="dashboard-chart-card" role="status">
+        <h3>{component.chart_specification?.title ?? 'Saved monthly forecast'}</h3>
+        <p className="dashboard-warning">
+          This saved forecast is unavailable or stale: {entry.error}
+        </p>
+        <p className="muted">
+          Original run {component.workflow_id} · dataset {component.dataset_id} /
+          {' '}file {component.file_id} · source {component.source_fingerprint}
+        </p>
+      </article>
+    )
+  }
+  const { result, completedAt } = entry
+  return (
+    <article className="dashboard-chart-card">
+      <h3>Original persisted forecast run</h3>
+      <p className="muted">
+        Persisted run {component.workflow_id} · dataset {component.dataset_id} /
+        {' '}file {component.file_id} · source {component.source_fingerprint.slice(0, 12)}
+      </p>
+      <p className="muted">
+        {component.horizon}-month horizon · {component.aggregation} aggregation ·
+        {' '}generated {completedAt ?? component.forecast_completed_at ?? 'time unavailable'}
+      </p>
+      <p className="muted">
+        {result.evaluation.method ?? 'Chronological holdout'} ·
+        {' '}{result.evaluation.sample_count ?? 'unknown'} evaluation period(s)
+        {result.evaluation.period_start && ` (${result.evaluation.period_start}–${result.evaluation.period_end})`}
+      </p>
+      <p className="muted">
+        Measured holdout MAE {result.evaluation.candidate.mae.toFixed(2)} vs
+        {' '}{result.evaluation.baseline_name} baseline MAE
+        {' '}{result.evaluation.baseline.mae.toFixed(2)} · RMSE
+        {' '}{result.evaluation.candidate.rmse.toFixed(2)} · WAPE
+        {' '}{!Number.isFinite(result.evaluation.candidate.wape)
+          ? `unavailable${result.evaluation.candidate.wape_reason
+            ? `: ${result.evaluation.candidate.wape_reason}`
+            : ''}`
+          : `${result.evaluation.candidate.wape.toFixed(2)}%`}
+        {' '}· comparison {result.evaluation.comparison?.outcome ?? 'legacy result; comparison unavailable'}
+      </p>
+      <p className="muted">
+        {result.uncertainty.status === 'available'
+          ? 'Empirical rolling-origin error envelope; not a calibrated prediction interval.'
+          : `Uncertainty unavailable: ${result.uncertainty.reason}`}
+      </p>
+      {result.forecast.map((point) => (
+        <p className="muted" key={point.period}>
+          Forecast {point.period}: {point.predicted.toFixed(2)}
+          {point.lower_bound !== null && point.lower_bound !== undefined
+            && point.upper_bound !== null && point.upper_bound !== undefined
+            ? ` · empirical error envelope ${point.lower_bound.toFixed(2)}–${point.upper_bound.toFixed(2)}`
+            : ' · uncertainty bounds unavailable'}
+        </p>
+      ))}
+      {(result.suitability?.findings ?? []).map((finding, index) => (
+        <p
+          className={finding.severity === 'warning' || finding.severity === 'blocked'
+            ? 'dashboard-warning'
+            : 'muted'}
+          key={`${finding.code}-${index}`}
+        >
+          {finding.severity}: {finding.message}
+        </p>
+      ))}
+      <ChartCard chart={result.chart} />
+    </article>
+  )
+}
+
+function SavedAnalyticsResult({ entry }) {
+  const { component } = entry
+  if (entry.error) {
+    return (
+      <article className="dashboard-chart-card" role="status">
+        <h3>Saved analytics output</h3>
+        <p className="dashboard-warning">
+          This saved analytics result is unavailable or stale: {entry.error}
+        </p>
+        <p className="muted">
+          Original workflow {component.workflow_id} · task {component.task_id}
+        </p>
+      </article>
+    )
+  }
+  const { result } = entry
+  const summary = result.result.summary
+  const rowLabel = summary?.joined_row_count !== undefined
+    ? `${summary.joined_row_count} joined row(s)`
+    : summary?.rows_analyzed !== undefined
+      ? `${summary.rows_analyzed} source row(s) analyzed`
+      : null
+  const groupCount = summary?.group_count
+  return (
+    <article className="dashboard-chart-card">
+      <h3>Original persisted analytics output</h3>
+      <p className="muted">
+        {result.operation.replaceAll('_', ' ')} · workflow {component.workflow_id} ·
+        {' '}task {component.task_id} · workflow status {result.workflow_status} ·
+        {' '}completed {result.completed_at ?? 'time unavailable'}
+      </p>
+      <p className="muted">
+        {rowLabel && `${rowLabel} · `}
+        {groupCount !== undefined && `${groupCount} result group(s) · `}
+        {summary?.findings_count ?? result.result.findings.length} verified finding(s) ·
+        {' '}provenance {result.provenance.operation_id}
+      </p>
+      {result.dependency_task_ids?.length > 0 && (
+        <p className="muted">
+          Executed after persisted plan task(s): {result.dependency_task_ids.join(', ')}
+        </p>
+      )}
+      {result.result.charts.map((chart) => (
+        <ChartCard chart={chart} key={`${chart.title}-${chart.x_field}-${chart.y_field}`} />
+      ))}
+      {result.result.findings.slice(0, 20).map((finding) => (
+        <p className="muted" key={finding.id}>
+          {finding.statement}
+        </p>
+      ))}
+      {result.result.findings.length > 20 && (
+        <p className="muted">
+          Showing 20 of {result.result.findings.length} findings. Open the source workflow for the complete bounded report.
+        </p>
+      )}
+      {result.warnings.map((warning, index) => (
+        <p className="dashboard-warning" key={`${warning}-${index}`}>{warning}</p>
+      ))}
     </article>
   )
 }
@@ -253,8 +403,12 @@ function DashboardForm({ sources, onCreate, busy }) {
 function Dashboards() {
   const [dashboards, setDashboards] = useState([])
   const [sources, setSources] = useState([])
-  const [selectedId, setSelectedId] = useState('')
+  const [selectedId, setSelectedId] = useState(() => (
+    new URLSearchParams(window.location.hash.split('?')[1] ?? '').get('dashboardId') ?? ''
+  ))
   const [report, setReport] = useState(null)
+  const [forecastComponents, setForecastComponents] = useState([])
+  const [analyticsComponents, setAnalyticsComponents] = useState([])
   const [layout, setLayout] = useState([])
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
@@ -281,7 +435,9 @@ function Dashboards() {
       }))
       setDashboards(saved)
       setSources(fileGroups.flat())
-      setSelectedId((current) => saved.some((dashboard) => dashboard.id === current) ? current : saved[0]?.id ?? '')
+      setSelectedId((current) => saved.some((dashboard) => dashboard.id === current)
+        ? current
+        : saved[0]?.id ?? '')
     } catch (requestError) {
       if (requestError.name !== 'AbortError') setError(requestError.message)
     } finally {
@@ -301,6 +457,115 @@ function Dashboards() {
     [dashboards, selectedId],
   )
 
+  const loadSavedForecasts = useCallback(async (dashboard, signal) => {
+    const components = dashboard.definition?.forecast_components ?? []
+    const loaded = await Promise.all(components.map(async (component) => {
+      try {
+        const run = await getMonthlyForecast(component.workflow_id, signal)
+        const result = run.task?.result
+        const matchesSavedReference = (
+          run.status === 'completed'
+          && run.task?.status === 'completed'
+          && result
+          && result.dataset_id === component.dataset_id
+          && result.file_id === component.file_id
+          && result.table_index === component.table_index
+          && result.source_fingerprint === component.source_fingerprint
+          && result.normalized_artifact_sha256 === component.normalized_artifact_sha256
+          && result.date_column === component.date_column
+          && result.target_column === component.target_column
+          && result.aggregation === component.aggregation
+          && result.horizon === component.horizon
+          && result.result_sha256 === component.result_sha256
+          && result.model_artifact_sha256 === component.model_artifact_sha256
+          && result.chart?.chart_type === component.chart_specification?.chart_type
+          && result.chart?.title === component.chart_specification?.title
+          && result.chart?.x_field === component.chart_specification?.x_field
+          && result.chart?.y_field === component.chart_specification?.y_field
+          && result.chart?.series_field === component.chart_specification?.series_field
+          && result.chart?.data?.series?.some((series) => series.name === 'Observed history')
+          && result.chart?.data?.series?.some((series) => series.name === 'Forecast')
+          && result.evaluation?.candidate
+          && result.evaluation?.baseline
+        )
+        if (!matchesSavedReference) {
+          throw new Error('The saved forecast reference does not match its persisted result.')
+        }
+        return {
+          component,
+          result,
+          completedAt: run.completed_at,
+        }
+      } catch (requestError) {
+        if (requestError.name === 'AbortError') throw requestError
+        return { component, error: requestError.message }
+      }
+    }))
+    if (!signal?.aborted) setForecastComponents(loaded)
+    return loaded
+  }, [])
+
+  const loadSavedAnalytics = useCallback(async (dashboard, signal) => {
+    const components = dashboard.definition?.analytics_components ?? []
+    const loaded = await Promise.all(components.map(async (component) => {
+      try {
+        const result = await getAnalyticsWorkflowResult(
+          component.workflow_id,
+          component.task_id,
+          signal,
+        )
+        const sameSourceReferences = (
+          Array.isArray(component.source_references)
+          && Array.isArray(result.source_references)
+          && component.source_references.length === result.source_references.length
+          && component.source_references.every((savedSource) => (
+            result.source_references.some((currentSource) => (
+              currentSource.alias === savedSource.alias
+              && currentSource.dataset_id === savedSource.dataset_id
+              && currentSource.file_id === savedSource.file_id
+              && currentSource.table_index === savedSource.table_index
+              && currentSource.source_fingerprint === savedSource.source_fingerprint
+              && currentSource.normalized_artifact_sha256
+                === savedSource.normalized_artifact_sha256
+            ))
+          ))
+        )
+        if (
+          result.workflow_id !== component.workflow_id
+          || result.task_id !== component.task_id
+          || result.operation !== component.operation
+          || result.result_sha256 !== component.result_sha256
+          || !sameSourceReferences
+          || !result.provenance
+          || !Array.isArray(result.result?.charts)
+          || !Array.isArray(result.result?.findings)
+        ) {
+          throw new Error('The saved analytics reference does not match its verified workflow result.')
+        }
+        return { component, result }
+      } catch (requestError) {
+        if (requestError.name === 'AbortError') throw requestError
+        return { component, error: requestError.message }
+      }
+    }))
+    if (!signal?.aborted) setAnalyticsComponents(loaded)
+    return loaded
+  }, [])
+
+  useEffect(() => {
+    if (!selectedId) return undefined
+    const controller = new AbortController()
+    getDashboard(selectedId, controller.signal)
+      .then((dashboard) => Promise.all([
+        loadSavedForecasts(dashboard, controller.signal),
+        loadSavedAnalytics(dashboard, controller.signal),
+      ]))
+      .catch((requestError) => {
+        if (requestError.name !== 'AbortError') setError(requestError.message)
+      })
+    return () => controller.abort()
+  }, [loadSavedAnalytics, loadSavedForecasts, selectedId])
+
   async function refreshDashboard(dashboard = selected) {
     if (!dashboard) return
     setBusy(true)
@@ -311,8 +576,19 @@ function Dashboards() {
       const definition = await getDashboard(dashboard.id)
       const { analysis_request: analysis, chart_requests: charts } = definition.definition
       setLayout(definition.definition.layout ?? [])
-      setReport(await generateAnalyticsReport({ ...analysis, charts }))
-      setNotice('Report refreshed from current source data. Dashboards refresh only when requested.')
+      await Promise.all([
+        loadSavedForecasts(definition),
+        loadSavedAnalytics(definition),
+      ])
+      if (analysis) {
+        setReport(await generateAnalyticsReport({ ...analysis, charts }))
+        setNotice(
+          'Dashboard report refreshed from current source data. Saved workflow results and forecasts were revalidated and reloaded without recomputation or retraining.',
+        )
+      } else {
+        setReport(null)
+        setNotice('Saved workflow results and forecasts were revalidated and reloaded without recomputation or retraining.')
+      }
     } catch (requestError) {
       setError(requestError.message)
     } finally {
@@ -346,6 +622,8 @@ function Dashboards() {
       setDashboards(remaining)
       setSelectedId(remaining[0]?.id ?? '')
       setReport(null)
+      setForecastComponents([])
+      setAnalyticsComponents([])
       setLayout([])
       setNotice('Dashboard deleted.')
     } catch (requestError) {
@@ -365,7 +643,7 @@ function Dashboards() {
           </div>
           {dashboards.length > 0 && (
             <label className="dashboard-select-label">Dashboard
-              <select value={selectedId} onChange={(event) => { setSelectedId(event.target.value); setReport(null); setNotice('') }}>
+              <select value={selectedId} onChange={(event) => { setSelectedId(event.target.value); setReport(null); setForecastComponents([]); setAnalyticsComponents([]); setNotice('') }}>
                 {dashboards.map((dashboard) => <option key={dashboard.id} value={dashboard.id}>{dashboard.title}</option>)}
               </select>
             </label>
@@ -377,7 +655,11 @@ function Dashboards() {
           <div className="dashboard-actions">
             <p className="muted">{selected.description || 'Saved analysis definition'} · refreshes on demand</p>
             <button className="button button-secondary" type="button" onClick={() => refreshDashboard()} disabled={busy}>
-              {busy ? 'Refreshing…' : 'Refresh report'}
+              {busy
+                ? 'Refreshing…'
+                : selected.definition?.analysis_request
+                  ? 'Refresh report'
+                  : 'Reload saved forecasts'}
             </button>
             <button className="button button-secondary" type="button" onClick={handleDelete} disabled={busy}>Delete</button>
           </div>
@@ -418,6 +700,29 @@ function Dashboards() {
               ))}
             </ul>
           </div>
+        )}
+        {forecastComponents.length > 0 && (
+          <section className="dashboard-report">
+            <h3>Saved forecasts · original persisted runs</h3>
+            <div className="dashboard-chart-grid">
+              {forecastComponents.map((entry) => (
+                <SavedForecast key={entry.component.workflow_id} entry={entry} />
+              ))}
+            </div>
+          </section>
+        )}
+        {analyticsComponents.length > 0 && (
+          <section className="dashboard-report">
+            <h3>Saved analytics outputs · original workflows</h3>
+            <div className="dashboard-chart-grid">
+              {analyticsComponents.map((entry) => (
+                <SavedAnalyticsResult
+                  entry={entry}
+                  key={`${entry.component.workflow_id}-${entry.component.task_id}`}
+                />
+              ))}
+            </div>
+          </section>
         )}
       </section>
       <section className="panel dashboard-panel">

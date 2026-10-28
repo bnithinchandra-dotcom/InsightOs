@@ -29,8 +29,12 @@ to Redis and idles; it does not consume jobs. Upload, normalization, quality
 analysis, EDA, and schema analysis execute synchronously in API requests.
 Preprocessing is a Python-library entry point and is not wired into the API or
 UI. The local Data Workspace supports profile/project setup, upload,
-normalization, and univariate EDA; authentication, quality workflows, and
-broader interactive data-analysis workflows remain unimplemented.
+normalization, univariate EDA, monthly forecasting, and explicit dashboard
+saving for verified results. EDA evidence reporting uses the stored EDA
+analysis reference and the existing durable analytics-plan task path.
+Multi-dataset reports remain an explicitly sourced dashboard-builder path;
+they do not consume EDA or forecast results. A general-purpose BI workspace
+remains unimplemented.
 
 Compose-published API and infrastructure ports bind to `127.0.0.1`. Selected
 project, dataset, file, and conversation routes enforce ownership against the
@@ -162,6 +166,28 @@ The API persists conversations and ordered user/assistant messages in
 - `POST /api/v1/chat/workflows/{workflow_id}/recover` — explicitly recover a
   stale workflow by reusing valid completed read-only tasks and retrying
   eligible idempotent read-only tasks.
+- `GET /api/v1/chat/workflows/{workflow_id}/tasks/{task_key}/analytics-result`
+  — retrieve a completed Assistant evidence-report task after rechecking
+  workflow/task ownership, task input identity, normalized source references,
+  report provenance, and the persisted output digest.
+- `GET /api/v1/chat/analytics/capabilities` — return machine-readable analytics
+  capability metadata and parameter schemas derived from registered tool
+  definitions, including which operations support the structured report
+  workflow and bounded-plan execution.
+- `POST /api/v1/chat/analytics/executions` — validate and execute one
+  registered evidence-report operation through the existing durable workflow
+  task scheduler. Identical operation, parameters, and source-state requests
+  resolve to the same persisted workflow.
+- `POST /api/v1/chat/analytics/plans` — validate and persist a plan of one to
+  five registered evidence-report operations, with dependency depth limited
+  to four operations. Dependencies define execution ordering and failure
+  blocking only: report tools do not accept upstream output references, so
+  result handoffs are rejected. The existing durable workflow task runner
+  executes the plan in dependency order, continues independent operations
+  after failures, and returns verified per-operation results and provenance.
+  Successful report tasks remain individually saveable to dashboards even
+  when the overall workflow is partial; dashboard reload uses the existing
+  task-result verifier and does not rerun work.
 
 Concurrent sends for the same conversation are rejected while it is being
 processed. An unexpected execution failure produces a sanitized failed
@@ -376,6 +402,45 @@ timeout are enforceable because the worker can be terminated. The
 local-runtime target is a contract option only and is not registered or
 available. Execution-placement history is not persisted.
 
+### Phase 5B.3: ML suitability and robust anomaly screening
+
+The metadata-only `POST /api/v1/analytics/ml/suitability` endpoint requires an
+authorized dataset file, successful ingestion, and verified normalized
+artifact. It reuses stored schema and bounded profiling metadata to report
+candidate task categories, explicit prerequisites, missingness, constant
+columns, and likely identifier warnings. It does not infer a business target
+or execute a predictive model. Existing monthly forecasting remains on its
+separate chronological evaluation and persistence contract.
+
+EDA also supports persisted `anomaly_detection` results for one explicitly
+selected numeric column. It scans at most 250,000 rows from the verified
+Parquet artifact and uses a median/MAD robust score, with IQR and zero-
+dispersion fallbacks. At most 100 scored rows are retained. The screen is
+univariate and its threshold is a screening convention, not a calibrated
+false-positive rate; flags are not proof of errors or fraud. Grouped/time-aware
+anomaly detection remains unimplemented.
+
+### Phase 5B.4: supervised evaluation
+
+`POST /api/v1/analytics/ml/supervised` requires an authorized ready source,
+explicit target and feature columns, and explicit confirmation for
+identifier-like or suspicious features. It reads only selected columns from a
+verified Parquet artifact, with 20,000-row, 30-feature, 32 MiB artifact,
+64 MiB decoded-column, 20-class, and 32-category-per-feature bounds. The
+deterministic candidates are Ridge/regularized logistic regression and bounded
+random forests, compared against a dummy baseline.
+
+Preprocessing lives inside each training pipeline. Candidate selection uses a
+separate training-only validation split; final metrics use a held-out test
+split. The request may explicitly select chronological or group-aware
+evaluation, which keeps temporal boundaries ordered or groups disjoint across
+partitions. Only versioned JSON evaluation evidence and a digest are stored in
+the existing workflow task result; executable models are not persisted.
+`GET /api/v1/analytics/ml/supervised/{workflow_id}` and the latest-by-file
+route verify result integrity and current source identity before returning a
+saved result. This is split-specific evaluation evidence, not a production
+model, causal conclusion, or guarantee of future performance.
+
 ### Resource units and enforcement points
 
 | Dimension | Unit and scope | Accounting and enforcement | Status/limitation |
@@ -490,12 +555,15 @@ backend, and the health check does not mutate storage.
 | Normalization | **Partial** | `normalize_file` hashes and reparses the source, builds normalized Parquet per logical table, validates rows/schema/nulls and stores checksummed objects. | Output defaults to 600 MiB, written in batches. A raw Arrow batch-size estimate is checked before each batch; a write-through reservation enforces the exact resulting temporary Parquet file length, including footer bytes, before writes. Result metadata includes versioned source/configuration/output provenance. Temporary files are removed on success and failure. This is an output-file length cap, not a process-memory or filesystem-allocation quota. |
 | Quality analysis | **Partial** | API validates normalized artifacts, downloads verified local copies, runs deterministic registered rules, and persists versioned provenance-bound reports. | 600 MiB normalized-input cap, 4 MiB rule-tracking memory cap, shared comparison budget, bounded findings/examples/report serialization. `RuleBudget` delegates its counters to `ExecutionBudget` while preserving quality-specific units and exhaustion semantics. Additive report provenance preserves legacy report validation and the existing deterministic analysis key. Real PostgreSQL advisory locking and MinIO integration are not established by unit tests in this checkout. |
 | Preprocessing | **Partial** | `DEFAULT_TRANSFORMATION_REGISTRY` and `orchestrate_preprocessing` run explicit DA/BA transforms on Arrow tables; business-semantic operations require explicit approvals. | Input cap 64 MiB Arrow buffers, 1,000,000 rows, 256 columns. Python-string estimates are checked before whole-column conversions and share the byte ceiling across selected columns/chunks. Input/output Arrow IPC fingerprints and ordered per-step provenance are returned in memory. This adds bounded full-table passes; it is not streaming or a process-wide memory bound. Output is not persisted; no API. |
-| EDA | **Partial** | FastAPI routes in `backend/app/main.py` (`POST /api/v1/datasets/{dataset_id}/files/{file_id}/eda`, `GET .../eda`, `GET .../eda/{analysis_id}`); deterministic univariate, bivariate, and multivariate analysis of verified normalized Parquet; the POST computation uses the capability-aware backend task boundary, requiring sensitive-data permission and backend locality without transfer; PostgreSQL persistence in `eda_analyses` retains idempotency, version 1 provenance envelope, and backend-only JEV lineage verification. The Data workspace can normalize an ingested file and run univariate analysis on a selected profile column. | Defaults/caps include 1,000,000 rows, 600 MiB selected-column scan metadata, 250,000 numeric values, 50,000 categories, 250,000 grouped values, 50,000 contingency cells, 4,000,000 pairwise work units, 128 MiB estimated decoded strings, and configured result serialization up to 1 MiB. Result records are persisted with bounded pagination (limit 1-100). Placement is reported only on the immediate computation response, not persisted as execution history. |
+| EDA | **Partial** | FastAPI routes in `backend/app/main.py` (`POST /api/v1/datasets/{dataset_id}/files/{file_id}/eda`, `GET .../eda`, `GET .../eda/{analysis_id}`); deterministic univariate, bivariate, and multivariate analysis of verified normalized Parquet; the POST computation uses the capability-aware backend task boundary, requiring sensitive-data permission and backend locality without transfer; PostgreSQL persistence in `eda_analyses` retains idempotency, version 1 provenance envelope, and backend-only JEV lineage verification. The Data Workspace runs univariate analysis and passes its persisted analysis ID to the durable EDA evidence-report task, which can be explicitly pinned to an existing or new dashboard. | Defaults/caps include 1,000,000 rows, 600 MiB selected-column scan metadata, 250,000 numeric values, 50,000 categories, 250,000 grouped values, 50,000 contingency cells, 4,000,000 pairwise work units, 128 MiB estimated decoded strings, and configured result serialization up to 1 MiB. Result records are persisted with bounded pagination (limit 1-100). Placement is reported only on the immediate computation response, not persisted as execution history. |
+| Monthly forecasting | **Partial** | `POST /api/v1/analytics/forecasts/monthly` loads an owner-authorized, integrity-checked normalized Parquet table, validates explicit time/target columns, sum aggregation, and a 1–24 month horizon, then executes the existing deterministic engine through persisted workflow/task claims. Evaluation is a chronological holdout plus a bounded expanding-window backtest of up to 12 origins. Model MAE comparison uses a 1% relative tolerance; WAPE is unavailable when the absolute-actual denominator is at most `1e-12`. Structured findings report short history, small holdouts, near-constant targets, long horizons relative to history, and duplicate-month aggregation. A descriptive 90th-percentile absolute-error envelope is emitted only with at least eight out-of-sample origins per lead; it is not a calibrated prediction/confidence interval. Request + source fingerprints provide idempotent reuse; `GET /api/v1/analytics/forecasts/monthly/{workflow_id}` verifies bounded model/output integrity and rejects a changed or unavailable source. The registered Assistant tool uses the same API and explicit-intent gate; the Data workspace renders persisted observed and forecast series, measured holdout metrics, warnings, and provenance using the existing chart component. A completed run can be explicitly appended to an owner-scoped dashboard through `POST /api/v1/dashboards/{dashboard_id}/forecasts`; the dashboard JSON stores the run ID, source fingerprint, parameters, chart specification, timestamps, and provenance references. Dashboard reload and refresh resolve the same verified persisted run and display stale/unavailable states without retraining. Schema-v1 artifacts remain readable with suitability/uncertainty explicitly unavailable. | Monthly gaps are rejected; only sum aggregation and the existing linear-trend/annual-seasonality algorithm are supported. Result/model artifacts are bounded and serialized into the existing task summary; public API responses contain an artifact hash/reference, not the serialized model. Dashboard references are bounded to eight per dashboard and do not duplicate model artifacts or series data. No calibrated prediction intervals, independent accuracy oracle, background queue, or automatic replay is implemented. No schema migration was needed. |
+| Assistant report dashboard delivery | **Partial** | Existing dashboard JSON can explicitly pin a completed `generate_evidence_report` or `generate_eda_evidence_report` task through `POST /api/v1/dashboards/{dashboard_id}/analytics-results`. The dashboard stores only the workflow/task reference, result digest, source fingerprints/artifact hashes, and save time; `GET /api/v1/chat/workflows/{workflow_id}/tasks/{task_key}/analytics-result` resolves the bounded persisted task output and revalidates its inputs and provenance. Dashboard reload renders stored charts/findings and unavailable/stale states. Refresh re-resolves the original task and does not rerun its report operation. | At most eight report references are stored per dashboard; report data remains in the existing workflow task result summary. New saves reject incomplete, unauthorized, stale-source, or integrity-invalid results. Dashboard edits preserve saved forecast and report references. No parallel report/dashboard store or schema migration was added. |
+| Unified structured analytics journey | **Partial** | `GET /api/v1/chat/analytics/capabilities` describes registered analytics operations directly from `ToolDefinition` parameter models and execution metadata. The Assistant workspace supports bounded single-operation execution and multi-operation plans through `POST /api/v1/chat/analytics/executions` and `/plans`; report tasks are source-validated, persisted through the existing workflow/task scheduler, and returned with verified evidence. The Data Workspace can pass a stored EDA analysis ID into an EDA evidence-report plan and explicitly pin its completed task result to a dashboard. Completed monthly forecast runs are saved through their separate forecast contract. Multi-dataset reports use explicit source, join, dimension, and metric parameters in the dashboard builder; they do not consume EDA or forecast task outputs. | Plans currently accept only registered evidence-report operations, with dependency ordering/blocking but no result-data handoffs. EDA, multi-dataset reporting, and forecasting remain separate operation paths. Execution is bounded and synchronous under existing task, output-size, and workflow limits; there is no new background queue or automatic recovery. |
 | Schema Architect (Phase 4) | **Partial** | `backend/app/schema_architect.py` profiles selected normalized tables, identifies candidate keys, infers or rejects relationship hypotheses with overlap/cardinality/fan-out evidence, and produces conditional star, snowflake, and hybrid recommendations; when evidence does not support those structures, it recommends conservatively preserving the selected tables. Column roles are heuristic candidates only. FastAPI persists results in `schema_analyses` with source and artifact provenance. The React workflow selects projects, datasets, and normalized tables; creates or recomputes analyses; and displays history, relationship evidence, conditional recommendations, warnings, and provenance. | Synchronous and deterministic; accepts at most 20 files/tables and 200 columns per table, scans at most 1,000,000 rows and 1 GiB of selected normalized artifacts, retains at most 100,000 typed values (32 MiB canonical-value bytes; 10,000 values per column; 16 KiB per value), evaluates at most 10,000 relationship comparisons/500 candidates, and returns at most 10 MiB. It streams object downloads in 1 MiB chunks and scans Parquet batches. Exact distinct/overlap statistics become unavailable when retention limits are exceeded. Keys and relationships are never called verified constraints; models, grain, and measure semantics remain conditional. A per-file schema-analysis advisory lock prevents duplicate concurrent runs; existing normalization, quality, EDA, preprocessing, and deletion locks also prevent cross-operation overlap. No LLM, source rewrite, or warehouse materialization is used. Isolated PostgreSQL/MinIO integration tests cover project/dataset/file listing, analysis creation/retrieval/recomputation, history pagination, stale detection, and missing-resource errors; a browser run against the same isolated service flow verified frontend selection, creation, recomputation, retrieval, and stale display. |
-| Frontend | **Partial** | React shell, system-health view, local workspace profile bootstrap, project/dataset creation, supported-file multipart upload, ingestion status, normalization, univariate EDA result display, Phase 4 Schema Architect, conversation workspace, and a feature-probed browser Web Worker SHA-256 demonstration. | The local profile bootstrap is one-time and unauthenticated for local development only; it is not account/authentication support. Selected API routes check ownership, but route coverage is incomplete and not tenant isolation; remote/multi-user deployment is unsupported. Browser worker is not integrated with ingestion or BI analysis; no cross-target scheduling. |
+| Frontend | **Partial** | React shell, system-health view, local workspace profile bootstrap, project/dataset creation, supported-file multipart upload, ingestion and normalization status/error display, retryable normalization, univariate EDA with durable evidence-report and dashboard-save flow, monthly forecasting of verified normalized files, explicit-source dashboard report builder, Phase 4 Schema Architect, conversation workspace, and a feature-probed browser Web Worker SHA-256 demonstration. File mutations refresh only the selected source list; forecast and saved analytics results resolve their original persisted references and display provenance/warnings. | The local profile bootstrap is one-time and unauthenticated for local development only; it is not account/authentication support. Selected API routes check ownership, but route coverage is incomplete and not tenant isolation; remote/multi-user deployment is unsupported. Browser worker is not integrated with ingestion or BI analysis; no cross-target scheduling. |
 | Capability-aware execution (Phase 5B) | **Foundation partial** | `backend/app/task_execution.py` provides typed capabilities, deterministic policy, typed failures, and bounded result validation; registered agent tools and deterministic EDA computation use backend targets with their respective classifications/capabilities. `frontend/src/execution.js` discovers browser worker/Web Crypto support and enforces task timeout/cancellation by terminating the worker. | Backend task execution remains synchronous/cooperative; no backend hard timeout/cancellation, local-runtime target, cross-environment scheduler, persisted execution-placement history, or BI operation on a browser worker. |
 | Worker/queue | **Planned** | Worker starts, checks Redis, and idles. | No queue consumer, retry lifecycle, or execution-budget propagation. The frontend Web Worker is a separate browser-local execution target, not this service. |
-| Bounded assistant specialists and deterministic analytics/report tools | **Partial** | Sequential logical specialists validate explicit registered operations; deterministic multi-dataset analytics and evidence-backed reports are available through typed chat tools. | Not a general autonomous BI system: forecasting, prediction, broad NL analytics, semantic layer, monitoring, governance, and production deployment remain planned or unverified. |
+| Bounded assistant specialists and deterministic analytics/report tools | **Partial** | Sequential logical specialists validate explicit registered operations; deterministic multi-dataset analytics, evidence-backed reports, and explicitly requested monthly forecasting are available through typed chat tools. | Not a general autonomous BI system: arbitrary forecasting/modeling, broad NL analytics, semantic layer, monitoring, governance, and production deployment remain planned or unverified. |
 
 ### JSON expansion boundary
 
@@ -582,7 +650,8 @@ authentication boundary, or remote deployment profile.
 | Ingestion and storage | **Partial** |
 | Profiling, normalization, quality | **Partial** |
 | Preprocessing | **Partial; in-memory library** |
-| EDA (Stage 3.7 API & persistence) | **Partial; API and PostgreSQL persistence plus basic Data Workspace univariate EDA implemented; broader UI workflows planned** |
+| EDA (Stage 3.7 API & persistence) | **Partial; API and PostgreSQL persistence, Data Workspace EDA/anomaly screening, durable evidence reporting, and explicit dashboard save implemented; broader analysis workflows remain** |
+| ML task suitability, anomaly screening and supervised evaluation | **Partial; verified-source metadata assessment, persisted bounded univariate anomaly screening, and held-out regression/classification evaluation; executable model persistence and dashboard integration are not implemented** |
 | Schema Architect (Phase 4) | **Partial; deterministic API, persistence, frontend workflow, and disposable PostgreSQL/MinIO browser verification implemented** |
 | Semantic layer, agents, NL-BI, ML, monitoring, governance, production deployment | **Planned** |
 

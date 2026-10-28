@@ -15,6 +15,7 @@ from app.agent.contracts import (
 )
 from app.agent.runtime import execute_agent_request
 from app.agent.tools import ToolRegistry
+from app.main import MonthlyForecastRequest
 
 
 def _settings():
@@ -244,6 +245,134 @@ class DatasetEngineToolTests(unittest.TestCase):
             )
         }
         self.assertNotIn("run_eda_analysis", missing_context_tools)
+
+    def test_monthly_forecast_is_registered_only_for_explicit_selected_dataset_requests(self):
+        registry = ToolRegistry()
+        forecast_tools = {
+            item["function"]["name"]
+            for item in registry.provider_schemas(
+                context={
+                    "dataset_id": 42,
+                    "user_message": "Generate a monthly forecast of net_sales.",
+                }
+            )
+        }
+        self.assertIn("run_monthly_forecast", forecast_tools)
+        self.assertNotIn(
+            "run_monthly_forecast",
+            {
+                item["function"]["name"]
+                for item in registry.provider_schemas(
+                    context={
+                        "dataset_id": 42,
+                        "user_message": "Explain what a forecast is.",
+                    }
+                )
+            },
+        )
+        self.assertNotIn(
+            "run_monthly_forecast",
+            {
+                item["function"]["name"]
+                for item in registry.provider_schemas(
+                    context={"user_message": "Generate a monthly forecast."}
+                )
+            },
+        )
+
+    def test_monthly_forecast_runs_through_specialists_and_returns_verified_values(self):
+        self.main.MonthlyForecastRequest = MonthlyForecastRequest
+        self.main.create_monthly_forecast = Mock(
+            return_value={
+                "workflow_id": "a" * 32,
+                "task_id": "b" * 32,
+                "status": "completed",
+            }
+        )
+        result = {
+            "dataset_id": 42,
+            "file_id": 7,
+            "table_index": 0,
+            "date_column": "order_date",
+            "target_column": "net_sales",
+            "aggregation": "sum",
+            "horizon": 1,
+            "source_fingerprint": "c" * 64,
+            "normalized_artifact_sha256": "d" * 64,
+            "historical": [{"period": "2022-12", "observed": 140.0}],
+            "forecast": [{"period": "2023-01", "predicted": 150.25, "kind": "forecast"}],
+            "evaluation": {
+                "candidate": {"mae": 4.0, "rmse": 5.0, "wape": 2.5},
+                "baseline": {"mae": 8.0, "rmse": 9.0, "wape": 5.0},
+                "baseline_name": "last_observation",
+                "beats_baseline": True,
+            },
+            "chart": {
+                "title": "net_sales monthly forecast",
+                "chart_type": "line",
+                "x_field": "order_date",
+                "y_field": "net_sales",
+                "data": {"labels": ["2022-12", "2023-01"], "series": []},
+            },
+            "warnings": [],
+            "limitations": [],
+            "references": [
+                {
+                    "type": "normalized_source",
+                    "dataset_id": 42,
+                    "file_id": 7,
+                    "source_fingerprint": "c" * 64,
+                }
+            ],
+        }
+        self.main.get_monthly_forecast = Mock(
+            return_value={
+                "workflow_id": "a" * 32,
+                "status": "completed",
+                "created_at": "2026-10-28T00:00:00",
+                "completed_at": "2026-10-28T00:00:01",
+                "task": {
+                    "id": "b" * 32,
+                    "status": "completed",
+                    "result": result,
+                },
+            }
+        )
+        provider = EngineRequestProvider(
+            "run_monthly_forecast",
+            {
+                "dataset_id": 42,
+                "file_id": 7,
+                "table_index": 0,
+                "date_column": "order_date",
+                "target_column": "net_sales",
+                "aggregation": "sum",
+                "horizon": 1,
+            },
+        )
+
+        outcome = execute_agent_request(
+            user_message="Generate a monthly forecast of net_sales.",
+            history=[],
+            context={"dataset_id": 42, "conversation_id": 301},
+            settings=_settings(),
+            provider=provider,
+            registry=ToolRegistry(),
+        )
+
+        self.assertEqual(outcome.status, "completed")
+        self.assertIn("2023-01: 150.25", outcome.assistant_text)
+        self.assertIn("MAE 4.00 vs selected baseline 8.00", outcome.assistant_text)
+        self.main.create_monthly_forecast.assert_called_once()
+        self.main.get_monthly_forecast.assert_called_once_with("a" * 32)
+        forecast_result = next(
+            item
+            for item in outcome.structured_results
+            if item["tool"] == "run_monthly_forecast"
+        )
+        self.assertEqual(forecast_result["status"], "succeeded")
+        self.assertEqual(forecast_result["data"]["workflow_id"], "a" * 32)
+        self.assertEqual(forecast_result["data"]["forecast"][0]["predicted"], 150.25)
 
     def test_agent_two_runs_real_eda_endpoint_with_validated_scoped_arguments(self):
         provider = EngineRequestProvider(

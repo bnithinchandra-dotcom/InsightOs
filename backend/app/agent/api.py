@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from contextlib import ExitStack
 from collections.abc import Callable
 from typing import Annotated, Literal
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,7 @@ from fastapi import APIRouter, HTTPException, Path, Query, status
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, ValidationError
 from sqlalchemy import func
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import object_session
 
 from app.agent.config import (
     MAX_HISTORY_MESSAGES,
@@ -40,11 +42,13 @@ from app.agent.specialist_agents import (
 from app.agent.runtime import execute_agent_request, public_outcome_metadata
 from app.agent.tools import ToolRegistry
 from app.database import SessionLocal
+from app.provenance import canonical_sha256, validate_provenance
 from app.models import (
     Conversation,
     ConversationMessage,
     Dataset,
     DatasetFile,
+    EDAAnalysis,
     Project,
     User,
     WorkflowExecution,
@@ -55,6 +59,7 @@ from app.workflow_execution import (
     MAX_WORKFLOW_TASKS,
     WorkflowPlanError,
     WorkflowTaskExecutionError,
+    persist_trace_plan,
     persist_workflow_task,
     recover_persisted_workflow,
     run_persisted_workflow,
@@ -67,6 +72,9 @@ PROCESSING_LEASE_SECONDS = 2_460
 MAX_MESSAGES_PER_CONVERSATION = 25
 MAX_PERSISTED_MESSAGE_BYTES = 256 * 1024
 MAX_RECOVERY_AGE_SECONDS = PROCESSING_LEASE_SECONDS
+MAX_ANALYTICS_PLAN_OPERATIONS = 5
+MAX_ANALYTICS_PLAN_DEPTH = 4
+MAX_ANALYTICS_PLAN_BYTES = 32 * 1024
 
 
 def _fingerprint_json(value: Any) -> str:
@@ -309,26 +317,54 @@ def _workflow_task_input_is_current(
         for item in references
         if isinstance(item, dict) and item.get("type") == "dependency_outputs"
     ]
+    dependency_order_refs = [
+        item
+        for item in references
+        if isinstance(item, dict) and item.get("type") == "dependency_order"
+    ]
     if dependency_tasks:
-        if len(dependency_refs) != 1 or any(
-            dependency.status != "completed"
-            or not isinstance(dependency.result_summary, dict)
-            for dependency in dependency_tasks
-        ):
-            return False
-        current_fingerprints = [
-            {
-                "task_id": dependency.task_key,
-                "sha256": _fingerprint_json(dependency.result_summary),
-            }
-            for dependency in sorted(
-                dependency_tasks,
-                key=lambda item: item.task_key,
+        if dependency_order_refs:
+            expected_dependency_keys = sorted(
+                dependency.task_key for dependency in dependency_tasks
             )
-        ]
-        if dependency_refs[0].get("fingerprints") != current_fingerprints:
-            return False
-    elif dependency_refs:
+            if (
+                len(dependency_order_refs) != 1
+                or dependency_refs
+                or dependency_order_refs[0].get("task_ids")
+                != expected_dependency_keys
+                or any(dependency.status != "completed" for dependency in dependency_tasks)
+            ):
+                return False
+        elif (
+            not dependency_refs
+            and task.status in {"pending", "running", "failed"}
+            and task.task_type
+            in {
+                "generate_evidence_report",
+                "generate_eda_evidence_report",
+            }
+        ):
+            pass
+        else:
+            if len(dependency_refs) != 1 or any(
+                dependency.status != "completed"
+                or not isinstance(dependency.result_summary, dict)
+                for dependency in dependency_tasks
+            ):
+                return False
+            current_fingerprints = [
+                {
+                    "task_id": dependency.task_key,
+                    "sha256": _fingerprint_json(dependency.result_summary),
+                }
+                for dependency in sorted(
+                    dependency_tasks,
+                    key=lambda item: item.task_key,
+                )
+            ]
+            if dependency_refs[0].get("fingerprints") != current_fingerprints:
+                return False
+    elif dependency_refs or dependency_order_refs:
         return False
     identity = json.dumps(
         {
@@ -346,6 +382,357 @@ def _workflow_task_input_is_current(
     return hashlib.sha256(identity.encode("utf-8")).hexdigest() == identity_refs[0].get(
         "sha256"
     )
+
+
+def get_verified_analytics_workflow_result(
+    session: SessionLocal,
+    owner: User,
+    workflow_id: str,
+    task_key: str,
+) -> dict[str, Any]:
+    workflow = (
+        session.query(WorkflowExecution)
+        .filter(
+            WorkflowExecution.id == workflow_id,
+            WorkflowExecution.owner_user_id == owner.id,
+        )
+        .one_or_none()
+    )
+    if workflow is None:
+        raise HTTPException(status_code=404, detail="Workflow not found.")
+    if workflow.conversation_id is not None:
+        conversation = session.get(Conversation, workflow.conversation_id)
+        if conversation is None:
+            raise HTTPException(status_code=404, detail="Workflow not found.")
+        if conversation.project_id is not None:
+            _require_project_access(session, conversation.project_id, owner)
+        if conversation.dataset_id is not None:
+            _require_dataset_access(session, conversation.dataset_id, owner)
+    if workflow.dataset_id is not None:
+        _require_dataset_access(session, workflow.dataset_id, owner)
+
+    task = (
+        session.query(WorkflowTask)
+        .filter(
+            WorkflowTask.workflow_id == workflow.id,
+            WorkflowTask.task_key == task_key,
+        )
+        .one_or_none()
+    )
+    if task is None:
+        raise HTTPException(status_code=404, detail="Workflow task not found.")
+    if task.task_type not in {
+        "generate_evidence_report",
+        "generate_eda_evidence_report",
+    }:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "analytics_output_unsupported",
+                "message": "This workflow operation does not produce a dashboard report.",
+            },
+        )
+    if (
+        task.status != "completed"
+        or not isinstance(task.result_summary, dict)
+        or task.result_summary.get("status") != "succeeded"
+        or not isinstance(task.result_summary.get("data"), dict)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "analytics_output_unavailable",
+                "message": "Only completed successful report operations can be delivered.",
+            },
+        )
+    if not _workflow_task_input_is_current(session, workflow, task):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "analytics_output_stale",
+                "message": "The report source or workflow inputs are no longer current.",
+            },
+        )
+
+    argument_refs = [
+        item
+        for item in task.input_references
+        if isinstance(item, dict)
+        and item.get("type") == "tool_arguments"
+        and item.get("tool") == task.task_type
+        and isinstance(item.get("arguments"), dict)
+    ]
+    if len(argument_refs) != 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "analytics_output_invalid",
+                "message": "The persisted report inputs are missing or ambiguous.",
+            },
+        )
+    arguments = argument_refs[0]["arguments"]
+    report = task.result_summary["data"]
+    try:
+        provenance = validate_provenance(report.get("provenance"))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "analytics_provenance_invalid",
+                "message": "The persisted report provenance could not be verified.",
+            },
+        ) from None
+    if (
+        provenance["status"] not in {"completed", "partial"}
+        or not isinstance(report.get("summary"), dict)
+        or not isinstance(report.get("findings"), list)
+        or not isinstance(report.get("charts"), list)
+        or not isinstance(report.get("warnings"), list)
+        or any(not isinstance(item, str) for item in report["warnings"])
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "analytics_output_invalid",
+                "message": "The persisted report does not satisfy its output contract.",
+            },
+        )
+
+    if task.task_type == "generate_evidence_report":
+        from app.main import (
+            MultiDatasetReportRequest,
+            _load_multi_dataset_sources,
+        )
+
+        try:
+            request = MultiDatasetReportRequest.model_validate(arguments)
+        except ValidationError:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "analytics_output_invalid",
+                    "message": "The persisted analytics request failed validation.",
+                },
+            ) from None
+        with ExitStack() as cleanup:
+            sources = _load_multi_dataset_sources(
+                session,
+                request.sources,
+                owner,
+                cleanup,
+            )
+        expected_sources = [
+            {
+                "dataset_id": source.dataset_id,
+                "file_id": source.file_id,
+                "table_index": source.table_index,
+                "source_fingerprint": source.checksum,
+                "normalized_artifact_sha256": source.artifact_sha256,
+                "alias": source.alias,
+            }
+            for source in sources
+        ]
+        inputs = provenance["inputs"]
+        actual_sources = sorted(
+            json.dumps(
+                [
+                    item.get("dataset_id"),
+                    item.get("file_id"),
+                    item.get("table_index"),
+                    item.get("sha256"),
+                ],
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for item in inputs
+            if isinstance(item, dict)
+        )
+        expected_provenance_sources = sorted(
+            json.dumps(
+                [
+                    source["dataset_id"],
+                    source["file_id"],
+                    source["table_index"],
+                    source["source_fingerprint"],
+                ],
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for source in expected_sources
+        )
+        if (
+            actual_sources != expected_provenance_sources
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "analytics_output_stale",
+                    "message": "A normalized source no longer matches the saved report.",
+                },
+            )
+        saved_source_references = report.get("source_references")
+        if saved_source_references != expected_sources:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "analytics_output_stale",
+                    "message": "A normalized source no longer matches the saved report.",
+                },
+            )
+        expected_output_sha256 = canonical_sha256(
+            {
+                "summary": report["summary"],
+                "findings": report["findings"],
+                "charts": report["charts"],
+            }
+        )
+        operation = "multi_dataset_analytics_report"
+        parameters = request.model_dump(mode="json")
+    else:
+        from app.main import (
+            MultiDatasetSourceRequest,
+            _load_multi_dataset_sources,
+        )
+
+        source_identity = (
+            report.get("analysis", {}).get("source")
+            if isinstance(report.get("analysis"), dict)
+            else None
+        )
+        if not isinstance(source_identity, dict):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "analytics_output_invalid",
+                    "message": "The EDA report has no source identity.",
+                },
+            )
+        try:
+            dataset_id = int(arguments["dataset_id"])
+            file_id = int(arguments["file_id"])
+            table_index = int(source_identity["table_index"])
+            source_request = MultiDatasetSourceRequest(
+                alias="source",
+                dataset_id=dataset_id,
+                file_id=file_id,
+                table_index=table_index,
+            )
+        except (KeyError, TypeError, ValueError, ValidationError):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "analytics_output_invalid",
+                    "message": "The persisted EDA report source failed validation.",
+                },
+            ) from None
+        with ExitStack() as cleanup:
+            sources = _load_multi_dataset_sources(
+                session,
+                [source_request],
+                owner,
+                cleanup,
+            )
+        source = sources[0]
+        inputs = provenance["inputs"]
+        if (
+            len(inputs) != 1
+            or inputs[0].get("dataset_id") != dataset_id
+            or inputs[0].get("file_id") != file_id
+            or inputs[0].get("table_index") != table_index
+            or inputs[0].get("source_sha256") != source.artifact_sha256
+            or source_identity.get("artifact_sha256") != source.artifact_sha256
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "analytics_output_stale",
+                    "message": "The normalized EDA source no longer matches the saved report.",
+                },
+            )
+        expected_output_sha256 = canonical_sha256(
+            {
+                "summary": report["summary"],
+                "findings": report["findings"],
+                "charts": report["charts"],
+            }
+        )
+        operation = "eda_evidence_report"
+        parameters = arguments
+        expected_sources = [
+            {
+                "dataset_id": source.dataset_id,
+                "file_id": source.file_id,
+                "table_index": source.table_index,
+                "source_fingerprint": source.checksum,
+                "normalized_artifact_sha256": source.artifact_sha256,
+                "alias": source.alias,
+            }
+        ]
+
+    outputs = provenance["outputs"]
+    if (
+        provenance["operation_type"] != operation
+        or len(outputs) != 1
+        or outputs[0].get("sha256") != expected_output_sha256
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "analytics_output_integrity_failed",
+                "message": "The stored report output does not match its provenance digest.",
+            },
+        )
+
+    dependency_keys = [
+        dependency.task_key
+        for dependency in (
+            session.query(WorkflowTask)
+            .join(
+                WorkflowTaskDependency,
+                WorkflowTaskDependency.depends_on_task_id == WorkflowTask.id,
+            )
+            .filter(WorkflowTaskDependency.task_id == task.id)
+            .all()
+        )
+    ]
+    source_references = sorted(
+        expected_sources,
+        key=lambda item: (
+            item["dataset_id"],
+            item["file_id"],
+            item["table_index"],
+            item["alias"],
+        ),
+    )
+    contract = AnalyticsWorkflowResultContract.model_validate(
+        {
+            "contract_version": 1,
+            "request_id": workflow.id,
+            "execution_id": workflow.id,
+            "workflow_id": workflow.id,
+            "task_id": task.task_key,
+            "operation": task.task_type,
+            "workflow_status": workflow.status,
+            "task_status": task.status,
+            "dependency_task_ids": dependency_keys,
+            "source_references": source_references,
+            "parameters": parameters,
+            "result_sha256": canonical_sha256(report),
+            "result": report,
+            "evidence": [
+                *provenance["inputs"],
+                *provenance["outputs"],
+            ],
+            "warnings": report["warnings"],
+            "provenance": provenance,
+            "completed_at": (
+                task.completed_at.isoformat() if task.completed_at else None
+            ),
+        }
+    )
+    return contract.model_dump(mode="json")
 
 
 def _workflow_tool_scheduler(
@@ -532,6 +919,51 @@ def _workflow_tool_scheduler(
                 "label": label,
             }
 
+        def attach_analytics_task_reference(
+            result: ToolResult,
+            task: WorkflowTask,
+        ) -> tuple[str | None, ToolResult]:
+            if (
+                result.status != "succeeded"
+                or task.task_type
+                not in {
+                    "generate_evidence_report",
+                    "generate_eda_evidence_report",
+                }
+            ):
+                return None, result
+            result = ToolResult(
+                status=result.status,
+                summary=result.summary,
+                data=result.data,
+                warnings=result.warnings,
+                references=result.references
+                + (
+                    {
+                        "type": "analytics_workflow_result",
+                        "workflow_id": workflow_id,
+                        "task_id": task.task_key,
+                    },
+                ),
+                limitations=result.limitations,
+                error_code=result.error_code,
+            )
+            raw_output = json.dumps(
+                {
+                    "status": result.status,
+                    "summary": result.summary,
+                    "data": result.data,
+                    "warnings": list(result.warnings),
+                    "references": list(result.references),
+                    "limitations": list(result.limitations),
+                    "error_code": result.error_code,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            return raw_output, result
+
         try:
             with SessionLocal() as session:
                 run_persisted_workflow(
@@ -571,6 +1003,12 @@ def _workflow_tool_scheduler(
                     )
                 if last_execution:
                     raw_output, result, label = last_execution[-1]
+                    task_reference_output, result = attach_analytics_task_reference(
+                        result,
+                        task,
+                    )
+                    if task_reference_output is not None:
+                        raw_output = task_reference_output
                     return raw_output, result, label, task.task_key
                 if not isinstance(task.result_summary, dict):
                     return (
@@ -593,6 +1031,10 @@ def _workflow_tool_scheduler(
                     limitations=tuple(stored.get("limitations", [])),
                     error_code=stored.get("error_code"),
                 )
+                task_reference_output, result = attach_analytics_task_reference(
+                    result,
+                    task,
+                )
                 raw_output = json.dumps(
                     {
                         "status": result.status,
@@ -607,6 +1049,8 @@ def _workflow_tool_scheduler(
                     separators=(",", ":"),
                     allow_nan=False,
                 )
+                if task_reference_output is not None:
+                    raw_output = task_reference_output
                 return raw_output, result, stored.get("label", tool_name), task.task_key
         except (SQLAlchemyError, WorkflowPlanError, LookupError) as error:
             logger.error(
@@ -1067,6 +1511,42 @@ class UserMessageRequest(StrictRequest):
     content: StrictStr = Field(min_length=1, max_length=MAX_USER_MESSAGE_CHARS)
 
 
+class AnalyticsJourneyRequest(StrictRequest):
+    operation: StrictStr = Field(min_length=1, max_length=96)
+    parameters: dict[str, Any]
+
+
+class AnalyticsResultReference(StrictRequest):
+    operation_id: StrictStr = Field(
+        min_length=1,
+        max_length=48,
+        pattern=r"^[A-Za-z][A-Za-z0-9_-]*$",
+    )
+    output: StrictStr = Field(min_length=1, max_length=64)
+
+
+class AnalyticsPlanOperation(StrictRequest):
+    operation_id: StrictStr = Field(
+        min_length=1,
+        max_length=48,
+        pattern=r"^[A-Za-z][A-Za-z0-9_-]*$",
+    )
+    operation: StrictStr = Field(min_length=1, max_length=96)
+    parameters: dict[str, Any]
+    depends_on: list[StrictStr] = Field(default_factory=list, max_length=4)
+    result_references: list[AnalyticsResultReference] = Field(
+        default_factory=list,
+        max_length=8,
+    )
+
+
+class AnalyticsPlanRequest(StrictRequest):
+    operations: list[AnalyticsPlanOperation] = Field(
+        min_length=1,
+        max_length=MAX_ANALYTICS_PLAN_OPERATIONS,
+    )
+
+
 class ConversationSummaryResponse(BaseModel):
     id: int
     title: str
@@ -1091,6 +1571,91 @@ class ConversationDetailResponse(ConversationSummaryResponse):
     limit: int
     offset: int
     messages: list[ConversationMessageResponse]
+
+
+class AnalyticsWorkflowResultContract(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    contract_version: Literal[1]
+    request_id: StrictStr
+    execution_id: StrictStr
+    workflow_id: StrictStr
+    task_id: StrictStr
+    operation: Literal["generate_evidence_report", "generate_eda_evidence_report"]
+    workflow_status: Literal[
+        "queued", "running", "completed", "partial", "failed", "blocked", "cancelled"
+    ]
+    task_status: Literal[
+        "pending", "running", "completed", "partial", "failed", "blocked",
+        "cancelled", "skipped", "unsupported"
+    ]
+    dependency_task_ids: list[StrictStr]
+    source_references: list[dict[str, Any]]
+    parameters: dict[str, Any]
+    result_sha256: StrictStr
+    result: dict[str, Any]
+    evidence: list[dict[str, Any]]
+    warnings: list[StrictStr]
+    provenance: dict[str, Any]
+    completed_at: StrictStr | None
+
+
+class AnalyticsPlanOperationResultContract(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    operation_id: StrictStr
+    operation: Literal[
+        "generate_evidence_report",
+        "generate_eda_evidence_report",
+    ]
+    status: Literal[
+        "pending",
+        "running",
+        "completed",
+        "partial",
+        "failed",
+        "blocked",
+        "cancelled",
+        "unsupported",
+        "stale",
+        "unavailable",
+    ]
+    depends_on: list[StrictStr]
+    result_reference: dict[str, Any] | None
+    result: dict[str, Any] | None
+    source_references: list[dict[str, Any]]
+    provenance: dict[str, Any] | None
+    warnings: list[StrictStr]
+    error_code: StrictStr | None
+    reason: StrictStr | None
+
+
+class AnalyticsPlanLimitsContract(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    maximum_operations: StrictInt
+    maximum_dependency_depth: StrictInt
+    supports_result_handoffs: bool
+
+
+class AnalyticsPlanResultContract(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    contract_version: Literal[1]
+    plan_id: StrictStr
+    workflow_id: StrictStr
+    status: Literal[
+        "running",
+        "completed",
+        "partial",
+        "failed",
+        "blocked",
+        "cancelled",
+    ]
+    limits: AnalyticsPlanLimitsContract
+    operations: list[AnalyticsPlanOperationResultContract]
+    error_code: StrictStr | None
+    completed_at: StrictStr | None
 
 
 class ChatTurnResponse(BaseModel):
@@ -1853,6 +2418,1089 @@ def get_chat_workflow(workflow_id: str):
             ) from None
 
 
+@router.get("/analytics/capabilities")
+def get_chat_analytics_capabilities():
+    with SessionLocal() as session:
+        _require_workspace_owner(session)
+    return {
+        "operations": ToolRegistry().analytics_capabilities(),
+        "maximum_parameter_bytes": 4096,
+        "maximum_operations_per_request": 1,
+        "plan_limits": {
+            "maximum_operations": MAX_ANALYTICS_PLAN_OPERATIONS,
+            "maximum_dependency_depth": MAX_ANALYTICS_PLAN_DEPTH,
+            "supports_dependency_ordering": True,
+            "supports_result_handoffs": False,
+            "eligible_operations": [
+                "generate_evidence_report",
+                "generate_eda_evidence_report",
+            ],
+        },
+        "workflow_execution": "synchronous_bounded",
+    }
+
+
+def _validate_analytics_plan(
+    request: AnalyticsPlanRequest,
+    registry: ToolRegistry,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    operations: list[dict[str, Any]] = []
+    operation_ids = [item.operation_id for item in request.operations]
+    if len(set(operation_ids)) != len(operation_ids):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "analytics_plan_duplicate_operation_id",
+                "message": "Operation IDs must be unique within an analytics plan.",
+            },
+        )
+    operation_id_set = set(operation_ids)
+    operations_by_id = {
+        item.operation_id: item
+        for item in request.operations
+    }
+    outputs_by_operation = {
+        capability["operation"]: set(capability["supported_outputs"])
+        for capability in registry.analytics_capabilities()
+    }
+    dependencies: dict[str, list[str]] = {}
+    depth_by_id: dict[str, int] = {}
+
+    for item in request.operations:
+        if len(set(item.depends_on)) != len(item.depends_on):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "analytics_plan_duplicate_dependency",
+                    "operation_id": item.operation_id,
+                    "message": "An operation cannot list the same dependency more than once.",
+                },
+            )
+        if item.operation_id in item.depends_on:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "analytics_plan_self_dependency",
+                    "operation_id": item.operation_id,
+                    "message": "An operation cannot depend on itself.",
+                },
+            )
+        unknown_dependencies = sorted(set(item.depends_on) - operation_id_set)
+        if unknown_dependencies:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "analytics_plan_unknown_dependency",
+                    "operation_id": item.operation_id,
+                    "dependencies": unknown_dependencies,
+                    "message": "Every dependency must identify an operation in this plan.",
+                },
+            )
+        for reference in item.result_references:
+            if (
+                reference.operation_id not in operation_id_set
+                or reference.operation_id not in item.depends_on
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "analytics_result_reference_invalid",
+                        "operation_id": item.operation_id,
+                        "message": "A result reference must name an explicitly declared dependency.",
+                    },
+                )
+            source_operation = operations_by_id[reference.operation_id]
+            if reference.output not in outputs_by_operation.get(
+                source_operation.operation,
+                set(),
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "analytics_result_reference_invalid",
+                        "operation_id": item.operation_id,
+                        "message": "The referenced output is not declared by the registered source operation.",
+                    },
+                )
+        if item.result_references:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "analytics_result_reference_unsupported",
+                    "operation_id": item.operation_id,
+                    "message": "Registered evidence-report operations do not accept upstream result data.",
+                },
+            )
+        try:
+            parameters = registry.validate_workflow_report_parameters(
+                item.operation,
+                item.parameters,
+            )
+        except LookupError:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "analytics_operation_unsupported",
+                    "operation_id": item.operation_id,
+                    "message": "Only registered operations that produce verified evidence reports can run in a structured plan.",
+                },
+            ) from None
+        except ValidationError as error:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "analytics_parameters_invalid",
+                    "operation_id": item.operation_id,
+                    "message": "Operation parameters do not match the registered schema.",
+                    "errors": [
+                        {
+                            "location": list(issue["loc"]),
+                            "message": issue["msg"],
+                            "type": issue["type"],
+                        }
+                        for issue in error.errors()
+                    ],
+                },
+            ) from None
+        try:
+            encoded_parameters = json.dumps(
+                parameters,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError, OverflowError):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "analytics_parameters_invalid",
+                    "operation_id": item.operation_id,
+                    "message": "Validated operation parameters must contain finite JSON values.",
+                },
+            ) from None
+        if len(encoded_parameters.encode("utf-8")) > 4096:
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "code": "analytics_parameters_too_large",
+                    "operation_id": item.operation_id,
+                    "message": "Each operation is limited to 4096 bytes of validated parameters.",
+                },
+            )
+        dependencies[item.operation_id] = list(item.depends_on)
+        operations.append(
+            {
+                "operation_id": item.operation_id,
+                "operation": item.operation,
+                "parameters": parameters,
+                "depends_on": list(item.depends_on),
+            }
+        )
+
+    try:
+        plan_bytes = len(
+            json.dumps(
+                [item.model_dump(mode="json") for item in request.operations],
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+    except (TypeError, ValueError, UnicodeError, OverflowError):
+        plan_bytes = MAX_ANALYTICS_PLAN_BYTES + 1
+    if plan_bytes > MAX_ANALYTICS_PLAN_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "code": "analytics_plan_too_large",
+                "message": f"An analytics plan is limited to {MAX_ANALYTICS_PLAN_BYTES} bytes.",
+            },
+        )
+
+    pending = set(operation_ids)
+    ordered_ids: list[str] = []
+    while pending:
+        ready = [
+            operation_id
+            for operation_id in operation_ids
+            if operation_id in pending
+            and set(dependencies[operation_id]).issubset(ordered_ids)
+        ]
+        if not ready:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "analytics_plan_dependency_cycle",
+                    "message": "Operation dependencies must form an acyclic graph.",
+                },
+            )
+        for operation_id in ready:
+            dependency_depth = max(
+                (depth_by_id[dependency] for dependency in dependencies[operation_id]),
+                default=0,
+            )
+            depth = dependency_depth + 1
+            if depth > MAX_ANALYTICS_PLAN_DEPTH:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "analytics_plan_dependency_depth_exceeded",
+                        "maximum_dependency_depth": MAX_ANALYTICS_PLAN_DEPTH,
+                        "message": "The dependency chain exceeds the supported depth.",
+                    },
+                )
+            depth_by_id[operation_id] = depth
+        ordered_ids.extend(ready)
+        pending.difference_update(ready)
+    return operations, ordered_ids
+
+
+def _analytics_plan_result(
+    session: SessionLocal,
+    owner: User,
+    workflow: WorkflowExecution,
+) -> dict[str, Any]:
+    tasks = (
+        session.query(WorkflowTask)
+        .filter(WorkflowTask.workflow_id == workflow.id)
+        .order_by(WorkflowTask.sequence)
+        .all()
+    )
+    task_ids = {task.id: task.task_key for task in tasks}
+    dependency_edges = (
+        session.query(
+            WorkflowTaskDependency.task_id,
+            WorkflowTaskDependency.depends_on_task_id,
+        )
+        .filter(WorkflowTaskDependency.task_id.in_(task_ids))
+        .all()
+        if task_ids
+        else []
+    )
+    dependency_map: dict[str, list[str]] = {}
+    for task_id, dependency_id in dependency_edges:
+        dependency_map.setdefault(task_ids[task_id], []).append(
+            task_ids.get(dependency_id, "")
+        )
+    for dependency_ids in dependency_map.values():
+        dependency_ids.sort()
+
+    operation_results: list[dict[str, Any]] = []
+    for task in tasks:
+        operation_result: dict[str, Any] = {
+            "operation_id": task.task_key,
+            "operation": task.task_type,
+            "status": task.status,
+            "depends_on": dependency_map.get(task.task_key, []),
+            "result_reference": None,
+            "result": None,
+            "source_references": [],
+            "provenance": None,
+            "warnings": [],
+            "error_code": task.error_code,
+            "reason": (
+                task.result_summary.get("summary")
+                if isinstance(task.result_summary, dict)
+                else None
+            ),
+        }
+        if task.status == "completed":
+            try:
+                verified = get_verified_analytics_workflow_result(
+                    session,
+                    owner,
+                    workflow.id,
+                    task.task_key,
+                )
+            except HTTPException as error:
+                detail = error.detail
+                code = detail.get("code") if isinstance(detail, dict) else None
+                operation_result["status"] = (
+                    "stale" if isinstance(code, str) and "stale" in code else "unavailable"
+                )
+                operation_result["error_code"] = code or "analytics_result_unavailable"
+                operation_result["reason"] = (
+                    detail.get("message")
+                    if isinstance(detail, dict)
+                    else str(detail)
+                )
+            else:
+                operation_result.update(
+                    {
+                        "result_reference": {
+                            "workflow_id": workflow.id,
+                            "task_id": task.task_key,
+                            "result_sha256": verified["result_sha256"],
+                        },
+                        "result": verified["result"],
+                        "source_references": verified["source_references"],
+                        "provenance": verified["provenance"],
+                        "warnings": verified["warnings"],
+                        "reason": None,
+                    }
+                )
+        operation_results.append(operation_result)
+
+    statuses = {item["status"] for item in operation_results}
+    completed_count = sum(item["status"] == "completed" for item in operation_results)
+    if statuses.intersection({"pending", "running"}):
+        overall_status = "running"
+    elif completed_count == len(operation_results):
+        overall_status = "completed"
+    elif completed_count:
+        overall_status = "partial"
+    elif statuses and statuses == {"blocked"}:
+        overall_status = "blocked"
+    elif statuses and statuses.issubset({"cancelled"}):
+        overall_status = "cancelled"
+    else:
+        overall_status = "failed"
+    return {
+        "contract_version": 1,
+        "plan_id": workflow.id,
+        "workflow_id": workflow.id,
+        "status": overall_status,
+        "limits": {
+            "maximum_operations": MAX_ANALYTICS_PLAN_OPERATIONS,
+            "maximum_dependency_depth": MAX_ANALYTICS_PLAN_DEPTH,
+            "supports_result_handoffs": False,
+        },
+        "operations": operation_results,
+        "error_code": workflow.error_code,
+        "completed_at": workflow.completed_at.isoformat() if workflow.completed_at else None,
+    }
+
+
+def _validate_analytics_journey_sources(
+    session: SessionLocal,
+    owner: User,
+    operation: str,
+    parameters: dict[str, Any],
+) -> tuple[dict[str, Any], int]:
+    from app.main import (
+        EDAReportRequest,
+        MultiDatasetReportRequest,
+        MultiDatasetSourceRequest,
+        _load_multi_dataset_sources,
+        _validate_multi_dataset_request,
+    )
+
+    if operation == "generate_evidence_report":
+        request = MultiDatasetReportRequest.model_validate(parameters)
+        try:
+            _validate_multi_dataset_request(
+                request.sources,
+                request.joins,
+                request.dimensions,
+                request.metrics,
+            )
+        except ValueError as error:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": getattr(error, "code", "analytics_plan_invalid"),
+                    "message": str(error),
+                },
+            ) from None
+        with ExitStack() as cleanup:
+            sources = _load_multi_dataset_sources(
+                session,
+                request.sources,
+                owner,
+                cleanup,
+            )
+        dataset_id = sources[0].dataset_id
+    elif operation == "generate_eda_evidence_report":
+        request = EDAReportRequest.model_validate(parameters)
+        _require_dataset_access(session, request.dataset_id, owner)
+        dataset_file = (
+            session.query(DatasetFile)
+            .filter(
+                DatasetFile.id == request.file_id,
+                DatasetFile.dataset_id == request.dataset_id,
+            )
+            .one_or_none()
+        )
+        if dataset_file is None:
+            raise HTTPException(status_code=404, detail="Dataset file not found.")
+        analysis = (
+            session.query(EDAAnalysis)
+            .filter(
+                EDAAnalysis.id == request.analysis_id,
+                EDAAnalysis.dataset_id == request.dataset_id,
+                EDAAnalysis.file_id == request.file_id,
+            )
+            .one_or_none()
+        )
+        if analysis is None:
+            raise HTTPException(status_code=404, detail="EDA analysis not found.")
+        if (
+            analysis.status not in {"Completed", "PartiallyCompleted"}
+            or not isinstance(analysis.result, dict)
+            or dataset_file.status != "Ready"
+            or dataset_file.normalization_status != "Ready"
+            or not isinstance(dataset_file.normalization_result, dict)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "eda_result_unavailable",
+                    "message": "A completed stored EDA result and its normalized source are required.",
+                },
+            )
+        source_record = analysis.result.get("source")
+        table_index = analysis.table_index
+        tables = dataset_file.normalization_result.get("tables")
+        current_table = (
+            tables[table_index]
+            if isinstance(tables, list) and 0 <= table_index < len(tables)
+            else None
+        )
+        if (
+            not isinstance(source_record, dict)
+            or not isinstance(current_table, dict)
+            or source_record.get("table_index") != table_index
+            or source_record.get("artifact_sha256") != current_table.get("sha256")
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "eda_result_stale",
+                    "message": "The stored EDA result no longer matches the current normalized source.",
+                },
+            )
+        try:
+            provenance = validate_provenance(analysis.provenance)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "eda_provenance_invalid",
+                    "message": "The stored EDA provenance could not be verified.",
+                },
+            ) from None
+        if not any(
+            item.get("kind") == "normalized_parquet"
+            and item.get("dataset_id") == request.dataset_id
+            and item.get("file_id") == request.file_id
+            and item.get("table_index") == table_index
+            and item.get("sha256") == source_record.get("artifact_sha256")
+            for item in provenance["inputs"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "eda_provenance_mismatch",
+                    "message": "The stored EDA result does not match its source provenance.",
+                },
+            )
+        source_request = MultiDatasetSourceRequest(
+            alias="source",
+            dataset_id=request.dataset_id,
+            file_id=request.file_id,
+            table_index=table_index,
+        )
+        with ExitStack() as cleanup:
+            sources = _load_multi_dataset_sources(
+                session,
+                [source_request],
+                owner,
+                cleanup,
+            )
+        if sources[0].artifact_sha256 != source_record.get("artifact_sha256"):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "eda_result_stale",
+                    "message": "The normalized EDA source changed before execution.",
+                },
+            )
+        dataset_id = request.dataset_id
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "analytics_operation_unsupported",
+                "message": "This registered analytics capability is not available in the unified report workflow.",
+            },
+        )
+
+    source_identity = _tool_source_state_identity(
+        session,
+        parameters,
+        dataset_id,
+        owner.id,
+    )
+    if source_identity is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "analytics_source_unavailable",
+                "message": "One or more requested source datasets are unavailable.",
+            },
+        )
+    return source_identity, dataset_id
+
+
+@router.post("/analytics/executions")
+def execute_analytics_journey(request: AnalyticsJourneyRequest):
+    registry = ToolRegistry()
+    try:
+        parameters = registry.validate_workflow_report_parameters(
+            request.operation,
+            request.parameters,
+        )
+    except LookupError:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "analytics_operation_unsupported",
+                "message": "Choose a registered operation that produces a persisted evidence report.",
+            },
+        ) from None
+    except ValidationError as error:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "analytics_parameters_invalid",
+                "message": "The operation parameters do not match its registered schema.",
+                "errors": [
+                    {
+                        "location": list(item["loc"]),
+                        "message": item["msg"],
+                        "type": item["type"],
+                    }
+                    for item in error.errors()
+                ],
+            },
+        ) from None
+
+    parameters_json = json.dumps(
+        parameters,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(parameters_json.encode("utf-8")) > 4096:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "code": "analytics_parameters_too_large",
+                "message": "Analytics parameters exceed the 4096-byte workflow input limit.",
+            },
+        )
+
+    with SessionLocal() as session:
+        try:
+            owner = _require_workspace_owner(session)
+            source_identity, dataset_id = _validate_analytics_journey_sources(
+                session,
+                owner,
+                request.operation,
+                parameters,
+            )
+            request_identity = canonical_sha256(
+                {
+                    "operation": request.operation,
+                    "parameters": parameters,
+                    "source_identity": source_identity,
+                    "owner_user_id": owner.id,
+                }
+            )
+            workflow_id = request_identity[:32]
+            workflow = session.get(WorkflowExecution, workflow_id)
+            if workflow is None:
+                workflow = WorkflowExecution(
+                    id=workflow_id,
+                    owner_user_id=owner.id,
+                    idempotency_key=request_identity,
+                    objective=f"Structured analytics: {request.operation}",
+                    status="queued",
+                    current_step=0,
+                    source_scope={"project_id": None, "dataset_id": None},
+                    dataset_id=dataset_id,
+                )
+                session.add(workflow)
+                session.commit()
+            elif workflow.owner_user_id != owner.id:
+                raise HTTPException(status_code=404, detail="Workflow not found.")
+
+            existing_task = (
+                session.query(WorkflowTask)
+                .filter(WorkflowTask.workflow_id == workflow_id)
+                .order_by(WorkflowTask.sequence)
+                .first()
+            )
+            if existing_task is not None:
+                if (
+                    workflow.status == "completed"
+                    and existing_task.status == "completed"
+                ):
+                    verified_result = get_verified_analytics_workflow_result(
+                        session,
+                        owner,
+                        workflow_id,
+                        existing_task.task_key,
+                    )
+                    return verified_result
+                return {
+                    "workflow_id": workflow_id,
+                    "task_id": existing_task.task_key,
+                    "operation": request.operation,
+                    "workflow_status": workflow.status,
+                    "task_status": existing_task.status,
+                    "summary": (
+                        existing_task.result_summary.get("summary")
+                        if isinstance(existing_task.result_summary, dict)
+                        else None
+                    ),
+                    "error_code": existing_task.error_code,
+                    "result": None,
+                    "duplicate": True,
+                }
+
+            if workflow.status != "queued":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "analytics_workflow_unavailable",
+                        "message": "The existing workflow has no runnable operation; explicit recovery is required where supported.",
+                    },
+                )
+            workflow_id_for_execution = workflow.id
+            owner_id_for_execution = owner.id
+            execution_context = {
+                "project_id": None,
+                "dataset_id": None,
+                "workflow_id": workflow.id,
+                "owner_user_id": owner.id,
+                "user_message": "Generate an evidence-backed analytics report for the explicitly supplied data.",
+            }
+        except HTTPException:
+            raise
+        except (SQLAlchemyError, OSError) as error:
+            session.rollback()
+            logger.error(
+                "Analytics workflow could not be prepared (%s)",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="The analytics workflow could not be prepared.",
+            ) from None
+
+    def execute_registered_report():
+        return registry.execute(
+            request.operation,
+            parameters,
+            context=execution_context,
+        )
+
+    raw_output, tool_result, label, task_key = _workflow_tool_scheduler(
+        workflow_id_for_execution,
+        owner_id_for_execution,
+        execution_context,
+    )(
+        request.operation,
+        parameters,
+        execute_registered_report,
+        idempotent=True,
+        max_retries=1,
+    )
+    del raw_output, label
+    if task_key is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": tool_result.error_code or "analytics_task_unavailable",
+                "message": tool_result.summary,
+            },
+        )
+    with SessionLocal() as session:
+        owner = _require_workspace_owner(session)
+        workflow = session.get(WorkflowExecution, workflow_id_for_execution)
+        task = (
+            session.query(WorkflowTask)
+            .filter(
+                WorkflowTask.workflow_id == workflow_id_for_execution,
+                WorkflowTask.task_key == task_key,
+            )
+            .one_or_none()
+        )
+        if workflow is None or task is None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "analytics_result_unavailable",
+                    "message": "The persisted workflow task could not be retrieved.",
+                },
+            )
+        if workflow.status == "completed" and task.status == "completed":
+            return get_verified_analytics_workflow_result(
+                session,
+                owner,
+                workflow_id_for_execution,
+                task_key,
+            )
+        return {
+            "workflow_id": workflow.id,
+            "task_id": task.task_key,
+            "operation": request.operation,
+            "workflow_status": workflow.status,
+            "task_status": task.status,
+            "summary": (
+                task.result_summary.get("summary")
+                if isinstance(task.result_summary, dict)
+                else tool_result.summary
+            ),
+            "error_code": task.error_code or tool_result.error_code,
+            "result": None,
+            "duplicate": False,
+        }
+
+
+@router.post(
+    "/analytics/plans",
+    response_model=AnalyticsPlanResultContract,
+)
+def execute_analytics_plan(request: AnalyticsPlanRequest):
+    registry = ToolRegistry()
+    operations, ordered_ids = _validate_analytics_plan(request, registry)
+    if len(operations) > MAX_WORKFLOW_TASKS:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "analytics_plan_task_limit",
+                "message": "The analytics plan exceeds the existing workflow task limit.",
+            },
+        )
+
+    with SessionLocal() as session:
+        try:
+            owner = _require_workspace_owner(session)
+            operation_sources: dict[str, dict[str, Any]] = {}
+            task_plan: list[dict[str, Any]] = []
+            source_scope_ids: list[int] = []
+            for operation in operations:
+                source_identity, dataset_id = _validate_analytics_journey_sources(
+                    session,
+                    owner,
+                    operation["operation"],
+                    operation["parameters"],
+                )
+                operation_sources[operation["operation_id"]] = {
+                    "identity": source_identity,
+                    "dataset_id": dataset_id,
+                }
+                source_scope_ids.append(dataset_id)
+                arguments = operation["parameters"]
+                context = {"project_id": None, "dataset_id": None}
+                identity = json.dumps(
+                    {
+                        "tool": operation["operation"],
+                        "arguments": arguments,
+                        **context,
+                        "source_identity": source_identity,
+                    },
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                input_digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+                source_digest = hashlib.sha256(
+                    json.dumps(
+                        source_identity,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                source_file_id = arguments.get("file_id")
+                if source_file_id is None and isinstance(arguments.get("sources"), list):
+                    first_source = next(
+                        (
+                            source
+                            for source in arguments["sources"]
+                            if isinstance(source, dict)
+                        ),
+                        None,
+                    )
+                    source_file_id = (
+                        first_source.get("file_id")
+                        if first_source is not None
+                        else None
+                    )
+                task_plan.append(
+                    {
+                        "task_id": operation["operation_id"],
+                        "agent": "registered_tool",
+                        "operation": operation["operation"],
+                        "depends_on": operation["depends_on"],
+                        "status": "pending",
+                        "dataset_id": dataset_id,
+                        "file_id": source_file_id,
+                        "source_fingerprint": source_digest,
+                        "input_references": [
+                            {"type": "input_identity", "sha256": input_digest},
+                            {
+                                "type": "tool_arguments",
+                                "tool": operation["operation"],
+                                "arguments": arguments,
+                            },
+                            {"type": "input_context", "context": context},
+                            *(
+                                [
+                                    {
+                                        "type": "dependency_order",
+                                        "task_ids": sorted(
+                                            operation["depends_on"]
+                                        ),
+                                    }
+                                ]
+                                if operation["depends_on"]
+                                else []
+                            ),
+                        ],
+                        "output_references": [],
+                        "idempotent": True,
+                        "max_retries": 1,
+                    }
+                )
+
+            ordered_operations = {
+                operation["operation_id"]: operation for operation in operations
+            }
+            identity_payload = {
+                "operations": [
+                    {
+                        **ordered_operations[operation_id],
+                        "source_identity": operation_sources[operation_id]["identity"],
+                    }
+                    for operation_id in ordered_ids
+                ],
+                "owner_user_id": owner.id,
+            }
+            request_identity = canonical_sha256(identity_payload)
+            workflow_id = request_identity[:32]
+            workflow = session.get(WorkflowExecution, workflow_id)
+            should_execute = workflow is None
+            if workflow is None:
+                workflow = WorkflowExecution(
+                    id=workflow_id,
+                    owner_user_id=owner.id,
+                    idempotency_key=request_identity,
+                    objective="Execute a bounded evidence report analytics plan.",
+                    status="queued",
+                    current_step=0,
+                    source_scope={"project_id": None, "dataset_id": None},
+                    dataset_id=source_scope_ids[0] if source_scope_ids else None,
+                )
+                session.add(workflow)
+                session.flush()
+                persist_trace_plan(session, workflow, task_plan)
+                session.commit()
+            elif workflow.owner_user_id != owner.id:
+                raise HTTPException(status_code=404, detail="Workflow not found.")
+            elif not session.query(WorkflowTask.id).filter(
+                WorkflowTask.workflow_id == workflow_id
+            ).first():
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "analytics_plan_unavailable",
+                        "message": "The existing workflow has no persisted tasks; explicit recovery is required.",
+                    },
+                )
+            workflow_id_for_execution = workflow.id
+            owner_id_for_execution = owner.id
+        except HTTPException:
+            raise
+        except (SQLAlchemyError, WorkflowPlanError, OSError) as error:
+            session.rollback()
+            logger.error(
+                "Analytics plan could not be persisted (%s)",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "analytics_plan_persistence_failed",
+                    "message": "The analytics plan could not be safely persisted.",
+                },
+            ) from None
+
+    if should_execute:
+        execution_context = {
+            "project_id": None,
+            "dataset_id": None,
+            "workflow_id": workflow_id_for_execution,
+            "owner_user_id": owner_id_for_execution,
+            "user_message": "Generate an evidence-backed analytics report for the explicitly supplied data.",
+        }
+
+        def make_handler(tool_name: str):
+            def execute_task(task: WorkflowTask) -> dict[str, Any]:
+                task_session = object_session(task)
+                if task_session is None:
+                    raise WorkflowTaskExecutionError(
+                        "analytics_task_session_unavailable",
+                        "The persisted operation could not access its workflow session.",
+                    )
+                workflow = task_session.get(WorkflowExecution, workflow_id_for_execution)
+                if workflow is None:
+                    raise WorkflowTaskExecutionError(
+                        "analytics_workflow_unavailable",
+                        "The persisted analytics workflow is unavailable.",
+                    )
+                if not _workflow_task_input_is_current(
+                    task_session,
+                    workflow,
+                    task,
+                ):
+                    raise WorkflowTaskExecutionError(
+                        "analytics_source_stale",
+                        "The operation source or dependency evidence changed before execution.",
+                    )
+                argument_references = [
+                    item
+                    for item in task.input_references
+                    if isinstance(item, dict)
+                    and item.get("type") == "tool_arguments"
+                    and item.get("tool") == tool_name
+                    and isinstance(item.get("arguments"), dict)
+                ]
+                if len(argument_references) != 1:
+                    raise WorkflowTaskExecutionError(
+                        "analytics_input_invalid",
+                        "The persisted operation inputs are missing or ambiguous.",
+                    )
+                _raw, result, label = registry.execute(
+                    tool_name,
+                    argument_references[0]["arguments"],
+                    context=execution_context,
+                )
+                if result.status != "succeeded":
+                    raise WorkflowTaskExecutionError(
+                        result.error_code or "analytics_operation_failed",
+                        result.summary,
+                    )
+                references = list(result.references)
+                references.append(
+                    {
+                        "type": "analytics_workflow_result",
+                        "workflow_id": workflow_id_for_execution,
+                        "task_id": task.task_key,
+                    }
+                )
+                return {
+                    "status": result.status,
+                    "summary": result.summary,
+                    "data": result.data,
+                    "warnings": list(result.warnings),
+                    "references": references,
+                    "limitations": list(result.limitations),
+                    "error_code": result.error_code,
+                    "label": label,
+                }
+
+            return execute_task
+
+        try:
+            with SessionLocal() as session:
+                run_persisted_workflow(
+                    session,
+                    workflow_id_for_execution,
+                    {
+                        operation: make_handler(operation)
+                        for operation in (
+                            "generate_evidence_report",
+                            "generate_eda_evidence_report",
+                        )
+                    },
+                    max_steps=MAX_ANALYTICS_PLAN_OPERATIONS,
+                )
+        except (SQLAlchemyError, WorkflowPlanError, LookupError) as error:
+            logger.error(
+                "Analytics plan execution failed for %s (%s)",
+                workflow_id_for_execution,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "analytics_plan_execution_unavailable",
+                    "message": "The persisted analytics plan could not be completed.",
+                },
+            ) from None
+
+    with SessionLocal() as session:
+        try:
+            owner = _require_workspace_owner(session)
+            workflow = (
+                session.query(WorkflowExecution)
+                .filter(
+                    WorkflowExecution.id == workflow_id_for_execution,
+                    WorkflowExecution.owner_user_id == owner.id,
+                )
+                .one_or_none()
+            )
+            if workflow is None:
+                raise HTTPException(status_code=404, detail="Workflow not found.")
+            return _analytics_plan_result(session, owner, workflow)
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            logger.error(
+                "Analytics plan result retrieval failed (%s)",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "analytics_plan_result_unavailable",
+                    "message": "The persisted analytics plan result could not be retrieved.",
+                },
+            ) from None
+
+
+@router.get(
+    "/workflows/{workflow_id}/tasks/{task_key}/analytics-result",
+    response_model=AnalyticsWorkflowResultContract,
+)
+def get_chat_analytics_workflow_result(workflow_id: str, task_key: str):
+    if len(workflow_id) != 32 or any(
+        character not in "0123456789abcdef" for character in workflow_id
+    ):
+        raise HTTPException(status_code=404, detail="Workflow not found.")
+    if not task_key or len(task_key) > 80:
+        raise HTTPException(status_code=404, detail="Workflow task not found.")
+    with SessionLocal() as session:
+        try:
+            owner = _require_workspace_owner(session)
+            return get_verified_analytics_workflow_result(
+                session,
+                owner,
+                workflow_id,
+                task_key,
+            )
+        except HTTPException:
+            raise
+        except SQLAlchemyError as error:
+            logger.error(
+                "Analytics workflow result retrieval failed (%s)",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="The persisted analytics result could not be retrieved.",
+            ) from None
+
+
 @router.post("/workflows/{workflow_id}/recover")
 def recover_chat_workflow(workflow_id: str):
     if len(workflow_id) != 32 or any(
@@ -1959,6 +3607,27 @@ def recover_chat_workflow(workflow_id: str):
                         raise WorkflowPlanError(
                             "Stored recovery arguments are missing or ambiguous."
                         )
+                    if persisted_task.task_type in {
+                        "generate_evidence_report",
+                        "generate_eda_evidence_report",
+                    }:
+                        task_session = object_session(persisted_task)
+                        if task_session is None:
+                            raise WorkflowPlanError(
+                                "The recovered task has no active workflow session."
+                            )
+                        recovered_workflow = task_session.get(
+                            WorkflowExecution,
+                            persisted_task.workflow_id,
+                        )
+                        if recovered_workflow is None or not _workflow_task_input_is_current(
+                            task_session,
+                            recovered_workflow,
+                            persisted_task,
+                        ):
+                            raise WorkflowPlanError(
+                                "A recovered analytics task source is stale."
+                            )
                     _raw, result, _label = selected_registry.execute(
                         persisted_task.task_type,
                         argument_refs[0]["arguments"],
@@ -1966,12 +3635,24 @@ def recover_chat_workflow(workflow_id: str):
                     )
                     if result.status != "succeeded":
                         raise RuntimeError("Recovered tool execution failed.")
+                    references = list(result.references)
+                    if persisted_task.task_type in {
+                        "generate_evidence_report",
+                        "generate_eda_evidence_report",
+                    }:
+                        references.append(
+                            {
+                                "type": "analytics_workflow_result",
+                                "workflow_id": persisted_task.workflow_id,
+                                "task_id": persisted_task.task_key,
+                            }
+                        )
                     return {
                         "status": result.status,
                         "summary": result.summary,
                         "data": result.data,
                         "warnings": list(result.warnings),
-                        "references": list(result.references),
+                        "references": references,
                         "limitations": list(result.limitations),
                         "error_code": result.error_code,
                     }

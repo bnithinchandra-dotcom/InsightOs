@@ -64,6 +64,14 @@ class EDAExecutionArguments(FileArguments):
     selected_columns: list[StrictStr] = Field(min_length=1, max_length=16)
 
 
+class MonthlyForecastArguments(FileArguments):
+    table_index: StrictInt = Field(default=0, ge=0)
+    date_column: StrictStr = Field(min_length=1, max_length=255)
+    target_column: StrictStr = Field(min_length=1, max_length=255)
+    aggregation: Literal["sum"] = "sum"
+    horizon: StrictInt = Field(default=3, ge=1, le=24)
+
+
 class EDAAnalysisArguments(FileArguments):
     analysis_id: StrictInt = Field(gt=0)
 
@@ -163,6 +171,10 @@ class ToolDefinition:
     execute: Callable[[dict[str, Any]], ToolResult]
     engine_operation: bool = False
     capability: str = "readonly_agent_tool"
+    analytics_scope: str | None = None
+    analytics_execution: str | None = None
+    analytics_outputs: tuple[str, ...] = ()
+    workflow_report_result: bool = False
 
     def provider_schema(self) -> dict[str, Any]:
         return {
@@ -800,6 +812,104 @@ def _run_eda_analysis(arguments: dict[str, Any]) -> ToolResult:
     ), inspection)
 
 
+def _run_monthly_forecast(arguments: dict[str, Any]) -> ToolResult:
+    main = _main()
+    inspection = _authorized_engine_file(
+        main,
+        arguments,
+        tool_name="run_monthly_forecast",
+    )
+    if inspection.status != "succeeded":
+        return inspection
+    try:
+        request = main.MonthlyForecastRequest.model_validate(arguments)
+    except ValidationError:
+        return _attach_inspection(
+            ToolResult(
+                status="failed",
+                summary="The monthly forecast parameters are invalid.",
+                error_code="invalid_arguments",
+            ),
+            inspection,
+        )
+    created = _call_api_tool(
+        main.create_monthly_forecast,
+        request,
+        name="run_monthly_forecast",
+    )
+    if created.status != "succeeded" or not isinstance(created.data, dict):
+        return _attach_inspection(created, inspection)
+    workflow_id = created.data.get("workflow_id")
+    if not isinstance(workflow_id, str):
+        return _attach_inspection(
+            ToolResult(
+                status="failed",
+                summary="The forecast workflow identifier was not persisted.",
+                error_code="forecast_workflow_missing",
+            ),
+            inspection,
+        )
+    persisted = _call_api_tool(
+        main.get_monthly_forecast,
+        workflow_id,
+        name="run_monthly_forecast",
+    )
+    if persisted.status != "succeeded" or not isinstance(persisted.data, dict):
+        return _attach_inspection(persisted, inspection)
+    task = persisted.data.get("task")
+    result = task.get("result") if isinstance(task, dict) else None
+    if (
+        not isinstance(task, dict)
+        or task.get("status") != "completed"
+        or not isinstance(result, dict)
+    ):
+        return _attach_inspection(
+            ToolResult(
+                status="failed",
+                summary="The persisted monthly forecast did not complete successfully.",
+                data={
+                    "workflow_id": workflow_id,
+                    "task": task,
+                },
+                error_code=(
+                    task.get("error_code")
+                    if isinstance(task.get("error_code"), str)
+                    else "forecast_task_incomplete"
+                ),
+            ),
+            inspection,
+        )
+    return _attach_inspection(
+        ToolResult(
+            status="succeeded",
+            summary="The deterministic monthly forecast completed and its persisted result was verified.",
+            data={
+                "workflow_id": workflow_id,
+                "status": task["status"],
+                "created_at": persisted.data.get("created_at"),
+                "completed_at": persisted.data.get("completed_at"),
+                **result,
+            },
+            warnings=tuple(
+                warning
+                for warning in result.get("warnings", [])
+                if isinstance(warning, str)
+            ),
+            references=tuple(
+                reference
+                for reference in result.get("references", [])
+                if isinstance(reference, dict)
+            ),
+            limitations=tuple(
+                limitation
+                for limitation in result.get("limitations", [])
+                if isinstance(limitation, str)
+            ),
+        ),
+        inspection,
+    )
+
+
 def _list_eda(arguments: dict[str, Any]) -> ToolResult:
     main = _main()
     return _call_api_tool(
@@ -960,6 +1070,9 @@ TOOL_DEFINITIONS = (
         "Compare explicitly selected ready dataset tables and return explainable join-key candidates using names, types, uniqueness, null rates, and observed value overlap. Recommendations are hypotheses, not approved joins.",
         MultiDatasetRecommendationArguments,
         _recommend_multi_dataset_joins,
+        analytics_scope="multiple_datasets",
+        analytics_execution="deterministic",
+        analytics_outputs=("join_recommendations", "source_evidence"),
     ),
     ToolDefinition(
         "analyze_multiple_datasets",
@@ -967,6 +1080,9 @@ TOOL_DEFINITIONS = (
         "Execute explicitly supplied inner/left join keys across 2 to 4 authorized dataset tables, then calculate deterministic grouped metrics. Use only user-approved exact keys; many-to-many joins require explicit approval and remain row-limited.",
         MultiDatasetAnalysisArguments,
         _analyze_multiple_datasets,
+        analytics_scope="multiple_datasets",
+        analytics_execution="deterministic",
+        analytics_outputs=("grouped_metrics", "source_evidence"),
     ),
     ToolDefinition(
         "generate_evidence_report",
@@ -974,6 +1090,10 @@ TOOL_DEFINITIONS = (
         "Calculate grouped metrics with the deterministic analytics engine, then return measured findings, validated chart specifications, source references, warnings, and provenance. All keys and metrics must be explicitly supplied; the model cannot provide chart values.",
         EvidenceReportArguments,
         _generate_evidence_report,
+        analytics_scope="multiple_datasets",
+        analytics_execution="deterministic",
+        analytics_outputs=("summary", "findings", "charts", "provenance"),
+        workflow_report_result=True,
     ),
     ToolDefinition(
         "generate_eda_evidence_report",
@@ -981,6 +1101,10 @@ TOOL_DEFINITIONS = (
         "Turn a completed, current stored EDA result into factual metric findings and deterministic charts with source provenance. This reports existing results and does not rerun analysis.",
         EDAEvidenceReportArguments,
         _generate_eda_evidence_report,
+        analytics_scope="one_dataset",
+        analytics_execution="deterministic",
+        analytics_outputs=("summary", "findings", "charts", "provenance"),
+        workflow_report_result=True,
     ),
     ToolDefinition(
         "get_profile",
@@ -1031,11 +1155,26 @@ TOOL_DEFINITIONS = (
     ToolDefinition(
         "run_eda_analysis",
         "Running exploratory data analysis",
-        "Run the existing deterministic univariate, bivariate, or multivariate EDA engine on explicitly selected columns of a normalized file. This does not implement grouped business aggregations, forecasting, or prediction.",
+        "Run the existing deterministic univariate, bivariate, or multivariate EDA engine on explicitly selected columns of a normalized file.",
         EDAExecutionArguments,
         _run_eda_analysis,
         engine_operation=True,
         capability="registered_dataset_engine",
+        analytics_scope="one_dataset",
+        analytics_execution="deterministic",
+        analytics_outputs=("eda_result_reference", "provenance"),
+    ),
+    ToolDefinition(
+        "run_monthly_forecast",
+        "Forecasting a monthly series",
+        "Run the deterministic monthly trend and seasonality forecast on an explicitly selected authorized normalized file. Select the time column, numeric target, sum aggregation, and a 1–24 month horizon. Returns a persisted workflow result with measured holdout metrics, historical observations, forecast values, provenance, warnings, and chart specification.",
+        MonthlyForecastArguments,
+        _run_monthly_forecast,
+        engine_operation=True,
+        capability="registered_dataset_engine",
+        analytics_scope="one_dataset",
+        analytics_execution="forecast",
+        analytics_outputs=("forecast", "evaluation", "warnings", "provenance"),
     ),
     ToolDefinition(
         "list_eda_results",
@@ -1076,6 +1215,13 @@ _ENGINE_INTENT_PATTERNS = {
         r"\b(?:run|perform|execute|calculate|compute|analy[sz]e)\b.{0,50}"
         r"\b(?:eda|exploratory(?:\s+data\s+analysis)?|distribution|statistics|"
         r"histogram|correlation)\b",
+        re.IGNORECASE,
+    ),
+    "run_monthly_forecast": re.compile(
+        r"\b(?:run|create|generate|make|calculate|build)\b.{0,60}"
+        r"\b(?:monthly\s+)?forecast\b|"
+        r"\b(?:forecast|predict)\b.{0,60}\b(?:sales|revenue|demand|values|"
+        r"target|series|monthly|future|months?)\b",
         re.IGNORECASE,
     ),
 }
@@ -1148,6 +1294,36 @@ class ToolRegistry:
     def is_engine_operation(self, name: str) -> bool:
         definition = self._definitions.get(name)
         return definition is not None and definition.engine_operation
+
+    def analytics_capabilities(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "operation": definition.name,
+                "description": definition.description,
+                "parameter_schema": definition.arguments_model.model_json_schema(),
+                "source_scope": definition.analytics_scope,
+                "execution_kind": definition.analytics_execution,
+                "supported_outputs": list(definition.analytics_outputs),
+                "workflow_report_result": definition.workflow_report_result,
+                "plan_eligible": definition.workflow_report_result,
+                "dependency_ordering": definition.workflow_report_result,
+                "supported_result_references": [],
+            }
+            for definition in self._definitions.values()
+            if definition.analytics_scope is not None
+        ]
+
+    def validate_workflow_report_parameters(
+        self,
+        name: str,
+        raw_arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        definition = self._definitions.get(name)
+        if definition is None or not definition.workflow_report_result:
+            raise LookupError("This operation does not produce a workflow report result.")
+        return definition.arguments_model.model_validate(raw_arguments).model_dump(
+            mode="json"
+        )
 
     def prepare_engine_inspection(
         self,

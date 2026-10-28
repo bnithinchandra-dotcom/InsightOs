@@ -25,7 +25,7 @@ class EDAAnalysis(Base):
             name="ck_eda_analyses_status",
         ),
         CheckConstraint(
-            "analysis_type IN ('univariate', 'bivariate', 'multivariate')",
+            "analysis_type IN ('univariate', 'bivariate', 'multivariate', 'anomaly_detection')",
             name="ck_eda_analyses_analysis_type",
         ),
         UniqueConstraint(

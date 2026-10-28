@@ -46,13 +46,17 @@ the [system architecture](docs/architecture/system-design.md).
   deterministic profile inspection, typed discovery/retrieval tools, and
   explicitly requested normalization, quality-analysis, and EDA engine tools.
   It also exposes deterministic multi-dataset analysis and evidence-report
-  tools with explicit sources, join keys, and metrics. Specialist stages run
+  tools with explicit sources, join keys, and metrics, plus an explicitly
+  requested monthly forecast tool backed by the deterministic forecasting
+  engine. Forecast runs reuse verified normalized Parquet and persist their
+  request, evaluation, source provenance, observed history, predictions, and
+  bounded model artifact in the existing workflow tasks. Specialist stages run
   sequentially through the configured provider for engine operations; durable
   workflow records preserve task outcomes and support explicit recovery of
   eligible stale read-only tasks; engine operations and model reasoning are not
-  replayed. Monthly forecasting is available through the deterministic
-  analytics API, but is not registered as an assistant tool. Arbitrary code
-  execution and automatic analysis selection are not supported. The application
+  replayed. Forecast result retrieval checks that its normalized source is
+  still current. Arbitrary code execution and automatic analysis selection are
+  not supported. The application
   default provider is `none`; live model generation and autonomous tool
   selection remain unverified.
 - **Worker:** a Redis connectivity process only. It does not consume or execute
@@ -79,7 +83,12 @@ stores original bytes, and returns parser/profile metadata; unsupported files
 and operational errors are shown without marking a failed upload as complete.
 Select the resulting file to normalize it, then run univariate EDA on a chosen
 column. The EDA response reports backend placement and the results/provenance
-come from the existing deterministic engine. In Assistant, select the dataset and ask for stored profile facts (counts,
+come from the existing deterministic engine. For monthly forecasting, expand
+**Monthly forecasting** for a ready normalized file, explicitly select the time
+and numeric target columns, choose a 1–24 month horizon, and run the operation.
+The workspace displays the persisted forecast chart, held-out evaluation
+metrics, predicted monthly values, warnings, and source fingerprint. In
+Assistant, select the dataset and ask for stored profile facts (counts,
 missing values, observed types, or exact duplicate counts); this inspection
 path requires exactly one ready file and declines unsupported measurements.
 Explicit requests can also invoke the registered deterministic engines and
@@ -94,13 +103,36 @@ guard.
 `POST /api/v1/analytics/forecasts/monthly` trains a bounded CPU linear-trend
 model with annual calendar features from one authorized normalized Parquet
 table. The request names the date and numeric target columns and a 1–24 month
-horizon; monthly target values are summed, gaps are rejected, and a
-chronological holdout is compared with naive baselines. The workflow and
-bounded JSON model artifact are stored in the existing workflow-task tables.
+horizon and explicitly uses sum aggregation; missing months are rejected and a
+chronological holdout is compared with history-supported naive baselines. A
+bounded expanding-window backtest reports up to 12 rolling forecast origins.
+Model MAE is compared with the selected baseline using a 1% relative tolerance;
+WAPE is explicitly unavailable when the absolute-actual denominator is at most
+`1e-12`. Suitability findings flag short histories, small holdouts, near-constant
+targets, long horizons relative to history, and aggregated duplicate-month
+rows. A descriptive 90th-percentile absolute-error envelope is included only
+when at least eight out-of-sample origins are available for each lead time; it
+is not a calibrated prediction or confidence interval. Duplicate requests for
+the same owner, request parameters, and source fingerprint reuse the existing
+workflow. The workflow stores the bounded JSON model artifact, measured
+evaluation, historical observations, forecast values, and provenance in the
+existing workflow-task tables. API responses expose the artifact hash/reference
+rather than the serialized model artifact, and include a chart specification
+with observed and predicted series kept distinct.
 `GET /api/v1/analytics/forecasts/monthly/{workflow_id}` retrieves the
-owner-scoped persisted run. This does not yet integrate forecasts into the
-assistant or dashboard APIs, provide prediction intervals, or establish
-end-to-end dashboard acceptance.
+owner-scoped persisted run only while its normalized source remains current.
+The Assistant tool and Data workspace use this same execution and retrieval
+path. After completion, the Data workspace can append the verified run to an
+existing dashboard or create a forecast-only dashboard, using
+`POST /api/v1/dashboards/{dashboard_id}/forecasts`. Dashboard definitions keep
+the workflow ID, source fingerprint, forecast parameters, chart specification,
+and provenance references—not the model or duplicated time-series data.
+Opening or refreshing a dashboard resolves the original persisted workflow and
+does not retrain or replace it. Stale or unavailable source results are shown
+as unavailable. Schema-v1 saved artifacts remain readable; their suitability
+and uncertainty are explicitly marked unavailable rather than inferred.
+Independent accuracy verification and calibrated prediction intervals are not
+implemented.
 
 `POST /api/v1/analytics/reports` runs the existing deterministic grouped
 multi-dataset engine and returns measured findings, validated charts,
@@ -112,9 +144,11 @@ the current normalized artifact, and does not rerun EDA.
 
 Dashboard definitions are owner-scoped through `GET`, `POST`, `PUT`, and
 `DELETE /api/v1/dashboards`. They store a bounded analytics request, chart
-configuration, and layout—not source data or computed report results.
-Refreshing is explicit and recomputes against current inputs; dashboards do
-not refresh automatically. The additive dashboard migration
+configuration, layout, and references to completed forecast workflows—not
+source data or copied model artifacts. Refreshing is explicit: analytics
+reports recompute against current inputs, while saved forecast references
+reload their original verified run. Dashboards do not refresh automatically.
+The additive dashboard migration
 `7a94c21b6e3f` has been created but not applied. As elsewhere in the local
 workspace, the owner guard is not authenticated multi-tenant access.
 
@@ -148,7 +182,7 @@ is a short navigation document. Operation contracts remain in:
 | 5A. Conversational assistant foundation | Foundation accepted; live local-model inference unverified | Bounded model adapters, allowlisted deterministic tools, persisted conversations, profile inspection, deterministic multi-dataset analytics, and evidence-backed EDA/report tools. The local workspace-owner guard is not authentication or full tenant isolation; approval-gated preprocessing remains unavailable. |
 | 5B. Capability-aware execution foundation | Partial | Typed target/task contracts, privacy/locality-aware placement, registered agent tools routed through the backend target, and a bounded browser Web Worker SHA-256 demonstration. No BI analysis has moved to browser/local execution; no cross-environment scheduler or queue exists. |
 | 5C. Open model foundation | Provider health and synthetic evaluation implemented; live generation unverified | Provider-neutral completion, honest health/capability status, and evaluation harnesses exist. Ollama 0.40.11 listed `qwen3:8b`, `qwen3:4b`, `qwen3:4b-instruct`, and `qwen3:0.6b` locally on 2026-10-26; health is not generation verification. No Qwen3-8B adapter has been trained. |
-| 5-13. Remaining agents, BI, ML, monitoring, governance, production | Partial / planned | Deterministic multi-dataset analytics, evidence-backed reports, on-demand dashboards, and a bounded monthly forecasting API exist; assistant/dashboard forecast integration, prediction intervals, broad governance, and production deployment remain planned. Do not treat roadmap descriptions as implemented capabilities. |
+| 5-13. Remaining agents, BI, ML, monitoring, governance, production | Partial / planned | Deterministic multi-dataset analytics, evidence-backed reports, on-demand dashboards, and bounded monthly forecasting with chronological holdout, expanding-window validation, suitability findings, and descriptive empirical error envelopes exist through the API, Assistant tool, and Data workspace; calibrated prediction intervals, broad governance, and production deployment remain planned. Do not treat roadmap descriptions as implemented capabilities. |
 
 ## Assistant configuration
 

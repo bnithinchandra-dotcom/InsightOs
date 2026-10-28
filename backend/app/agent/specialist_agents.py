@@ -54,6 +54,7 @@ class DataIntelligenceResult(_StrictContract):
         "normalize_file",
         "run_quality_analysis",
         "run_eda_analysis",
+        "run_monthly_forecast",
     ]
     evidence_references: list[dict[str, Any]] = Field(max_length=32)
 
@@ -65,6 +66,7 @@ class AnalyticsDecision(_StrictContract):
         "normalize_file",
         "run_quality_analysis",
         "run_eda_analysis",
+        "run_monthly_forecast",
     ]
     arguments: dict[str, Any]
     summary: StrictStr = Field(min_length=1, max_length=500)
@@ -474,6 +476,7 @@ def run_analytics_decision(
                 "normalize_file",
                 "run_quality_analysis",
                 "run_eda_analysis",
+                "run_monthly_forecast",
             ],
         },
         model=AnalyticsDecision,

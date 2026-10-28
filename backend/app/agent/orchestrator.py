@@ -37,6 +37,8 @@ _UNSUPPORTED_ANALYTICS = re.compile(
     re.IGNORECASE,
 )
 _EXPLICIT_ENGINE_REQUEST = re.compile(
+    r"\b(?:generate|create|make|build|run|perform|execute|calculate|compute)\b"
+    r".{0,60}\b(?:monthly\s+)?forecast(?:ing)?\b|"
     r"\b(?:normalize|normalise|run|perform|execute|calculate|compute|analy[sz]e|"
     r"check)\b.{0,60}\b(?:normalization|normalisation|eda|exploratory(?:\s+data\s+analysis)?|"
     r"quality|distribution|statistics|histogram|correlation)\b|"

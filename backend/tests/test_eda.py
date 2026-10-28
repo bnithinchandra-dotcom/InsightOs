@@ -20,6 +20,10 @@ from app.eda import (
     eda_configuration_from_dict,
 )
 from app.normalization import normalize_file
+from app.ml_intelligence import (
+    assess_ml_task_suitability,
+    detect_univariate_anomalies,
+)
 from app.parsing import parse_dataset_file
 from app.quality_analysis import (
     QUALITY_ANALYSIS_CONFIGURATION,
@@ -105,6 +109,88 @@ class EDAContractTests(unittest.TestCase):
             EDAConfiguration(selected_columns=("x",), percentiles=(float("nan"),))
         with self.assertRaisesRegex(EDAError, "analysis type"):
             EDAConfiguration(analysis_type=[], selected_columns=("x",))
+
+    def test_anomaly_configuration_validates_threshold(self):
+        configuration = eda_configuration_from_dict({
+            "analysis_type": "anomaly_detection",
+            "selected_columns": ["metric"],
+            "anomaly_threshold": 4.0,
+        })
+        self.assertEqual(configuration.anomaly_threshold, 4.0)
+        with self.assertRaisesRegex(EDAError, "anomaly_threshold"):
+            eda_configuration_from_dict({
+                "analysis_type": "anomaly_detection",
+                "selected_columns": ["metric"],
+                "anomaly_threshold": 1.0,
+            })
+
+
+class MLIntelligenceTests(unittest.TestCase):
+    def test_suitability_requires_explicit_targets_and_flags_identifiers(self):
+        result = assess_ml_task_suitability(
+        row_count=100,
+        schema=[
+            {"name": "id", "type": "int64"},
+            {"name": "value", "type": "double"},
+            {"name": "group", "type": "string"},
+            {"name": "when", "type": "timestamp[us]"},
+        ],
+        profile_columns=[
+            {
+                "name": "id",
+                "missing_value_count": 0,
+                "distinct_value_count": 100,
+                "distinct_count_exact": True,
+            },
+            {
+                "name": "value",
+                "missing_value_count": 1,
+                "distinct_value_count": 80,
+                "distinct_count_exact": True,
+                "numeric_statistics": {"minimum": 1.0, "maximum": 99.0},
+            },
+            {
+                "name": "group",
+                "missing_value_count": 0,
+                "distinct_value_count": 2,
+                "distinct_count_exact": True,
+            },
+            {
+                "name": "when",
+                "missing_value_count": 0,
+                "distinct_value_count": 100,
+                "distinct_count_exact": True,
+            },
+        ],
+        )
+        self.assertTrue(result["columns"][0]["likely_identifier"])
+        self.assertEqual(
+        result["tasks"][1]["candidate_target_columns"],
+        ["value"],
+        )
+        self.assertIn("explicit_target", result["tasks"][1]["missing_prerequisites"])
+        self.assertEqual(result["tasks"][0]["status"], "needs_user_input")
+
+    def test_anomaly_detector_finds_injected_outlier_with_bounded_evidence(self):
+        result = detect_univariate_anomalies(
+        [10.0] * 19 + [1000.0],
+        row_indices=list(range(1, 21)),
+        max_evidence_rows=1,
+        )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["anomaly_count"], 1)
+        self.assertEqual(result["evidence_rows"][0]["row_index"], 20)
+        self.assertLessEqual(len(result["evidence_rows"]), 1)
+
+    def test_anomaly_detector_handles_constant_and_small_samples(self):
+        constant = detect_univariate_anomalies([5.0] * 10)
+        self.assertEqual(constant["anomaly_count"], 0)
+        insufficient = detect_univariate_anomalies([1.0, 2.0])
+        self.assertEqual(insufficient["status"], "insufficient_data")
+
+    def test_anomaly_detector_rejects_nonfinite_values(self):
+        with self.assertRaisesRegex(ValueError, "finite numbers"):
+            detect_univariate_anomalies([1.0, float("nan")])
 
 
 class EDAServiceTests(unittest.TestCase):
@@ -1554,6 +1640,39 @@ class EDAServiceTests(unittest.TestCase):
                 normalization_result=normalization,
                 configuration=EDAConfiguration(selected_columns=("metric",)),
             )
+
+    def test_anomaly_analysis_is_persistable_and_reports_bounded_provenance(self):
+        table = pa.table({
+            "metric": [10.0] * 19 + [1000.0, None],
+        })
+        result, _ = self.run_eda(
+            table,
+            ["metric"],
+            analysis_type="anomaly_detection",
+        )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.anomaly_summary["anomaly_count"], 1)
+        self.assertEqual(result.anomaly_summary["evidence_rows"][0]["row_index"], 20)
+        self.assertEqual(result.rows_analyzed, 21)
+        self.assertTrue(any("null or non-finite" in warning for warning in result.warnings))
+        self.assertEqual(result.provenance["verification"]["status"], "verified")
+
+    def test_anomaly_analysis_rejects_non_numeric_columns(self):
+        with self.assertRaisesRegex(EDAError, "numeric column"):
+            self.run_eda(
+                pa.table({"label": ["a", "b", "c"]}),
+                ["label"],
+                analysis_type="anomaly_detection",
+            )
+
+    def test_anomaly_analysis_refuses_oversized_tables(self):
+        with patch.object(eda, "MAX_EDA_NUMERIC_VALUES", 10):
+            with self.assertRaisesRegex(EDAError, "limited to 10 rows"):
+                self.run_eda(
+                    pa.table({"metric": [float(value) for value in range(11)]}),
+                    ["metric"],
+                    analysis_type="anomaly_detection",
+                )
 
 
 if __name__ == "__main__":

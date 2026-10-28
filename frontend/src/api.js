@@ -146,6 +146,40 @@ export function createDatasetEda(datasetId, fileId, payload, signal) {
   }).then((value) => expectObject(value, 'EDA analysis'))
 }
 
+export function getMlTaskSuitability(datasetId, fileId, tableIndex = 0, signal) {
+  return request('/api/v1/analytics/ml/suitability', {
+    signal,
+    method: 'POST',
+    body: {
+      dataset_id: Number(datasetId),
+      file_id: Number(fileId),
+      table_index: tableIndex,
+    },
+  }).then((value) => expectObject(value, 'ML task suitability'))
+}
+
+export function createSupervisedEvaluation(payload, signal) {
+  return request('/api/v1/analytics/ml/supervised', {
+    signal,
+    method: 'POST',
+    body: payload,
+  }).then((value) => expectObject(value, 'supervised ML evaluation'))
+}
+
+export function getSupervisedEvaluation(workflowId, signal) {
+  return get(`/api/v1/analytics/ml/supervised/${encodeURIComponent(workflowId)}`, signal)
+    .then((value) => expectObject(value, 'supervised ML evaluation'))
+}
+
+export function getLatestSupervisedEvaluation(datasetId, fileId, signal) {
+  const query = new URLSearchParams({
+    dataset_id: String(datasetId),
+    file_id: String(fileId),
+  })
+  return get(`/api/v1/analytics/ml/supervised?${query}`, signal)
+    .then((value) => expectObject(value, 'supervised ML evaluation'))
+}
+
 export function getSchemaAnalyses(datasetId, { limit = 10, offset = 0, signal } = {}) {
   const query = new URLSearchParams({ limit: String(limit), offset: String(offset) })
   return get(`/api/v1/datasets/${datasetId}/schema-analyses?${query}`, signal)
@@ -174,6 +208,34 @@ export function createSchemaAnalysis(datasetId, payload, signal) {
 export function getChatProviderStatus(signal) {
   return get('/api/v1/chat/provider-status', signal)
     .then((value) => expectObject(value, 'chat provider status'))
+}
+
+export function getAnalyticsWorkflowResult(workflowId, taskId, signal) {
+  return get(
+    `/api/v1/chat/workflows/${workflowId}/tasks/${encodeURIComponent(taskId)}/analytics-result`,
+    signal,
+  ).then((value) => expectObject(value, 'analytics workflow result'))
+}
+
+export function getAnalyticsCapabilities(signal) {
+  return get('/api/v1/chat/analytics/capabilities', signal)
+    .then((value) => expectObject(value, 'analytics capabilities'))
+}
+
+export function executeAnalyticsJourney(payload, signal) {
+  return request('/api/v1/chat/analytics/executions', {
+    signal,
+    method: 'POST',
+    body: payload,
+  }).then((value) => expectObject(value, 'analytics workflow execution'))
+}
+
+export function executeAnalyticsPlan(payload, signal) {
+  return request('/api/v1/chat/analytics/plans', {
+    signal,
+    method: 'POST',
+    body: payload,
+  }).then((value) => expectObject(value, 'analytics plan execution'))
 }
 
 export function getConversations({ limit = 25, offset = 0, signal } = {}) {
@@ -222,6 +284,14 @@ export function createDashboard(payload, signal) {
   }).then((value) => expectObject(value, 'dashboard'))
 }
 
+export function saveAnalyticsResultToDashboard(dashboardId, payload, signal) {
+  return request(`/api/v1/dashboards/${dashboardId}/analytics-results`, {
+    signal,
+    method: 'POST',
+    body: payload,
+  }).then((value) => expectObject(value, 'saved analytics result'))
+}
+
 export function updateDashboard(dashboardId, payload, signal) {
   return request(`/api/v1/dashboards/${dashboardId}`, {
     signal,
@@ -235,6 +305,14 @@ export function deleteDashboard(dashboardId, signal) {
     signal,
     method: 'DELETE',
   }).then((value) => expectObject(value, 'dashboard deletion'))
+}
+
+export function saveForecastToDashboard(dashboardId, workflowId, signal) {
+  return request(`/api/v1/dashboards/${dashboardId}/forecasts`, {
+    signal,
+    method: 'POST',
+    body: { workflow_id: workflowId },
+  }).then((value) => expectObject(value, 'saved forecast component'))
 }
 
 export function generateAnalyticsReport(payload, signal) {
@@ -251,4 +329,17 @@ export function generateEdaEvidenceReport(payload, signal) {
     method: 'POST',
     body: payload,
   }).then((value) => expectObject(value, 'EDA evidence report'))
+}
+
+export function createMonthlyForecast(payload, signal) {
+  return request('/api/v1/analytics/forecasts/monthly', {
+    signal,
+    method: 'POST',
+    body: payload,
+  }).then((value) => expectObject(value, 'monthly forecast'))
+}
+
+export function getMonthlyForecast(workflowId, signal) {
+  return get(`/api/v1/analytics/forecasts/monthly/${workflowId}`, signal)
+    .then((value) => expectObject(value, 'monthly forecast result'))
 }

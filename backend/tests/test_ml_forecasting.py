@@ -1,11 +1,14 @@
 import hashlib
+import json
 import math
 import unittest
 from datetime import datetime
 
 import numpy as np
 
+import app.ml_forecasting as forecasting
 from app.ml_forecasting import (
+    MAX_BACKTEST_FOLDS,
     ForecastError,
     load_model_artifact,
     predict_monthly_forecast,
@@ -76,8 +79,11 @@ class MonthlyForecastingTests(unittest.TestCase):
         self.assertEqual(len(result["artifact_sha256"]), 64)
         self.assertEqual(
             bool(forecast["warnings"]),
-            not evaluation["beats_baseline"],
+            evaluation["comparison"]["outcome"] != "beats_baseline",
         )
+        self.assertEqual(evaluation["method"], "chronological_holdout")
+        self.assertEqual(evaluation["period_start"], evaluation["periods"][0])
+        self.assertEqual(evaluation["period_end"], evaluation["periods"][-1])
 
     def test_saved_artifact_round_trips_and_produces_same_forecast(self):
         result = train_monthly_forecast(**self.kwargs)
@@ -220,10 +226,177 @@ class MonthlyForecastingTests(unittest.TestCase):
             "rmse": float(np.sqrt(np.mean(np.square(errors)))),
             "wape": (
                 float(np.sum(absolute_errors) / denominator * 100)
-                if denominator > 0
+                if denominator > forecasting.WAPE_NEAR_ZERO_TOLERANCE
                 else None
             ),
+            "wape_status": (
+                "available"
+                if denominator > forecasting.WAPE_NEAR_ZERO_TOLERANCE
+                else "unavailable"
+            ),
+            "wape_reason": (
+                None
+                if denominator > forecasting.WAPE_NEAR_ZERO_TOLERANCE
+                else "The sum of absolute actual values is zero or below 1e-12."
+            ),
         }
+
+    def test_expanding_backtest_is_bounded_chronological_and_uses_past_only(self):
+        baseline = train_monthly_forecast(**self.kwargs)
+        validation = baseline["artifact"]["validation"]
+        backtesting = validation["backtesting"]
+        folds = backtesting["folds"]
+
+        self.assertEqual(backtesting["method"], "expanding_window")
+        self.assertLessEqual(len(folds), MAX_BACKTEST_FOLDS)
+        self.assertEqual(backtesting["fold_count"], len(folds))
+        for fold in folds:
+            self.assertLess(fold["training_end"], fold["evaluation_start"])
+            self.assertLessEqual(fold["evaluation_start"], fold["evaluation_end"])
+            self.assertEqual(
+                fold["training_observations"],
+                self._periods(36).index(fold["training_end"]) + 1,
+            )
+        self.assertEqual(
+            set(validation["baselines"]),
+            {"last_observation", "seasonal_naive_12"},
+        )
+        self.assertEqual(validation["baseline_name"], "seasonal_naive_12")
+        self.assertEqual(
+            validation["comparison"]["baseline_name"],
+            validation["baseline_name"],
+        )
+
+        changed_future = [
+            value + 100_000 if index >= 25 else value
+            for index, value in enumerate(self.targets)
+        ]
+        changed = train_monthly_forecast(
+            **{**self.kwargs, "targets": changed_future}
+        )
+        self.assertEqual(
+            changed["artifact"]["validation"]["backtesting"]["folds"][0][
+                "candidate_mae"
+            ],
+            folds[0]["candidate_mae"],
+        )
+        self.assertEqual(
+            changed["artifact"]["validation"]["backtesting"]["folds"][0][
+                "last_observation_mae"
+            ],
+            folds[0]["last_observation_mae"],
+        )
+
+    def test_uncertainty_uses_out_of_sample_errors_and_has_finite_ordered_bounds(self):
+        result = train_monthly_forecast(**self.kwargs)
+        forecast = result["forecast"]
+        uncertainty = forecast["uncertainty"]
+
+        self.assertEqual(uncertainty["status"], "available")
+        self.assertEqual(
+            uncertainty["method"],
+            "expanding_window_empirical_absolute_error_envelope",
+        )
+        self.assertTrue(
+            all(item["sample_count"] == uncertainty["available_folds"]
+                for item in uncertainty["lead_time_bounds"])
+        )
+        for item in forecast["forecast"]:
+            self.assertTrue(math.isfinite(item["lower_bound"]))
+            self.assertTrue(math.isfinite(item["upper_bound"]))
+            self.assertLessEqual(item["lower_bound"], item["predicted"])
+            self.assertLessEqual(item["predicted"], item["upper_bound"])
+        json.dumps(forecast, allow_nan=False)
+
+    def test_uncertainty_is_unavailable_for_long_horizon_with_too_few_origins(self):
+        result = train_monthly_forecast(
+            **{**self.kwargs, "horizon": 24}
+        )
+        uncertainty = result["forecast"]["uncertainty"]
+
+        self.assertEqual(uncertainty["status"], "unavailable")
+        self.assertLess(uncertainty["available_folds"], uncertainty["required_folds"])
+        self.assertTrue(all(
+            item["lower_bound"] is None and item["upper_bound"] is None
+            for item in result["forecast"]["forecast"]
+        ))
+        self.assertIn(
+            "long_horizon_relative_to_history",
+            [
+                finding["code"]
+                for finding in result["forecast"]["suitability"]["findings"]
+            ],
+        )
+
+    def test_suitability_reports_constant_and_duplicate_month_observations(self):
+        result = train_monthly_forecast(
+            **{
+                **self.kwargs,
+                "dates": self.dates + [self.dates[0]],
+                "targets": [10.0] * len(self.targets) + [0.0],
+            }
+        )
+        findings = result["forecast"]["suitability"]["findings"]
+        codes = {finding["code"] for finding in findings}
+
+        self.assertIn("constant_or_near_constant_target", codes)
+        self.assertIn("duplicate_month_rows_aggregated", codes)
+        self.assertEqual(result["forecast"]["suitability"]["status"], "warning")
+
+    def test_blocked_data_errors_include_structured_suitability_findings(self):
+        cases = (
+            (
+                {
+                    **self.kwargs,
+                    "dates": self.dates[:14],
+                    "targets": self.targets[:14],
+                },
+                "insufficient_history",
+            ),
+            (
+                {
+                    **self.kwargs,
+                    "dates": self.dates[:18] + self.dates[19:],
+                    "targets": self.targets[:18] + self.targets[19:],
+                },
+                "missing_periods",
+            ),
+            (
+                {
+                    **self.kwargs,
+                    "dates": ["not-a-date"] * len(self.dates),
+                },
+                "invalid_dates",
+            ),
+        )
+        for arguments, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+                with self.assertRaises(ForecastError) as raised:
+                    train_monthly_forecast(**arguments)
+                self.assertEqual(raised.exception.code, expected_code)
+                self.assertEqual(raised.exception.findings[0]["severity"], "blocked")
+                self.assertEqual(raised.exception.findings[0]["code"], expected_code)
+
+    def test_wape_near_zero_denominator_is_explicitly_unavailable(self):
+        metrics = forecasting._metrics(
+            np.asarray([1e-15, -1e-15]),
+            np.asarray([2e-15, -2e-15]),
+        )
+
+        self.assertIsNone(metrics["wape"])
+        self.assertEqual(metrics["wape_status"], "unavailable")
+        self.assertTrue(metrics["wape_reason"])
+
+    def test_baseline_comparison_uses_documented_tolerance(self):
+        comparison = forecasting._baseline_comparison(
+            {"mae": 9.95},
+            {"mae": 10.0},
+            "last_observation",
+        )
+
+        self.assertEqual(comparison["outcome"], "within_tolerance")
+        self.assertEqual(comparison["mae_tolerance"], 0.1)
+        self.assertEqual(comparison["tolerance_relative"], 0.01)
 
     @staticmethod
     def _periods(count):

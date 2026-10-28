@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -20,8 +21,16 @@ import pyarrow.parquet as pq
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from app.database import Base
-from app.models import Dataset, DatasetFile, EDAAnalysis, Project, User
+from app.models import (
+    Dataset,
+    DatasetFile,
+    EDAAnalysis,
+    Project,
+    User,
+    WorkflowExecution,
+)
 from app.migrations.versions import b27c49e1d8f3_add_eda_analyses_table as eda_migration
+from app.migrations.versions import d4b8e3f21a67_extend_eda_analysis_types as eda_type_migration
 from app import main, normalization, eda
 from app.task_execution import CapabilityRegistry, ExecutionTarget
 
@@ -195,6 +204,113 @@ class EDAApiTests(unittest.TestCase):
         )
         self.assertEqual(normalized.status_code, 200, normalized.text)
         return file_id
+
+    def _setup_supervised_file(self):
+        size = 120
+        values = [float(index * 0.5 + 2.0 * math.sin(index / 4)) for index in range(size)]
+        table = pa.table({
+            "outcome": values,
+            "signal": [float(index % 20) for index in range(size)],
+            "segment": [f"segment-{index % 4}" for index in range(size)],
+        })
+        buf = BytesIO()
+        pq.write_table(table, buf)
+        upload = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files",
+            files={"file": ("supervised.parquet", buf.getvalue(), "application/vnd.apache.parquet")},
+        )
+        self.assertEqual(upload.status_code, 201, upload.text)
+        file_id = upload.json()["file"]["id"]
+        normalized = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/normalize"
+        )
+        self.assertEqual(normalized.status_code, 200, normalized.text)
+        return file_id
+
+    def test_supervised_evaluation_persists_idempotently_and_reloads(self):
+        file_id = self._setup_supervised_file()
+        request = {
+            "dataset_id": self.dataset_id,
+            "file_id": file_id,
+            "task_type": "regression",
+            "target_column": "outcome",
+            "feature_columns": ["signal", "segment"],
+        }
+        response = self.client.post(
+            "/api/v1/analytics/ml/supervised",
+            json=request,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["status"], "completed", body)
+        self.assertEqual(body["result"]["task_type"], "regression")
+        self.assertEqual(body["result"]["evaluation"]["test_sample_count"], 24)
+        self.assertEqual(
+            body["result"]["evaluation"]["split_strategy"]["type"],
+            "random_holdout",
+        )
+        self.assertEqual(len(body["result"]["result_sha256"]), 64)
+        self.assertNotIn("model", body["result"])
+
+        repeated = self.client.post(
+            "/api/v1/analytics/ml/supervised",
+            json=request,
+        )
+        self.assertEqual(repeated.status_code, 200, repeated.text)
+        self.assertEqual(repeated.json()["workflow_id"], body["workflow_id"])
+        session = self.session_factory()
+        self.assertEqual(session.query(WorkflowExecution).count(), 1)
+        session.close()
+
+        loaded = self.client.get(
+            f"/api/v1/analytics/ml/supervised/{body['workflow_id']}"
+        )
+        self.assertEqual(loaded.status_code, 200, loaded.text)
+        self.assertEqual(
+            loaded.json()["result"]["result_sha256"],
+            body["result"]["result_sha256"],
+        )
+        latest = self.client.get(
+            "/api/v1/analytics/ml/supervised",
+            params={"dataset_id": self.dataset_id, "file_id": file_id},
+        )
+        self.assertEqual(latest.status_code, 200, latest.text)
+        self.assertEqual(latest.json()["workflow_id"], body["workflow_id"])
+
+    def test_supervised_evaluation_rejects_target_as_feature(self):
+        file_id = self._setup_supervised_file()
+        response = self.client.post(
+            "/api/v1/analytics/ml/supervised",
+            json={
+                "dataset_id": self.dataset_id,
+                "file_id": file_id,
+                "task_type": "regression",
+                "target_column": "outcome",
+                "feature_columns": ["outcome"],
+            },
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["detail"]["code"], "target_in_features")
+
+    def test_supervised_classification_api_returns_metrics_and_confusion_matrix(self):
+        file_id = self._setup_supervised_file()
+        response = self.client.post(
+            "/api/v1/analytics/ml/supervised",
+            json={
+                "dataset_id": self.dataset_id,
+                "file_id": file_id,
+                "task_type": "classification",
+                "target_column": "segment",
+                "feature_columns": ["signal"],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["status"], "completed", body)
+        self.assertEqual(body["result"]["task_type"], "classification")
+        metrics = body["result"]["evaluation"]["test_result"]["model"]
+        self.assertEqual(len(metrics["confusion_matrix"]), 4)
+        self.assertIn("balanced_accuracy", metrics)
 
     def test_univariate_eda_success_and_persistence(self):
         file_id = self._setup_normalized_file()
@@ -631,6 +747,23 @@ class EDAApiTests(unittest.TestCase):
                 )
                 self.assertIsNone(res.scalar())
 
+    def test_anomaly_analysis_type_migration_is_reversible_when_no_results_exist(self):
+        with self.engine.begin() as conn:
+            conn.exec_driver_sql("DROP TABLE IF EXISTS eda_analyses;")
+            op = Operations(MigrationContext.configure(conn))
+            with patch.object(eda_migration, "op", op):
+                eda_migration.upgrade()
+            with patch.object(eda_type_migration, "op", op):
+                eda_type_migration.upgrade()
+                constraint_sql = conn.exec_driver_sql(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type='table' AND name='eda_analyses'"
+                ).scalar_one()
+                self.assertIn("anomaly_detection", constraint_sql)
+                eda_type_migration.downgrade()
+            with patch.object(eda_migration, "op", op):
+                eda_migration.downgrade()
+
     def test_artifact_checksum_mismatch_fails_cleanly(self):
         file_id = self._setup_normalized_file()
 
@@ -699,6 +832,66 @@ class EDAApiTests(unittest.TestCase):
         self.assertTrue(len(created_paths) > 0)
         for path in created_paths:
             self.assertFalse(path.exists(), f"Temporary file {path} was not cleaned up on success!")
+
+    def test_ml_suitability_uses_verified_normalization_metadata(self):
+        file_id = self._setup_normalized_file()
+        response = self.client.post(
+            "/api/v1/analytics/ml/suitability",
+            json={
+                "dataset_id": self.dataset_id,
+                "file_id": file_id,
+                "table_index": 0,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertEqual(data["row_count"], 4)
+        self.assertEqual(data["source"]["dataset_id"], self.dataset_id)
+        self.assertEqual(data["source"]["file_id"], file_id)
+        self.assertEqual(data["source"]["artifact_verification"], "verified")
+        self.assertEqual(len(data["source"]["source_fingerprint"]), 64)
+        self.assertEqual(data["tasks"][3]["status"], "insufficient_data")
+        self.assertEqual(
+            data["tasks"][3]["missing_prerequisites"],
+            ["at_least_8_rows", "numeric_column_selection"],
+        )
+
+    def test_ml_suitability_rejects_file_from_another_dataset(self):
+        file_id = self._setup_normalized_file()
+        response = self.client.post(
+            "/api/v1/analytics/ml/suitability",
+            json={
+                "dataset_id": self.dataset_id + 1,
+                "file_id": file_id,
+            },
+        )
+        self.assertIn(response.status_code, (404, 422))
+
+    def test_anomaly_analysis_persists_and_reloads_without_rerunning(self):
+        file_id = self._setup_normalized_file()
+        response = self.client.post(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/eda",
+            json={
+                "analysis_type": "anomaly_detection",
+                "selected_columns": ["b"],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertEqual(data["result"]["analysis_type"], "anomaly_detection")
+        self.assertIn(data["result"]["status"], {"completed", "partially_completed"})
+        self.assertEqual(
+            data["result"]["algorithm_version"],
+            "robust-anomaly-1",
+        )
+        loaded = self.client.get(
+            f"/api/v1/datasets/{self.dataset_id}/files/{file_id}/eda/{data['id']}"
+        )
+        self.assertEqual(loaded.status_code, 200, loaded.text)
+        self.assertEqual(
+            loaded.json()["result"]["anomaly_summary"],
+            data["result"]["anomaly_summary"],
+        )
 
     def test_recompute_flag_in_json_body(self):
         file_id = self._setup_normalized_file()

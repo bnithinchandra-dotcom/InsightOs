@@ -37,6 +37,31 @@ describe('conversation workspace', () => {
           message: 'Provider is not configured.',
         })
       }
+      if (url.pathname === '/api/v1/chat/analytics/capabilities') {
+        return jsonResponse({
+          operations: [{
+            operation: 'generate_evidence_report',
+            description: 'Generate deterministic evidence reports.',
+            source_scope: 'multiple_datasets',
+            execution_kind: 'deterministic',
+            supported_outputs: ['summary', 'findings', 'charts', 'provenance'],
+            workflow_report_result: true,
+            plan_eligible: true,
+            dependency_ordering: true,
+            supported_result_references: [],
+            parameter_schema: {
+              type: 'object',
+              properties: { sources: { type: 'array' } },
+              required: ['sources'],
+            },
+          }],
+          plan_limits: {
+            maximum_operations: 5,
+            maximum_dependency_depth: 4,
+            supports_result_handoffs: false,
+          },
+        })
+      }
       if (url.pathname === '/api/v1/projects') return jsonResponse([])
       if (url.pathname === `/api/v1/chat/conversations/${conversation.id}`) {
         return jsonResponse({
@@ -103,6 +128,469 @@ describe('conversation workspace', () => {
     expect(input.value).toBe('')
   })
 
+  it('creates a dashboard and saves a completed Assistant report by reference', async () => {
+    const dashboard = {
+      id: 'a'.repeat(32),
+      title: 'Pinned Assistant report',
+      definition: {
+        analysis_request: null,
+        chart_requests: [],
+        layout: [],
+        forecast_components: [],
+        analytics_components: [],
+      },
+    }
+    const workflowId = 'b'.repeat(32)
+    const taskId = 'tool:generate_evidence_report:verified-report'
+    globalThis.fetch.mockImplementation(async (input, options = {}) => {
+      const url = new URL(String(input), window.location.origin)
+      if (url.pathname === '/api/v1/chat/conversations' && options.method === 'POST') {
+        return jsonResponse(conversation, 201)
+      }
+      if (url.pathname === '/api/v1/chat/conversations') return jsonResponse([])
+      if (url.pathname === '/api/v1/chat/provider-status') {
+        return jsonResponse({
+          provider: 'none',
+          status: 'not_configured',
+          message: 'Provider is not configured.',
+        })
+      }
+      if (url.pathname === '/api/v1/projects') return jsonResponse([])
+      if (url.pathname === `/api/v1/chat/conversations/${conversation.id}/messages`) {
+        return jsonResponse({
+          conversation,
+          user_message: {
+            id: 22,
+            sequence: 1,
+            role: 'user',
+            content: 'Save the report',
+            created_at: '2026-10-19T10:01:00',
+          },
+          assistant_message: {
+            id: 23,
+            sequence: 2,
+            role: 'assistant',
+            content: 'The verified report is ready.',
+            metadata: {
+              execution_status: 'completed',
+              tool_activities: [],
+              structured_results: [{
+                tool: 'generate_evidence_report',
+                status: 'succeeded',
+                summary: 'Generated a verified report.',
+                data: { findings: [] },
+                references: [{
+                  type: 'analytics_workflow_result',
+                  workflow_id: workflowId,
+                  task_id: taskId,
+                }],
+              }],
+              warnings: [],
+            },
+            created_at: '2026-10-19T10:01:01',
+          },
+          execution_status: 'completed',
+          tool_activities: [],
+          structured_results: [],
+          warnings: [],
+          error_code: null,
+        })
+      }
+      if (url.pathname === '/api/v1/dashboards' && options.method === 'GET') {
+        return jsonResponse([])
+      }
+      if (url.pathname === '/api/v1/dashboards' && options.method === 'POST') {
+        expect(JSON.parse(options.body)).toMatchObject({
+          title: 'Assistant evidence',
+          analysis_request: null,
+          chart_requests: [],
+        })
+        return jsonResponse(dashboard, 201)
+      }
+      if (
+        url.pathname === `/api/v1/dashboards/${dashboard.id}/analytics-results`
+        && options.method === 'POST'
+      ) {
+        expect(JSON.parse(options.body)).toEqual({
+          workflow_id: workflowId,
+          task_id: taskId,
+        })
+        return jsonResponse({
+          dashboard,
+          analytics_component: {},
+          duplicate: false,
+        })
+      }
+      return jsonResponse({ detail: `Unexpected request: ${url.pathname}` }, 500)
+    })
+
+    render(<ConversationWorkspace />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Start a conversation' }))
+    await screen.findByText('Ask a question about your existing projects, datasets, profiles, quality reports, EDA, or schema analyses.')
+    const input = screen.getByLabelText('Your message')
+    fireEvent.change(input, { target: { value: 'Save the report' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(await screen.findByText('The verified report is ready.')).toBeTruthy()
+    fireEvent.click(screen.getByText('generate evidence report result'))
+    fireEvent.click(screen.getByRole('button', { name: 'Save verified report to dashboard' }))
+    fireEvent.change(await screen.findByLabelText('Save this report to dashboard'), {
+      target: { value: '__create_dashboard__' },
+    })
+    fireEvent.change(screen.getByLabelText('New dashboard name'), {
+      target: { value: 'Assistant evidence' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save verified report' }))
+
+    expect(await screen.findByText(
+      'Saved the verified analytics result to dashboard "Pinned Assistant report".',
+    )).toBeTruthy()
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      expect.stringContaining(`/api/v1/dashboards/${dashboard.id}/analytics-results`),
+      expect.objectContaining({ method: 'POST' }),
+    )
+  })
+
+  it('discovers and runs a registered structured report, then offers dashboard save', async () => {
+    const workflowId = 'c'.repeat(32)
+    const taskId = 'tool:generate_evidence_report:structured'
+    const dashboard = {
+      id: 'd'.repeat(32),
+      title: 'Structured analytics',
+      definition: {
+        analysis_request: null,
+        chart_requests: [],
+        layout: [],
+        forecast_components: [],
+        analytics_components: [],
+      },
+    }
+    globalThis.fetch.mockImplementation(async (input, options = {}) => {
+      const url = new URL(String(input), window.location.origin)
+      if (url.pathname === '/api/v1/chat/conversations') return jsonResponse([])
+      if (url.pathname === '/api/v1/chat/provider-status') {
+        return jsonResponse({ provider: 'none', status: 'not_configured', message: '' })
+      }
+      if (url.pathname === '/api/v1/chat/analytics/capabilities') {
+        return jsonResponse({
+          operations: [{
+            operation: 'generate_evidence_report',
+            description: 'Compute deterministic grouped findings and charts.',
+            source_scope: 'multiple_datasets',
+            execution_kind: 'deterministic',
+            supported_outputs: ['summary', 'findings', 'charts', 'provenance'],
+            workflow_report_result: true,
+            plan_eligible: true,
+            dependency_ordering: true,
+            supported_result_references: [],
+            parameter_schema: {
+              type: 'object',
+              properties: { sources: { type: 'array' } },
+              required: ['sources'],
+            },
+          }],
+        })
+      }
+      if (url.pathname === '/api/v1/projects') return jsonResponse([])
+      if (url.pathname === '/api/v1/chat/analytics/executions' && options.method === 'POST') {
+        expect(JSON.parse(options.body)).toEqual({
+          operation: 'generate_evidence_report',
+          parameters: { sources: [] },
+        })
+        return jsonResponse({
+          contract_version: 1,
+          request_id: workflowId,
+          execution_id: workflowId,
+          workflow_id: workflowId,
+          task_id: taskId,
+          operation: 'generate_evidence_report',
+          workflow_status: 'completed',
+          task_status: 'completed',
+          dependency_task_ids: [],
+          source_references: [],
+          parameters: { sources: [] },
+          result_sha256: 'e'.repeat(64),
+          result: {
+            summary: { joined_row_count: 7, group_count: 1, findings_count: 1 },
+            findings: [{ id: 'finding-1', statement: 'Revenue equals 42.' }],
+            charts: [{
+              title: 'Revenue by region',
+              chart_type: 'bar',
+              x_field: 'region',
+              y_field: 'revenue',
+              data: {
+                labels: ['west'],
+                series: [{ name: 'revenue', values: [42] }],
+              },
+              warnings: [],
+            }],
+            warnings: [],
+          },
+          evidence: [],
+          warnings: [],
+          provenance: { operation_id: 'f'.repeat(64) },
+          completed_at: '2026-10-28T10:00:00+00:00',
+        })
+      }
+      if (url.pathname === '/api/v1/dashboards' && options.method === 'GET') {
+        return jsonResponse([dashboard])
+      }
+      if (
+        url.pathname === `/api/v1/dashboards/${dashboard.id}/analytics-results`
+        && options.method === 'POST'
+      ) {
+        return jsonResponse({
+          dashboard,
+          analytics_component: {},
+          duplicate: false,
+        })
+      }
+      return jsonResponse({ detail: `Unexpected request: ${url.pathname}` }, 500)
+    })
+
+    render(<ConversationWorkspace />)
+    const operationSelect = await screen.findByLabelText('Evidence-report operation')
+    expect(operationSelect.options[0].value).toBe('generate_evidence_report')
+    fireEvent.change(screen.getByLabelText('Operation parameters as JSON'), {
+      target: { value: '{"sources":[]}' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Run structured analytics' }))
+
+    expect(await screen.findByText(/workflow completed · operation completed/)).toBeTruthy()
+    expect(screen.getByText('Revenue equals 42.')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Revenue by region' })).toBeTruthy()
+    expect(await screen.findByLabelText('Save this report to dashboard')).toBeTruthy()
+    expect(screen.getByText(/Parameter schema/)).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save verified report' }))
+    expect(await screen.findByText(
+      'Saved the verified analytics result to dashboard "Structured analytics".',
+    )).toBeTruthy()
+  })
+
+  it('reports malformed structured parameters before sending an execution request', async () => {
+    render(<ConversationWorkspace />)
+    await screen.findByLabelText('Evidence-report operation')
+    fireEvent.change(screen.getByLabelText('Operation parameters as JSON'), {
+      target: { value: '{invalid' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Run structured analytics' }))
+
+    expect(await screen.findByText('Operation parameters must be valid JSON.')).toBeTruthy()
+    expect(globalThis.fetch).not.toHaveBeenCalledWith(
+      expect.stringContaining('/api/v1/chat/analytics/executions'),
+      expect.anything(),
+    )
+  })
+
+  it('validates a plan locally and presents successful and failed operations for saving', async () => {
+    const planWorkflowId = 'c'.repeat(32)
+    let planSubmissions = 0
+    const planDashboard = {
+      id: 'd'.repeat(32),
+      title: 'Structured analytics',
+      definition: {
+        analysis_request: null,
+        chart_requests: [],
+        layout: [],
+        forecast_components: [],
+        analytics_components: [],
+      },
+    }
+    const resultReference = {
+      workflow_id: planWorkflowId,
+      task_id: 'summary',
+      result_sha256: 'd'.repeat(64),
+    }
+    globalThis.fetch.mockImplementation(async (input, options = {}) => {
+      const url = new URL(String(input), window.location.origin)
+      if (url.pathname === '/api/v1/chat/conversations') return jsonResponse([])
+      if (url.pathname === '/api/v1/chat/provider-status') {
+        return jsonResponse({ provider: 'none', status: 'not_configured', message: '' })
+      }
+      if (url.pathname === '/api/v1/chat/analytics/capabilities') {
+        return jsonResponse({
+          operations: [{
+            operation: 'generate_evidence_report',
+            description: 'Generate verified report output.',
+            source_scope: 'multiple_datasets',
+            execution_kind: 'deterministic',
+            supported_outputs: ['summary', 'findings', 'charts', 'provenance'],
+            workflow_report_result: true,
+            plan_eligible: true,
+            parameter_schema: { type: 'object', properties: {} },
+          }],
+          plan_limits: {
+            maximum_operations: 5,
+            maximum_dependency_depth: 4,
+            supports_result_handoffs: false,
+          },
+        })
+      }
+      if (url.pathname === '/api/v1/projects') return jsonResponse([])
+      if (url.pathname === '/api/v1/chat/analytics/plans' && options.method === 'POST') {
+        planSubmissions += 1
+        if (planSubmissions > 1) {
+          return jsonResponse({ detail: 'Temporary plan error.' }, 503)
+        }
+        expect(JSON.parse(options.body)).toEqual({
+          operations: [
+            {
+              operation_id: 'failed',
+              operation: 'generate_evidence_report',
+              parameters: { sources: [] },
+              depends_on: [],
+            },
+            {
+              operation_id: 'summary',
+              operation: 'generate_evidence_report',
+              parameters: { sources: [] },
+              depends_on: [],
+            },
+            {
+              operation_id: 'blocked',
+              operation: 'generate_evidence_report',
+              parameters: { sources: [] },
+              depends_on: ['failed'],
+            },
+          ],
+        })
+        return jsonResponse({
+          plan_id: planWorkflowId,
+          workflow_id: planWorkflowId,
+          status: 'partial',
+          operations: [
+            {
+              operation_id: 'failed',
+              operation: 'generate_evidence_report',
+              status: 'failed',
+              depends_on: [],
+              result_reference: null,
+              result: null,
+              source_references: [],
+              provenance: null,
+              warnings: [],
+              error_code: 'synthetic_failure',
+              reason: 'Operation failed.',
+            },
+            {
+              operation_id: 'blocked',
+              operation: 'generate_evidence_report',
+              status: 'blocked',
+              depends_on: ['failed'],
+              result_reference: null,
+              result: null,
+              source_references: [],
+              provenance: null,
+              warnings: [],
+              error_code: 'dependency_not_completed',
+              reason: null,
+            },
+            {
+              operation_id: 'summary',
+              operation: 'generate_evidence_report',
+              status: 'completed',
+              depends_on: [],
+              result_reference: resultReference,
+              result: {
+                summary: { joined_row_count: 7 },
+                findings: [{ id: 'finding-1', statement: 'Seven rows were joined.' }],
+                charts: [],
+                warnings: [],
+              },
+              source_references: [],
+              provenance: { operation_id: 'e'.repeat(64) },
+              warnings: [],
+              error_code: null,
+              reason: null,
+            },
+          ],
+        })
+      }
+      if (url.pathname === '/api/v1/dashboards' && options.method === 'GET') {
+        return jsonResponse([planDashboard])
+      }
+      if (
+        url.pathname === `/api/v1/dashboards/${planDashboard.id}/analytics-results`
+        && options.method === 'POST'
+      ) {
+        expect(JSON.parse(options.body)).toEqual({
+          workflow_id: planWorkflowId,
+          task_id: 'summary',
+        })
+        return jsonResponse({ dashboard: planDashboard, analytics_component: {}, duplicate: false })
+      }
+      return jsonResponse({ detail: `Unexpected request: ${url.pathname}` }, 500)
+    })
+
+    render(<ConversationWorkspace />)
+    const planInput = await screen.findByLabelText('Analytics plan as JSON')
+    fireEvent.change(planInput, {
+      target: {
+        value: JSON.stringify({
+          operations: [
+            {
+              operation_id: 'failed',
+              operation: 'generate_evidence_report',
+              parameters: { sources: [] },
+              depends_on: [],
+            },
+            {
+              operation_id: 'summary',
+              operation: 'generate_evidence_report',
+              parameters: { sources: [] },
+              depends_on: [],
+            },
+            {
+              operation_id: 'blocked',
+              operation: 'generate_evidence_report',
+              parameters: { sources: [] },
+              depends_on: ['failed'],
+            },
+          ],
+        }),
+      },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Validate and run plan' }))
+
+    expect(await screen.findByText(/Plan .* · partial/)).toBeTruthy()
+    expect(screen.getByLabelText('Operation failed: failed')).toBeTruthy()
+    expect(screen.getByLabelText('Operation blocked: blocked')).toBeTruthy()
+    expect(screen.getByText('Seven rows were joined.')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Validate and run plan' }))
+    expect(await screen.findByText('Temporary plan error.')).toBeTruthy()
+    expect(screen.getByText('Seven rows were joined.')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Save verified result to dashboard' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Save verified report' }))
+    expect(await screen.findByText(
+      'Saved the verified analytics result to dashboard "Structured analytics".',
+    )).toBeTruthy()
+  })
+
+  it('rejects invalid plan dependencies without sending an execution request', async () => {
+    render(<ConversationWorkspace />)
+    fireEvent.change(await screen.findByLabelText('Analytics plan as JSON'), {
+      target: {
+        value: JSON.stringify({
+          operations: [
+            {
+              operation_id: 'same',
+              operation: 'generate_evidence_report',
+              parameters: {},
+              depends_on: ['same'],
+            },
+          ],
+        }),
+      },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Validate and run plan' }))
+    expect(await screen.findByText('Operation "same" cannot depend on itself.')).toBeTruthy()
+    expect(globalThis.fetch).not.toHaveBeenCalledWith(
+      expect.stringContaining('/api/v1/chat/analytics/plans'),
+      expect.anything(),
+    )
+  })
+
   it('preserves the draft and reports an API error', async () => {
     render(<ConversationWorkspace />)
     fireEvent.click(await screen.findByRole('button', { name: 'Start a conversation' }))
@@ -115,6 +603,9 @@ describe('conversation workspace', () => {
       if (url.pathname === '/api/v1/chat/conversations') return jsonResponse([])
       if (url.pathname === '/api/v1/chat/provider-status') {
         return jsonResponse({ provider: 'none', status: 'not_configured', message: '' })
+      }
+      if (url.pathname === '/api/v1/chat/analytics/capabilities') {
+        return jsonResponse({ operations: [] })
       }
       if (url.pathname === '/api/v1/projects') return jsonResponse([])
       if (url.pathname === `/api/v1/chat/conversations/${conversation.id}`) {
@@ -141,6 +632,9 @@ describe('conversation workspace', () => {
       if (url.pathname === '/api/v1/chat/conversations') return jsonResponse([])
       if (url.pathname === '/api/v1/chat/provider-status') {
         return jsonResponse({ provider: 'ollama', status: 'healthy', message: '' })
+      }
+      if (url.pathname === '/api/v1/chat/analytics/capabilities') {
+        return jsonResponse({ operations: [] })
       }
       if (url.pathname === '/api/v1/projects') return jsonResponse([])
       if (url.pathname === `/api/v1/chat/conversations/${conversation.id}`) {

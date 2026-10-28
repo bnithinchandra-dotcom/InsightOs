@@ -16,7 +16,7 @@ from email.message import Message
 from os import getenv
 from uuid import uuid4
 
-from fastapi import Body, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import Body, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
 from minio import Minio
@@ -149,7 +149,21 @@ from app.multi_dataset_analytics import (
     execute_join_aggregation,
     recommend_joins,
 )
-from app.ml_forecasting import MAX_HORIZON, ForecastError, train_monthly_forecast
+from app.ml_forecasting import (
+    MAX_HORIZON,
+    ForecastError,
+    load_model_artifact,
+    train_monthly_forecast,
+)
+from app.ml_intelligence import assess_ml_task_suitability
+from app.ml_supervised import (
+    MAX_RESULT_BYTES as MAX_SUPERVISED_RESULT_BYTES,
+    MAX_SUPERVISED_FEATURES,
+    MAX_SUPERVISED_ROWS,
+    SupervisedEvaluationError,
+    evaluate_supervised,
+    validate_supervised_request,
+)
 from app.workflow_execution import (
     WorkflowPlanError,
     WorkflowTaskExecutionError,
@@ -236,6 +250,37 @@ class ChartSpecificationRequest(BaseModel):
     series_field: StrictStr | None = Field(default=None, min_length=1, max_length=255)
 
 
+MAX_DASHBOARD_FORECASTS = 8
+MAX_DASHBOARD_ANALYTICS_RESULTS = 8
+
+
+class DashboardForecastRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    workflow_id: StrictStr = Field(min_length=32, max_length=32)
+
+    @model_validator(mode="after")
+    def validate_workflow_id(self):
+        if not re.fullmatch(r"[a-fA-F0-9]{32}", self.workflow_id):
+            raise ValueError("A valid forecast workflow identifier is required.")
+        return self
+
+
+class DashboardAnalyticsResultRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    workflow_id: StrictStr = Field(min_length=32, max_length=32)
+    task_id: StrictStr = Field(min_length=1, max_length=80)
+
+    @model_validator(mode="after")
+    def validate_identifiers(self):
+        if not re.fullmatch(r"[a-fA-F0-9]{32}", self.workflow_id):
+            raise ValueError("A valid workflow identifier is required.")
+        if any(ord(character) < 0x20 for character in self.task_id):
+            raise ValueError("A valid workflow task identifier is required.")
+        return self
+
+
 class DashboardLayoutItem(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -255,7 +300,7 @@ class DashboardDefinitionRequest(BaseModel):
 
     title: StrictStr = Field(min_length=1, max_length=120)
     description: StrictStr | None = Field(default=None, max_length=2000)
-    analysis_request: MultiDatasetAnalysisRequest
+    analysis_request: MultiDatasetAnalysisRequest | None = None
     chart_requests: list[ChartSpecificationRequest] = Field(
         default_factory=list,
         max_length=MAX_CHARTS,
@@ -264,6 +309,10 @@ class DashboardDefinitionRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_layout(self):
+        if self.analysis_request is None and (self.chart_requests or self.layout):
+            raise ValueError(
+                "Chart requests and layout require an analytics request."
+            )
         indexes = [item.chart_index for item in self.layout]
         if (
             len(indexes) != len(set(indexes))
@@ -299,12 +348,51 @@ class MonthlyForecastRequest(BaseModel):
     table_index: StrictInt = Field(default=0, ge=0)
     date_column: StrictStr = Field(min_length=1, max_length=255)
     target_column: StrictStr = Field(min_length=1, max_length=255)
+    aggregation: StrictStr = Field(default="sum", min_length=1, max_length=16)
     horizon: StrictInt = Field(default=3, ge=1, le=MAX_HORIZON)
 
     @model_validator(mode="after")
     def validate_columns(self):
         if self.date_column == self.target_column:
             raise ValueError("Date and target columns must be different.")
+        return self
+
+
+class MLTaskSuitabilityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    dataset_id: StrictInt = Field(gt=0)
+    file_id: StrictInt = Field(gt=0)
+    table_index: StrictInt = Field(default=0, ge=0)
+
+
+class SupervisedEvaluationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    dataset_id: StrictInt = Field(gt=0)
+    file_id: StrictInt = Field(gt=0)
+    table_index: StrictInt = Field(default=0, ge=0)
+    task_type: Literal["regression", "classification"]
+    target_column: StrictStr = Field(min_length=1, max_length=255)
+    feature_columns: list[StrictStr] = Field(
+        min_length=1,
+        max_length=MAX_SUPERVISED_FEATURES,
+    )
+    time_column: StrictStr | None = Field(default=None, min_length=1, max_length=255)
+    group_column: StrictStr | None = Field(default=None, min_length=1, max_length=255)
+    confirmed_suspicious_features: list[StrictStr] = Field(
+        default_factory=list,
+        max_length=MAX_SUPERVISED_FEATURES,
+    )
+
+    @model_validator(mode="after")
+    def validate_explicit_columns(self):
+        if len(set(self.feature_columns)) != len(self.feature_columns):
+            raise ValueError("Feature columns must be unique.")
+        if len(set(self.confirmed_suspicious_features)) != len(
+            self.confirmed_suspicious_features
+        ):
+            raise ValueError("Suspicious feature confirmations must be unique.")
         return self
 
 
@@ -2194,6 +2282,281 @@ def _monthly_forecast_source_fingerprint(source: AnalyticsSource) -> str:
     ).hexdigest()
 
 
+def _monthly_forecast_result_sha256(result: dict[str, Any]) -> str:
+    payload = {key: value for key, value in result.items() if key != "result_sha256"}
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _monthly_forecast_chart(result: dict[str, Any]) -> dict[str, Any]:
+    historical = result["historical"]
+    forecast = result["forecast"]
+    labels = [point["period"] for point in historical + forecast]
+    historical_values = [point["observed"] for point in historical]
+    forecast_values = [point["predicted"] for point in forecast]
+    return {
+        "title": f"{result['target_column']} monthly forecast",
+        "chart_type": "line",
+        "x_field": result["date_column"],
+        "y_field": result["target_column"],
+        "series_field": "kind",
+        "aggregation": result["aggregation"],
+        "labels": {
+            "x": result["date_column"],
+            "y": result["target_column"],
+        },
+        "data": {
+            "labels": labels,
+            "x_values": labels,
+            "series": [
+                {
+                    "name": "Observed history",
+                    "values": historical_values + [None] * len(forecast),
+                },
+                {
+                    "name": "Forecast",
+                    "values": [None] * len(historical) + forecast_values,
+                },
+            ],
+        },
+        "warnings": result["warnings"],
+    }
+
+
+def _monthly_forecast_public_result(result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "forecast_result_invalid",
+                "message": "The persisted forecast result is unavailable.",
+            },
+        )
+    result_schema_version = result.get("result_schema_version", 1)
+    if (
+        isinstance(result_schema_version, bool)
+        or not isinstance(result_schema_version, int)
+        or result_schema_version not in {1, 2}
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "forecast_result_version_unsupported",
+                "message": (
+                    f"Forecast result schema version {result_schema_version} is not "
+                    "supported by this application."
+                ),
+            },
+        )
+    expected_result_sha256 = result.get("result_sha256")
+    try:
+        actual_result_sha256 = _monthly_forecast_result_sha256(result)
+        artifact_bytes = json.dumps(
+            result.get("model_artifact"),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        artifact = load_model_artifact(
+            artifact_bytes,
+            result.get("model_artifact_sha256"),
+        )
+    except (ForecastError, TypeError, ValueError, UnicodeError, OverflowError):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "forecast_artifact_integrity_failed",
+                "message": "The stored model artifact failed integrity verification.",
+            },
+        ) from None
+    source = artifact.get("source")
+    evaluation = artifact.get("validation")
+    references = result.get("references")
+    source_reference = (
+        references[0]
+        if isinstance(references, list)
+        and references
+        and isinstance(references[0], dict)
+        else None
+    )
+    if (
+        not isinstance(expected_result_sha256, str)
+        or actual_result_sha256 != expected_result_sha256
+        or artifact.get("algorithm") != "sklearn_linear_trend_seasonal"
+        or artifact.get("date_column") != result.get("date_column")
+        or artifact.get("target_column") != result.get("target_column")
+        or artifact.get("aggregation") != result.get("aggregation")
+        or not isinstance(source, dict)
+        or source.get("dataset_id") != result.get("dataset_id")
+        or source.get("file_id") != result.get("file_id")
+        or source.get("fingerprint") != result.get("source_fingerprint")
+        or not isinstance(source_reference, dict)
+        or source_reference.get("source_fingerprint")
+        != result.get("source_fingerprint")
+        or source_reference.get("artifact_sha256")
+        != result.get("normalized_artifact_sha256")
+        or artifact.get("artifact_version") != result_schema_version
+        or not isinstance(evaluation, dict)
+        or not isinstance(result.get("historical"), list)
+        or not isinstance(result.get("forecast"), list)
+        or not isinstance(result.get("warnings"), list)
+        or not isinstance(result.get("limitations"), list)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "forecast_artifact_integrity_failed",
+                "message": "The stored forecast result failed integrity verification.",
+            },
+        )
+    if result_schema_version == 2 and (
+        evaluation.get("method") != "chronological_holdout"
+        or not isinstance(evaluation.get("backtesting"), dict)
+        or not isinstance(evaluation.get("suitability"), dict)
+        or not isinstance(evaluation.get("uncertainty"), dict)
+        or evaluation["uncertainty"].get("status")
+        not in {"available", "unavailable"}
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "forecast_result_invalid",
+                "message": "The version 2 forecast evaluation contract is incomplete.",
+            },
+        )
+    if result_schema_version == 1:
+        suitability = {
+            "status": "unavailable",
+            "findings": [
+                {
+                    "severity": "informational",
+                    "code": "legacy_result_suitability_unavailable",
+                    "message": (
+                        "This saved forecast predates structured suitability "
+                        "assessment; the original data was not reinterpreted."
+                    ),
+                }
+            ],
+        }
+        uncertainty = {
+            "status": "unavailable",
+            "method": None,
+            "reason": (
+                "This saved forecast predates out-of-sample uncertainty reporting."
+            ),
+            "lead_time_bounds": [],
+            "limitations": [
+                "No uncertainty bounds are inferred for legacy forecast artifacts."
+            ],
+        }
+    else:
+        suitability = evaluation["suitability"]
+        uncertainty = evaluation["uncertainty"]
+    if result_schema_version == 2:
+        for item in result["forecast"]:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("period"), str)
+                or not isinstance(item.get("predicted"), (int, float))
+                or isinstance(item.get("predicted"), bool)
+                or not math.isfinite(float(item["predicted"]))
+                or (
+                    item.get("lower_bound") is not None
+                    and (
+                        not isinstance(item["lower_bound"], (int, float))
+                        or not math.isfinite(float(item["lower_bound"]))
+                    )
+                )
+                or (
+                    item.get("upper_bound") is not None
+                    and (
+                        not isinstance(item["upper_bound"], (int, float))
+                        or not math.isfinite(float(item["upper_bound"]))
+                    )
+                )
+                or (
+                    item.get("lower_bound") is not None
+                    and item.get("upper_bound") is not None
+                    and item["lower_bound"] > item["upper_bound"]
+                )
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "forecast_result_invalid",
+                        "message": "The persisted forecast values or uncertainty bounds are invalid.",
+                    },
+                )
+    return {
+        "result_schema_version": result_schema_version,
+        "dataset_id": result["dataset_id"],
+        "file_id": result["file_id"],
+        "table_index": result["table_index"],
+        "date_column": result["date_column"],
+        "target_column": result["target_column"],
+        "aggregation": result["aggregation"],
+        "horizon": result["horizon"],
+        "source_fingerprint": result["source_fingerprint"],
+        "normalized_artifact_sha256": result["normalized_artifact_sha256"],
+        "historical": result["historical"],
+        "forecast": result["forecast"],
+        "evaluation": evaluation,
+        "evaluation_method": evaluation.get("method", "chronological_holdout"),
+        "comparison": evaluation.get("comparison"),
+        "suitability": suitability,
+        "uncertainty": uncertainty,
+        "model_artifact_sha256": result["model_artifact_sha256"],
+        "model_artifact_reference": {
+            "type": "forecast_model_artifact",
+            "sha256": result["model_artifact_sha256"],
+            "storage": "workflow_task_result",
+        },
+        "result_sha256": expected_result_sha256,
+        "warnings": result["warnings"],
+        "limitations": result["limitations"],
+        "references": references,
+        "chart": _monthly_forecast_chart(result),
+    }
+
+
+def _monthly_forecast_idempotency_key(
+    owner_user_id: int,
+    request: MonthlyForecastRequest,
+    source_fingerprint: str,
+) -> str:
+    identity = {
+        "owner_user_id": owner_user_id,
+        "operation": "monthly_forecast_v1",
+        "request": request.model_dump(mode="json"),
+        "source_fingerprint": source_fingerprint,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _lock_monthly_forecast_request(session: Session, key: str) -> None:
+    if session.get_bind().dialect.name == "postgresql":
+        lock_key = int.from_bytes(bytes.fromhex(key[:16]), "big", signed=True)
+        session.execute(
+            sa.text("SELECT pg_advisory_xact_lock(:lock_key)"),
+            {"lock_key": lock_key},
+        )
+
+
 def _analytics_key(request: MultiDatasetKeyRequest) -> JoinKey:
     return JoinKey(source_alias=request.alias, column=request.column)
 
@@ -2319,11 +2682,23 @@ def _analytics_result_for_report(
                     for metric in request.metrics
                 ],
             )
-        return build_report(
+        report = build_report(
             request.model_dump(mode="json"),
             result,
             [chart.model_dump(mode="json") for chart in chart_requests],
         )
+        report["source_references"] = [
+            {
+                "alias": source.alias,
+                "dataset_id": source.dataset_id,
+                "file_id": source.file_id,
+                "table_index": source.table_index,
+                "source_fingerprint": source.checksum,
+                "normalized_artifact_sha256": source.artifact_sha256,
+            }
+            for source in sources
+        ]
+        return report
     except (MultiDatasetAnalyticsError, DashboardAnalyticsError) as error:
         raise HTTPException(
             status_code=422,
@@ -2343,7 +2718,11 @@ def _serialize_dashboard(dashboard: Dashboard) -> dict[str, Any]:
     }
 
 
-def _dashboard_definition(request: DashboardDefinitionRequest) -> dict[str, Any]:
+def _dashboard_definition(
+    request: DashboardDefinitionRequest,
+    forecast_components: list[dict[str, Any]] | None = None,
+    analytics_components: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     chart_requests = [
         chart.model_dump(mode="json")
         for chart in request.chart_requests
@@ -2363,9 +2742,15 @@ def _dashboard_definition(request: DashboardDefinitionRequest) -> dict[str, Any]
         ]
     )
     return {
-        "analysis_request": request.analysis_request.model_dump(mode="json"),
+        "analysis_request": (
+            request.analysis_request.model_dump(mode="json")
+            if request.analysis_request is not None
+            else None
+        ),
         "chart_requests": chart_requests,
         "layout": layout,
+        "forecast_components": forecast_components or [],
+        "analytics_components": analytics_components or [],
     }
 
 
@@ -2488,10 +2873,905 @@ def analyze_multiple_datasets(request: MultiDatasetAnalysisRequest):
             ) from None
 
 
+@app.post("/api/v1/analytics/ml/suitability")
+def assess_ml_suitability(request: MLTaskSuitabilityRequest):
+    with SessionLocal() as session:
+        owner = _require_workspace_user(session)
+        _require_dataset_access(session, request.dataset_id, owner)
+        dataset_file = (
+            session.query(DatasetFile)
+            .filter(
+                DatasetFile.id == request.file_id,
+                DatasetFile.dataset_id == request.dataset_id,
+            )
+            .one_or_none()
+        )
+        if dataset_file is None:
+            raise HTTPException(status_code=404, detail="Dataset file not found.")
+        if dataset_file.status != "Ready":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "file_not_ready",
+                    "message": "ML task assessment requires successful file ingestion.",
+                    "status": dataset_file.status,
+                },
+            )
+        if (
+            dataset_file.normalization_status != "Ready"
+            or not isinstance(dataset_file.normalization_result, dict)
+            or not isinstance(dataset_file.parsing_result, dict)
+            or not dataset_file.checksum
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalization_unavailable",
+                    "message": "ML task assessment requires a validated normalized artifact.",
+                    "status": dataset_file.normalization_status,
+                },
+            )
+        try:
+            normalized = validate_normalization_result(
+                dataset_file.normalization_result,
+                dataset_file.parsing_result,
+                dataset_file.filename,
+                dataset_file.file_size_bytes,
+                dataset_file.checksum,
+                request.dataset_id,
+                request.file_id,
+            )
+        except NormalizationError:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalization_metadata_invalid",
+                    "message": "Normalized source metadata failed validation.",
+                },
+            ) from None
+        tables = normalized.get("tables")
+        if not isinstance(tables, list) or request.table_index >= len(tables):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "unknown_table",
+                    "message": "The selected normalized table does not exist.",
+                },
+            )
+        table_metadata = tables[request.table_index]
+        schema = table_metadata.get("schema") if isinstance(table_metadata, dict) else None
+        row_count = table_metadata.get("row_count") if isinstance(table_metadata, dict) else None
+        profile_columns: list[dict] | None = None
+        profile_result = dataset_file.profile_result
+        if isinstance(profile_result, dict):
+            profile_tables = profile_result.get("tables")
+            if isinstance(profile_tables, list) and request.table_index < len(profile_tables):
+                profile_table = profile_tables[request.table_index]
+                if (
+                    isinstance(profile_table, dict)
+                    and profile_table.get("row_count") == row_count
+                    and isinstance(profile_table.get("columns"), list)
+                ):
+                    profile_columns = profile_table["columns"]
+        if (
+            not isinstance(schema, list)
+            or len(schema) > MAX_ANALYTICS_COLUMNS
+            or not isinstance(row_count, int)
+            or isinstance(row_count, bool)
+            or row_count < 0
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalized_table_invalid",
+                    "message": "The selected normalized table metadata is invalid.",
+                },
+            )
+        storage = get_storage_client()
+        raw_bucket = getenv("MINIO_RAW_BUCKET", "insightos-raw")
+        processed_bucket = getenv("MINIO_PROCESSED_BUCKET", "insightos-processed")
+        if not _verify_stored_object(storage, raw_bucket, dataset_file):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "source_integrity_failed",
+                    "message": "The source file failed integrity verification.",
+                },
+            )
+        verification = verify_normalization_result_detailed(
+            storage,
+            processed_bucket,
+            normalized,
+        )
+        if verification.get("status") != "verified":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalized_artifact_unavailable",
+                    "message": "The normalized artifact could not be verified.",
+                },
+            )
+        identity = {
+            "dataset_id": request.dataset_id,
+            "file_id": request.file_id,
+            "table_index": request.table_index,
+            "source_sha256": dataset_file.checksum,
+            "normalized_artifact_sha256": table_metadata.get("sha256"),
+            "normalization_configuration_sha256": normalized["configuration"][
+                "configuration_sha256"
+            ],
+        }
+        source_fingerprint = hashlib.sha256(
+            json.dumps(
+                identity,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return {
+            **assess_ml_task_suitability(
+                row_count=row_count,
+                schema=schema,
+                profile_columns=profile_columns,
+            ),
+            "source": {
+                **identity,
+                "source_fingerprint": source_fingerprint,
+                "filename": dataset_file.filename,
+                "artifact_verification": "verified",
+            },
+        }
+
+
+def _supervised_source_metadata(
+    session: Session,
+    owner: User,
+    request: SupervisedEvaluationRequest,
+) -> tuple[DatasetFile, dict, dict, list[dict], list[dict] | None]:
+    _require_dataset_access(session, request.dataset_id, owner)
+    dataset_file = (
+        session.query(DatasetFile)
+        .filter(
+            DatasetFile.id == request.file_id,
+            DatasetFile.dataset_id == request.dataset_id,
+        )
+        .one_or_none()
+    )
+    if dataset_file is None:
+        raise HTTPException(status_code=404, detail="Dataset file not found.")
+    if (
+        dataset_file.status != "Ready"
+        or dataset_file.normalization_status != "Ready"
+        or not dataset_file.checksum
+        or not isinstance(dataset_file.parsing_result, dict)
+        or not isinstance(dataset_file.normalization_result, dict)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "normalized_source_unavailable",
+                "message": "Supervised evaluation requires a ready file and verified normalized artifact.",
+            },
+        )
+    try:
+        normalized = validate_normalization_result(
+            dataset_file.normalization_result,
+            dataset_file.parsing_result,
+            dataset_file.filename,
+            dataset_file.file_size_bytes,
+            dataset_file.checksum,
+            request.dataset_id,
+            request.file_id,
+        )
+    except NormalizationError:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "normalization_metadata_invalid",
+                "message": "Normalized source metadata failed validation.",
+            },
+        ) from None
+    tables = normalized.get("tables")
+    if not isinstance(tables, list) or request.table_index >= len(tables):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "unknown_table", "message": "The selected table does not exist."},
+        )
+    table_metadata = tables[request.table_index]
+    schema = table_metadata.get("schema") if isinstance(table_metadata, dict) else None
+    row_count = table_metadata.get("row_count") if isinstance(table_metadata, dict) else None
+    if (
+        not isinstance(schema, list)
+        or not isinstance(row_count, int)
+        or isinstance(row_count, bool)
+        or not 0 <= row_count <= MAX_SUPERVISED_ROWS
+    ):
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "code": "supervised_source_limit",
+                "message": f"Supervised evaluation supports at most {MAX_SUPERVISED_ROWS} rows.",
+            },
+        )
+    profile_columns = None
+    profile_result = dataset_file.profile_result
+    if isinstance(profile_result, dict):
+        profile_tables = profile_result.get("tables")
+        if isinstance(profile_tables, list) and request.table_index < len(profile_tables):
+            profile_table = profile_tables[request.table_index]
+            if (
+                isinstance(profile_table, dict)
+                and profile_table.get("row_count") == row_count
+                and isinstance(profile_table.get("columns"), list)
+            ):
+                profile_columns = profile_table["columns"]
+    try:
+        validate_supervised_request(
+            task_type=request.task_type,
+            target_column=request.target_column,
+            feature_columns=request.feature_columns,
+            schema=schema,
+            row_count=row_count,
+            profile_columns=profile_columns,
+            time_column=request.time_column,
+            group_column=request.group_column,
+            confirmed_suspicious_features=request.confirmed_suspicious_features,
+        )
+    except SupervisedEvaluationError as error:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": error.code,
+                "message": error.message,
+                "reasons": error.reasons,
+            },
+        ) from None
+    storage = get_storage_client()
+    raw_bucket = getenv("MINIO_RAW_BUCKET", "insightos-raw")
+    processed_bucket = getenv("MINIO_PROCESSED_BUCKET", "insightos-processed")
+    if not _verify_stored_object(storage, raw_bucket, dataset_file):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "source_integrity_failed",
+                "message": "The source file failed integrity verification.",
+            },
+        )
+    verification = verify_normalization_result_detailed(
+        storage,
+        processed_bucket,
+        normalized,
+    )
+    if verification.get("status") != "verified":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "normalized_artifact_unavailable",
+                "message": "The normalized artifact could not be verified.",
+            },
+        )
+    return dataset_file, normalized, table_metadata, schema, profile_columns
+
+
+def _supervised_source_identity(
+    request: SupervisedEvaluationRequest,
+    dataset_file: DatasetFile,
+    normalized: dict,
+    table_metadata: dict,
+) -> dict[str, Any]:
+    identity = {
+        "dataset_id": request.dataset_id,
+        "file_id": request.file_id,
+        "table_index": request.table_index,
+        "source_sha256": dataset_file.checksum,
+        "normalized_artifact_sha256": table_metadata.get("sha256"),
+        "normalization_configuration_sha256": normalized["configuration"][
+            "configuration_sha256"
+        ],
+    }
+    return {
+        **identity,
+        "source_fingerprint": hashlib.sha256(
+            json.dumps(
+                identity,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _load_supervised_table(
+    table_metadata: dict,
+    schema: list[dict],
+    dataset_file: DatasetFile,
+    request: SupervisedEvaluationRequest,
+    normalization_configuration_sha256: str,
+) -> Any:
+    columns = [
+        request.target_column,
+        *request.feature_columns,
+        *([request.time_column] if request.time_column else []),
+        *([request.group_column] if request.group_column else []),
+    ]
+    artifact_size = table_metadata.get("file_size_bytes")
+    object_key = table_metadata.get("object_key")
+    expected_sha256 = table_metadata.get("sha256")
+    if (
+        not isinstance(artifact_size, int)
+        or isinstance(artifact_size, bool)
+        or not 0 < artifact_size <= MAX_MULTI_DATASET_INPUT_BYTES
+        or not isinstance(object_key, str)
+        or not isinstance(expected_sha256, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", expected_sha256)
+    ):
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "code": "supervised_artifact_limit",
+                "message": "The normalized artifact exceeds the supervised evaluation size limit.",
+            },
+        )
+    key_parts = object_key.split("/")
+    if (
+        len(key_parts) != 5
+        or key_parts[:3]
+        != [
+            str(request.dataset_id),
+            str(request.file_id),
+            dataset_file.checksum,
+        ]
+        or key_parts[3] != normalization_configuration_sha256
+        or not key_parts[4].startswith(f"table-{request.table_index:04d}-")
+        or not key_parts[4].endswith(".parquet")
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "normalized_artifact_boundary_invalid",
+                "message": "The normalized artifact is outside its managed storage boundary.",
+            },
+        )
+    storage = get_storage_client()
+    bucket = getenv("MINIO_PROCESSED_BUCKET", "insightos-processed")
+    output = tempfile.NamedTemporaryFile(
+        prefix="insightos-supervised-",
+        suffix=".parquet",
+        delete=False,
+    )
+    path = output.name
+    output.close()
+    response = None
+    parquet = None
+    try:
+        response = storage.get_object(bucket, object_key)
+        digest = hashlib.sha256()
+        actual_size = 0
+        with open(path, "wb") as destination:
+            while chunk := response.read(UPLOAD_CHUNK_SIZE):
+                actual_size += len(chunk)
+                if actual_size > artifact_size:
+                    raise OSError("Normalized artifact exceeded its recorded size.")
+                digest.update(chunk)
+                destination.write(chunk)
+        if actual_size != artifact_size or digest.hexdigest() != expected_sha256:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalized_artifact_integrity_failed",
+                    "message": "The normalized artifact failed byte-level integrity verification.",
+                },
+            )
+        parquet = pq.ParquetFile(path)
+        metadata = parquet.metadata
+        if (
+            metadata.num_rows != table_metadata.get("row_count")
+            or metadata.schema.to_arrow_schema().names
+            != [item.get("name") for item in schema]
+            or [
+                {"name": field.name, "type": str(field.type)}
+                for field in metadata.schema.to_arrow_schema()
+            ]
+            != schema
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "normalized_artifact_schema_mismatch",
+                    "message": "The normalized artifact does not match its validated schema metadata.",
+                },
+            )
+        field_positions = {
+            field_name: index
+            for index, field_name in enumerate(metadata.schema.to_arrow_schema().names)
+        }
+        selected_positions = {field_positions[name] for name in columns}
+        uncompressed_size = sum(
+            metadata.row_group(row_group).column(position).total_uncompressed_size
+            for row_group in range(metadata.num_row_groups)
+            for position in selected_positions
+        )
+        if uncompressed_size > MAX_ANALYTICS_DECODED_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "code": "supervised_decoded_size_limit",
+                    "message": "Selected columns exceed the decoded-memory limit.",
+                },
+            )
+        table = parquet.read(columns=columns)
+        if table.nbytes > MAX_ANALYTICS_DECODED_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "code": "supervised_decoded_size_limit",
+                    "message": "Selected columns exceed the decoded-memory limit.",
+                },
+            )
+        return table
+    except HTTPException:
+        raise
+    except (OSError, pa.ArrowException, MinioException, ValueError) as error:
+        logger.warning("Supervised artifact could not be loaded (%s)", type(error).__name__)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "supervised_artifact_unavailable",
+                "message": "The verified normalized artifact could not be loaded safely.",
+            },
+        ) from None
+    finally:
+        if parquet is not None:
+            parquet.close()
+        if response is not None:
+            response.close()
+            release_connection = getattr(response, "release_conn", None)
+            if release_connection is not None:
+                release_connection()
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def _supervised_idempotency_key(
+    owner_user_id: int,
+    request: SupervisedEvaluationRequest,
+    source_fingerprint: str,
+) -> str:
+    payload = {
+        "owner_user_id": owner_user_id,
+        "operation": "supervised_evaluation_v1",
+        "request": request.model_dump(mode="json"),
+        "source_fingerprint": source_fingerprint,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _supervised_result_digest(result: dict[str, Any]) -> str:
+    payload = {key: value for key, value in result.items() if key != "result_sha256"}
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _supervised_evaluation_for_owner(
+    session: Session,
+    owner: User,
+    workflow_id: str,
+) -> dict[str, Any]:
+    workflow = (
+        session.query(WorkflowExecution)
+        .filter(
+            WorkflowExecution.id == workflow_id,
+            WorkflowExecution.owner_user_id == owner.id,
+        )
+        .one_or_none()
+    )
+    if workflow is None:
+        raise HTTPException(status_code=404, detail="Supervised evaluation not found.")
+    task = (
+        session.query(WorkflowTask)
+        .filter(
+            WorkflowTask.workflow_id == workflow.id,
+            WorkflowTask.task_type == "supervised_evaluation_v1",
+        )
+        .one_or_none()
+    )
+    if task is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "supervised_task_unavailable",
+                "message": "The persisted supervised evaluation task is unavailable.",
+            },
+        )
+    result = task.result_summary.get("result") if isinstance(task.result_summary, dict) else None
+    status_value = task.status
+    if task.status == "completed":
+        parameters = (
+            workflow.source_scope.get("parameters")
+            if isinstance(workflow.source_scope, dict)
+            and isinstance(workflow.source_scope.get("parameters"), dict)
+            else {}
+        )
+        if (
+            not isinstance(result, dict)
+            or len(
+                json.dumps(
+                    result,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            > MAX_SUPERVISED_RESULT_BYTES
+            or result.get("result_sha256") != _supervised_result_digest(result)
+            or task.source_fingerprint != result.get("source_fingerprint")
+            or task.file_id != result.get("file_id")
+            or workflow.dataset_id != result.get("dataset_id")
+            or not isinstance(workflow.source_scope, dict)
+            or workflow.source_scope.get("source_fingerprint")
+            != result.get("source_fingerprint")
+            or result.get("dataset_id") != workflow.dataset_id
+            or result.get("file_id") != task.file_id
+            or result.get("table_index") != workflow.source_scope.get("table_index")
+            or result.get("task_type") != parameters.get("task_type")
+            or result.get("target_column") != parameters.get("target_column")
+            or result.get("feature_columns") != parameters.get("feature_columns")
+            or result.get("time_column") != parameters.get("time_column")
+            or result.get("group_column") != parameters.get("group_column")
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "supervised_result_integrity_failed",
+                    "message": "The stored supervised result failed integrity verification.",
+                },
+            )
+        request = SupervisedEvaluationRequest.model_validate(
+            workflow.source_scope.get("parameters", {})
+        )
+        try:
+            dataset_file, normalized, table_metadata, _, _ = (
+                _supervised_source_metadata(session, owner, request)
+            )
+        except HTTPException:
+            status_value = "unavailable"
+            result = None
+        else:
+            current_identity = _supervised_source_identity(
+                request,
+                dataset_file,
+                normalized,
+                table_metadata,
+            )
+            if (
+                current_identity["source_fingerprint"] != result["source_fingerprint"]
+                or current_identity["normalized_artifact_sha256"]
+                != result["normalized_artifact_sha256"]
+            ):
+                status_value = "stale"
+                result = None
+    return {
+        "workflow_id": workflow.id,
+        "task_id": task.id,
+        "status": status_value,
+        "error_code": task.error_code,
+        "message": (
+            task.result_summary.get("summary")
+            if task.status in {"failed", "blocked", "partial"}
+            and isinstance(task.result_summary, dict)
+            else None
+        ),
+        "result": result,
+        "created_at": workflow.created_at.isoformat() if workflow.created_at else None,
+        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+    }
+
+
+@app.post("/api/v1/analytics/ml/supervised")
+def create_supervised_evaluation(request: SupervisedEvaluationRequest):
+    workflow_id: str | None = None
+    task_id: str | None = None
+    existing_workflow = False
+    workflow_owner_user_id: int | None = None
+    try:
+        with SessionLocal() as session:
+            owner = _require_workspace_user(session)
+            workflow_owner_user_id = owner.id
+            dataset_file, normalized, table_metadata, _, _ = (
+                _supervised_source_metadata(session, owner, request)
+            )
+            identity = _supervised_source_identity(
+                request, dataset_file, normalized, table_metadata
+            )
+            source_fingerprint = identity["source_fingerprint"]
+            idempotency_key = _supervised_idempotency_key(
+                owner.id, request, source_fingerprint
+            )
+            _lock_monthly_forecast_request(session, idempotency_key)
+            workflow = (
+                session.query(WorkflowExecution)
+                .filter(
+                    WorkflowExecution.owner_user_id == owner.id,
+                    WorkflowExecution.idempotency_key == idempotency_key,
+                )
+                .one_or_none()
+            )
+            if workflow is not None:
+                existing_workflow = True
+                workflow_id = workflow.id
+                task = (
+                    session.query(WorkflowTask)
+                    .filter(
+                        WorkflowTask.workflow_id == workflow.id,
+                        WorkflowTask.task_type == "supervised_evaluation_v1",
+                    )
+                    .one_or_none()
+                )
+                if task is None:
+                    raise WorkflowPlanError(
+                        "The matching supervised workflow has no persisted task."
+                    )
+                task_id = task.id
+            else:
+                workflow_id = uuid4().hex
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                workflow = WorkflowExecution(
+                    id=workflow_id,
+                    owner_user_id=owner.id,
+                    dataset_id=request.dataset_id,
+                    idempotency_key=idempotency_key,
+                    objective=f"Evaluate {request.task_type} target {request.target_column}",
+                    status="queued",
+                    current_step=0,
+                    source_scope={
+                        **identity,
+                        "parameters": request.model_dump(mode="json"),
+                    },
+                    started_at=now,
+                )
+                session.add(workflow)
+                session.flush()
+                task = persist_workflow_task(
+                    session,
+                    workflow,
+                    {
+                        "task_id": "supervised_evaluation",
+                        "agent": "analytics_modelling",
+                        "operation": "supervised_evaluation_v1",
+                        "depends_on": [],
+                        "status": "pending",
+                        "dataset_id": request.dataset_id,
+                        "file_id": request.file_id,
+                        "source_fingerprint": source_fingerprint,
+                        "input_references": [
+                            {
+                                "type": "normalized_parquet",
+                                "table_index": request.table_index,
+                                "artifact_sha256": identity[
+                                    "normalized_artifact_sha256"
+                                ],
+                                "source_sha256": identity["source_sha256"],
+                            },
+                            {
+                                "type": "supervised_evaluation_parameters",
+                                "target_column": request.target_column,
+                                "feature_columns": request.feature_columns,
+                                "task_type": request.task_type,
+                                "time_column": request.time_column,
+                                "group_column": request.group_column,
+                            },
+                        ],
+                        "output_references": [],
+                        "idempotent": True,
+                        "max_retries": 0,
+                        "timeout_seconds": 300,
+                    },
+                )
+                task_id = task.id
+                session.commit()
+    except HTTPException:
+        raise
+    except (SQLAlchemyError, MinioException, OSError, WorkflowPlanError) as error:
+        logger.error(
+            "Supervised evaluation could not be prepared (%s)",
+            type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "supervised_workflow_unavailable",
+                "message": "The supervised evaluation could not be persisted.",
+            },
+        ) from None
+    if workflow_id is None or task_id is None:
+        raise HTTPException(
+            status_code=503,
+            detail="The supervised evaluation task could not be persisted.",
+        )
+    if existing_workflow:
+        with SessionLocal() as session:
+            owner = _require_workspace_user(session)
+            return _supervised_evaluation_for_owner(session, owner, workflow_id)
+
+    def execute_supervised(_task: WorkflowTask) -> dict[str, Any]:
+        try:
+            with SessionLocal() as source_session:
+                owner = _require_workspace_user(source_session)
+                if owner.id != workflow_owner_user_id:
+                    raise SupervisedEvaluationError(
+                        "workspace_owner_changed",
+                        "The workspace owner changed before evaluation started.",
+                    )
+                dataset_file, normalized, table_metadata, source_schema, profile = (
+                    _supervised_source_metadata(source_session, owner, request)
+                )
+                current_identity = _supervised_source_identity(
+                    request, dataset_file, normalized, table_metadata
+                )
+                if current_identity["source_fingerprint"] != source_fingerprint:
+                    raise SupervisedEvaluationError(
+                        "source_changed",
+                        "The normalized source changed before evaluation started.",
+                    )
+                validated = validate_supervised_request(
+                    task_type=request.task_type,
+                    target_column=request.target_column,
+                    feature_columns=request.feature_columns,
+                    schema=source_schema,
+                    row_count=table_metadata["row_count"],
+                    profile_columns=profile,
+                    time_column=request.time_column,
+                    group_column=request.group_column,
+                    confirmed_suspicious_features=request.confirmed_suspicious_features,
+                )
+                table = _load_supervised_table(
+                    table_metadata,
+                    source_schema,
+                    dataset_file,
+                    request,
+                    normalized["configuration"]["configuration_sha256"],
+                )
+            evaluation = evaluate_supervised(
+                table=table,
+                task_type=request.task_type,
+                target_column=request.target_column,
+                feature_columns=request.feature_columns,
+                dataset_id=request.dataset_id,
+                file_id=request.file_id,
+                table_index=request.table_index,
+                source_fingerprint=source_fingerprint,
+                artifact_sha256=table_metadata["sha256"],
+                feature_kinds=validated["feature_kinds"],
+                time_column=request.time_column,
+                group_column=request.group_column,
+                confirmed_suspicious_features=request.confirmed_suspicious_features,
+            )
+        except SupervisedEvaluationError as error:
+            raise WorkflowTaskExecutionError(error.code, error.message) from error
+        except HTTPException as error:
+            detail = error.detail if isinstance(error.detail, dict) else {}
+            raise WorkflowTaskExecutionError(
+                detail.get("code", "supervised_source_unavailable"),
+                detail.get("message", "The supervised source could not be evaluated."),
+            ) from error
+        except (ValueError, FloatingPointError, MemoryError, OSError) as error:
+            raise WorkflowTaskExecutionError(
+                "supervised_io_failed" if isinstance(error, OSError) else "supervised_execution_failed",
+                f"Supervised evaluation failed safely ({type(error).__name__}).",
+            ) from error
+        evaluation["result_sha256"] = _supervised_result_digest(evaluation)
+        return {
+            "status": "succeeded",
+            "summary": "Supervised evaluation completed with held-out test metrics.",
+            "result": evaluation,
+            "references": [
+                {
+                    "type": "supervised_evaluation_result",
+                    "sha256": evaluation["result_sha256"],
+                    "storage": "workflow_task_result",
+                },
+            ],
+        }
+
+    try:
+        with SessionLocal() as session:
+            run_persisted_workflow(
+                session,
+                workflow_id,
+                {"supervised_evaluation_v1": execute_supervised},
+                max_steps=1,
+            )
+        with SessionLocal() as session:
+            owner = _require_workspace_user(session)
+            return _supervised_evaluation_for_owner(session, owner, workflow_id)
+    except HTTPException:
+        raise
+    except (SQLAlchemyError, LookupError) as error:
+        logger.error(
+            "Supervised evaluation task could not be confirmed (%s)",
+            type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "supervised_workflow_unavailable",
+                "message": "The supervised evaluation status could not be confirmed.",
+                "workflow_id": workflow_id,
+                "task_id": task_id,
+            },
+        ) from None
+
+
+@app.get("/api/v1/analytics/ml/supervised/{workflow_id}")
+def get_supervised_evaluation(workflow_id: str):
+    if not re.fullmatch(r"[a-fA-F0-9]{32}", workflow_id):
+        raise HTTPException(status_code=404, detail="Supervised evaluation not found.")
+    with SessionLocal() as session:
+        owner = _require_workspace_user(session)
+        return _supervised_evaluation_for_owner(session, owner, workflow_id)
+
+
+@app.get("/api/v1/analytics/ml/supervised")
+def get_latest_supervised_evaluation(
+    dataset_id: int = Query(gt=0),
+    file_id: int = Query(gt=0),
+):
+    with SessionLocal() as session:
+        owner = _require_workspace_user(session)
+        _require_dataset_access(session, dataset_id, owner)
+        workflow = (
+            session.query(WorkflowExecution)
+            .join(WorkflowTask, WorkflowTask.workflow_id == WorkflowExecution.id)
+            .filter(
+                WorkflowExecution.owner_user_id == owner.id,
+                WorkflowExecution.dataset_id == dataset_id,
+                WorkflowTask.file_id == file_id,
+                WorkflowTask.task_type == "supervised_evaluation_v1",
+            )
+            .order_by(WorkflowExecution.created_at.desc())
+            .first()
+        )
+        if workflow is None:
+            raise HTTPException(status_code=404, detail="No supervised evaluation is saved for this file.")
+        return _supervised_evaluation_for_owner(session, owner, workflow.id)
+
+
 @app.post("/api/v1/analytics/forecasts/monthly")
 def create_monthly_forecast(request: MonthlyForecastRequest):
-    workflow_id = uuid4().hex
+    if request.aggregation != "sum":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "unsupported_aggregation",
+                "message": "Monthly forecasting currently supports sum aggregation only.",
+            },
+        )
+    workflow_id: str | None = None
     task_id: str | None = None
+    dates: list[Any] = []
+    targets: list[Any] = []
+    source_fingerprint: str | None = None
+    source_artifact_sha256: str | None = None
+    existing_workflow = False
     try:
         with SessionLocal() as session, ExitStack() as cleanup:
             owner = _require_workspace_user(session)
@@ -2521,73 +3801,115 @@ def create_monthly_forecast(request: MonthlyForecastRequest):
                 )
 
             source_fingerprint = _monthly_forecast_source_fingerprint(source)
-            dates = source.table[request.date_column].to_pylist()
-            targets = source.table[request.target_column].to_pylist()
-            now = datetime.now(timezone.utc).replace(tzinfo=None)
-            workflow = WorkflowExecution(
-                id=workflow_id,
-                owner_user_id=owner.id,
-                dataset_id=request.dataset_id,
-                idempotency_key=hashlib.sha256(
-                    f"monthly-forecast:{workflow_id}".encode("utf-8")
-                ).hexdigest(),
-                objective=(
-                    f"Monthly forecast of {request.target_column} "
-                    f"by {request.date_column}"
-                ),
-                status="queued",
-                current_step=0,
-                source_scope={
+            source_artifact_sha256 = source.artifact_sha256
+            idempotency_key = _monthly_forecast_idempotency_key(
+                owner.id,
+                request,
+                source_fingerprint,
+            )
+            _lock_monthly_forecast_request(session, idempotency_key)
+            workflow = (
+                session.query(WorkflowExecution)
+                .filter(
+                    WorkflowExecution.owner_user_id == owner.id,
+                    WorkflowExecution.idempotency_key == idempotency_key,
+                )
+                .one_or_none()
+            )
+            if workflow is not None:
+                existing_workflow = True
+                workflow_id = workflow.id
+                task = (
+                    session.query(WorkflowTask)
+                    .filter(
+                        WorkflowTask.workflow_id == workflow.id,
+                        WorkflowTask.task_type == "monthly_forecast_v1",
+                    )
+                    .one_or_none()
+                )
+                if task is None:
+                    raise WorkflowPlanError(
+                        "The matching forecast workflow has no persisted task."
+                    )
+                task_id = task.id
+            else:
+                dates = source.table[request.date_column].to_pylist()
+                targets = source.table[request.target_column].to_pylist()
+                workflow_id = uuid4().hex
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                workflow = WorkflowExecution(
+                    id=workflow_id,
+                    owner_user_id=owner.id,
+                    dataset_id=request.dataset_id,
+                    idempotency_key=idempotency_key,
+                    objective=(
+                        f"Monthly forecast of {request.target_column} "
+                        f"by {request.date_column}"
+                    ),
+                    status="queued",
+                    current_step=0,
+                    source_scope={
+                        "dataset_id": request.dataset_id,
+                        "file_id": request.file_id,
+                        "table_index": request.table_index,
+                        "source_fingerprint": source_fingerprint,
+                        "normalized_artifact_sha256": source_artifact_sha256,
+                        "parameters": {
+                            "date_column": request.date_column,
+                            "target_column": request.target_column,
+                            "aggregation": request.aggregation,
+                            "horizon": request.horizon,
+                        },
+                    },
+                    started_at=now,
+                )
+                session.add(workflow)
+                session.flush()
+                plan_item = {
+                    "task_id": "monthly_forecast",
+                    "agent": "analytics_modelling",
+                    "operation": "monthly_forecast_v1",
+                    "depends_on": [],
+                    "status": "pending",
                     "dataset_id": request.dataset_id,
                     "file_id": request.file_id,
-                    "table_index": request.table_index,
                     "source_fingerprint": source_fingerprint,
-                    "normalized_artifact_sha256": source.artifact_sha256,
-                },
-                started_at=now,
-            )
-            session.add(workflow)
-            session.flush()
-            plan_item = {
-                "task_id": "monthly_forecast",
-                "agent": "analytics_modelling",
-                "operation": "monthly_forecast_v1",
-                "depends_on": [],
-                "status": "pending",
-                "dataset_id": request.dataset_id,
-                "file_id": request.file_id,
-                "source_fingerprint": source_fingerprint,
-                "input_references": [
-                    {
-                        "type": "normalized_parquet",
-                        "table_index": request.table_index,
-                        "artifact_sha256": source.artifact_sha256,
-                        "normalization_configuration_sha256": (
-                            source.normalization_configuration_sha256
-                        ),
-                        "source_sha256": source.checksum,
-                    },
-                    {
-                        "type": "forecast_parameters",
-                        "date_column": request.date_column,
-                        "target_column": request.target_column,
-                        "horizon": request.horizon,
-                    },
-                ],
-                "output_references": [],
-                "idempotent": True,
-                "max_retries": 0,
-                "timeout_seconds": 300,
-            }
-            task = persist_workflow_task(session, workflow, plan_item)
-            task_id = task.id
-            session.commit()
+                    "input_references": [
+                        {
+                            "type": "normalized_parquet",
+                            "table_index": request.table_index,
+                            "artifact_sha256": source_artifact_sha256,
+                            "normalization_configuration_sha256": (
+                                source.normalization_configuration_sha256
+                            ),
+                            "source_sha256": source.checksum,
+                        },
+                        {
+                            "type": "forecast_parameters",
+                            "date_column": request.date_column,
+                            "target_column": request.target_column,
+                            "aggregation": request.aggregation,
+                            "horizon": request.horizon,
+                        },
+                    ],
+                    "output_references": [],
+                    "idempotent": True,
+                    "max_retries": 0,
+                    "timeout_seconds": 300,
+                }
+                task = persist_workflow_task(session, workflow, plan_item)
+                task_id = task.id
+                session.commit()
     except HTTPException:
         raise
     except ForecastError as error:
         raise HTTPException(
             status_code=422,
-            detail={"code": error.code, "message": error.message},
+            detail={
+                "code": error.code,
+                "message": error.message,
+                "findings": error.findings,
+            },
         ) from None
     except (SQLAlchemyError, MinioException, OSError, WorkflowPlanError) as error:
         logger.error(
@@ -2599,11 +3921,22 @@ def create_monthly_forecast(request: MonthlyForecastRequest):
             detail="The selected normalized dataset could not be prepared for forecasting.",
         ) from None
 
-    if task_id is None:
+    if workflow_id is None or task_id is None:
         raise HTTPException(
             status_code=503,
             detail="The monthly forecast task could not be persisted.",
         )
+    if existing_workflow:
+        existing = get_monthly_forecast(workflow_id)
+        existing_task = existing["task"]
+        return {
+            "workflow_id": workflow_id,
+            "task_id": existing_task["id"],
+            "status": existing_task["status"],
+            "result": existing_task["result"],
+            "created_at": existing["created_at"],
+            "completed_at": existing["completed_at"],
+        }
 
     def execute_forecast(_task: WorkflowTask) -> dict[str, Any]:
         try:
@@ -2620,12 +3953,25 @@ def create_monthly_forecast(request: MonthlyForecastRequest):
             )
         except ForecastError as error:
             raise WorkflowTaskExecutionError(error.code, error.message) from error
-        return {
+        persisted_result = {
             "status": "succeeded",
+            "result_schema_version": result["forecast"]["result_schema_version"],
             "summary": "Monthly forecast trained and chronologically evaluated.",
+            "dataset_id": request.dataset_id,
+            "file_id": request.file_id,
+            "table_index": request.table_index,
+            "date_column": request.date_column,
+            "target_column": request.target_column,
+            "aggregation": request.aggregation,
+            "horizon": request.horizon,
+            "source_fingerprint": source_fingerprint,
+            "normalized_artifact_sha256": source_artifact_sha256,
             "model_artifact": result["artifact"],
             "model_artifact_sha256": result["artifact_sha256"],
+            "historical": result["forecast"]["historical"],
             "forecast": result["forecast"]["forecast"],
+            "warnings": result["forecast"]["warnings"],
+            "limitations": result["forecast"]["limitations"],
             "references": [
                 {
                     "type": "normalized_source",
@@ -2642,6 +3988,10 @@ def create_monthly_forecast(request: MonthlyForecastRequest):
                 },
             ],
         }
+        persisted_result["result_sha256"] = _monthly_forecast_result_sha256(
+            persisted_result
+        )
+        return persisted_result
 
     try:
         with SessionLocal() as session:
@@ -2677,16 +4027,26 @@ def create_monthly_forecast(request: MonthlyForecastRequest):
                     detail={
                         "code": code or "forecast_task_failed",
                         "message": summary,
+                        "findings": [
+                            {
+                                "severity": "blocked",
+                                "code": code or "forecast_task_failed",
+                                "message": summary,
+                            }
+                        ],
                         "workflow_id": workflow_id,
                         "task_id": task_id,
                     },
                 )
-            return {
-                "workflow_id": workflow_id,
-                "task_id": task.id,
-                "status": task.status,
-                "result": task.result_summary,
-            }
+        persisted = get_monthly_forecast(workflow_id)
+        return {
+            "workflow_id": workflow_id,
+            "task_id": persisted["task"]["id"],
+            "status": persisted["task"]["status"],
+            "result": persisted["task"]["result"],
+            "created_at": persisted["created_at"],
+            "completed_at": persisted["completed_at"],
+        }
     except HTTPException:
         raise
     except (SQLAlchemyError, LookupError) as error:
@@ -2705,105 +4065,129 @@ def create_monthly_forecast(request: MonthlyForecastRequest):
         ) from None
 
 
-@app.get("/api/v1/analytics/forecasts/monthly/{workflow_id}")
-def get_monthly_forecast(workflow_id: str):
+def _monthly_forecast_for_owner(
+    session: Session,
+    owner: User,
+    workflow_id: str,
+) -> dict[str, Any]:
     if not re.fullmatch(r"[a-fA-F0-9]{32}", workflow_id):
         raise HTTPException(status_code=404, detail="Forecast workflow not found.")
-    with SessionLocal() as session:
-        owner = _require_workspace_user(session)
-        workflow = (
-            session.query(WorkflowExecution)
-            .filter(
-                WorkflowExecution.id == workflow_id,
-                WorkflowExecution.owner_user_id == owner.id,
-            )
-            .one_or_none()
+    workflow = (
+        session.query(WorkflowExecution)
+        .filter(
+            WorkflowExecution.id == workflow_id,
+            WorkflowExecution.owner_user_id == owner.id,
         )
-        if workflow is None:
-            raise HTTPException(status_code=404, detail="Forecast workflow not found.")
-        task = (
-            session.query(WorkflowTask)
-            .filter(
-                WorkflowTask.workflow_id == workflow.id,
-                WorkflowTask.task_type == "monthly_forecast_v1",
-            )
-            .one_or_none()
+        .one_or_none()
+    )
+    if workflow is None:
+        raise HTTPException(status_code=404, detail="Forecast workflow not found.")
+    task = (
+        session.query(WorkflowTask)
+        .filter(
+            WorkflowTask.workflow_id == workflow.id,
+            WorkflowTask.task_type == "monthly_forecast_v1",
         )
-        if task is None:
+        .one_or_none()
+    )
+    if task is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "forecast_task_unavailable",
+                "message": "Forecast task is not available for this workflow.",
+            },
+        )
+    result = task.result_summary
+    if task.status == "completed":
+        result = _monthly_forecast_public_result(result)
+        source_scope = workflow.source_scope
+        parameters = (
+            source_scope.get("parameters")
+            if isinstance(source_scope, dict)
+            and isinstance(source_scope.get("parameters"), dict)
+            else {}
+        )
+        if (
+            workflow.status != "completed"
+            or not isinstance(source_scope, dict)
+            or result["dataset_id"] != workflow.dataset_id
+            or result["file_id"] != task.file_id
+            or result["source_fingerprint"] != task.source_fingerprint
+            or result["source_fingerprint"]
+            != source_scope.get("source_fingerprint")
+            or result["normalized_artifact_sha256"]
+            != source_scope.get("normalized_artifact_sha256")
+            or result["table_index"] != source_scope.get("table_index")
+            or result["date_column"] != parameters.get("date_column")
+            or result["target_column"] != parameters.get("target_column")
+            or result["aggregation"] != parameters.get("aggregation")
+            or result["horizon"] != parameters.get("horizon")
+        ):
             raise HTTPException(
                 status_code=409,
-                detail="Forecast task is not available for this workflow.",
+                detail={
+                    "code": "forecast_artifact_integrity_failed",
+                    "message": "The stored forecast does not match its persisted workflow source.",
+                },
             )
-        result = task.result_summary
-        if task.status == "completed":
-            artifact = (
-                result.get("model_artifact")
-                if isinstance(result, dict)
-                else None
-            )
-            expected_sha256 = (
-                result.get("model_artifact_sha256")
-                if isinstance(result, dict)
-                else None
-            )
-            artifact_source = (
-                artifact.get("source")
-                if isinstance(artifact, dict)
-                else None
-            )
-            references = result.get("references") if isinstance(result, dict) else None
-            source_reference = (
-                references[0]
-                if isinstance(references, list)
-                and references
-                and isinstance(references[0], dict)
-                else None
-            )
-            try:
-                encoded_artifact = json.dumps(
-                    artifact,
-                    ensure_ascii=False,
-                    allow_nan=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            except (TypeError, ValueError, UnicodeError):
-                encoded_artifact = b""
-            if (
-                not isinstance(artifact, dict)
-                or not isinstance(expected_sha256, str)
-                or hashlib.sha256(encoded_artifact).hexdigest() != expected_sha256
-                or not isinstance(workflow.source_scope, dict)
-                or not isinstance(artifact_source, dict)
-                or artifact_source.get("dataset_id") != workflow.dataset_id
-                or artifact_source.get("file_id") != task.file_id
-                or artifact_source.get("fingerprint") != task.source_fingerprint
-                or task.source_fingerprint
-                != workflow.source_scope.get("source_fingerprint")
-                or not isinstance(source_reference, dict)
-                or source_reference.get("artifact_sha256")
-                != workflow.source_scope.get("normalized_artifact_sha256")
-                or source_reference.get("source_fingerprint")
-                != task.source_fingerprint
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "forecast_artifact_integrity_failed",
-                        "message": "The stored model artifact failed integrity verification.",
-                    },
+        try:
+            with ExitStack() as cleanup:
+                current_source = _load_multi_dataset_sources(
+                    session,
+                    [
+                        MultiDatasetSourceRequest(
+                            alias="forecast",
+                            dataset_id=result["dataset_id"],
+                            file_id=result["file_id"],
+                            table_index=result["table_index"],
+                        )
+                    ],
+                    owner,
+                    cleanup,
+                )[0]
+                current_fingerprint = _monthly_forecast_source_fingerprint(
+                    current_source
                 )
-        return {
-            "workflow_id": workflow.id,
-            "status": workflow.status,
-            "source_scope": workflow.source_scope,
-            "task": {
-                "id": task.id,
-                "status": task.status,
-                "error_code": task.error_code,
-                "result": result,
-            },
-        }
+        except HTTPException:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "forecast_source_unavailable",
+                    "message": "The normalized source is no longer available for this forecast.",
+                },
+            ) from None
+        if current_fingerprint != result["source_fingerprint"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "forecast_source_stale",
+                    "message": "The normalized source changed after this forecast was generated.",
+                },
+            )
+    return {
+        "workflow_id": workflow.id,
+        "status": workflow.status,
+        "created_at": workflow.created_at.isoformat() if workflow.created_at else None,
+        "completed_at": workflow.completed_at.isoformat() if workflow.completed_at else None,
+        "source_scope": workflow.source_scope,
+        "task": {
+            "id": task.id,
+            "status": task.status,
+            "error_code": task.error_code,
+            "created_at": task.created_at.isoformat() if task.created_at else None,
+            "started_at": task.started_at.isoformat() if task.started_at else None,
+            "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+            "result": result,
+        },
+    }
+
+
+@app.get("/api/v1/analytics/forecasts/monthly/{workflow_id}")
+def get_monthly_forecast(workflow_id: str):
+    with SessionLocal() as session:
+        owner = _require_workspace_user(session)
+        return _monthly_forecast_for_owner(session, owner, workflow_id)
 
 
 @app.post("/api/v1/analytics/reports")
@@ -2946,12 +4330,13 @@ def create_dashboard(request: DashboardDefinitionRequest):
     with SessionLocal() as session:
         try:
             owner = _require_workspace_user(session)
-            _analytics_result_for_report(
-                session,
-                owner,
-                request.analysis_request,
-                request.chart_requests,
-            )
+            if request.analysis_request is not None:
+                _analytics_result_for_report(
+                    session,
+                    owner,
+                    request.analysis_request,
+                    request.chart_requests,
+                )
             dashboard = Dashboard(
                 id=uuid4().hex,
                 owner_user_id=owner.id,
@@ -2978,6 +4363,225 @@ def create_dashboard(request: DashboardDefinitionRequest):
             ) from None
 
 
+@app.post("/api/v1/dashboards/{dashboard_id}/forecasts")
+def save_forecast_to_dashboard(
+    dashboard_id: str,
+    request: DashboardForecastRequest,
+):
+    with SessionLocal() as session:
+        owner = _require_workspace_user(session)
+        dashboard = (
+            session.query(Dashboard)
+            .filter(
+                Dashboard.id == dashboard_id,
+                Dashboard.owner_user_id == owner.id,
+            )
+            .with_for_update()
+            .one_or_none()
+        )
+        if dashboard is None:
+            raise HTTPException(status_code=404, detail="Dashboard not found.")
+
+        forecast = _monthly_forecast_for_owner(
+            session,
+            owner,
+            request.workflow_id.lower(),
+        )
+        if (
+            forecast["status"] != "completed"
+            or forecast["task"]["status"] != "completed"
+            or not isinstance(forecast["task"]["result"], dict)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "forecast_not_completed",
+                    "message": "Only a completed, verified forecast can be saved to a dashboard.",
+                },
+            )
+
+        result = forecast["task"]["result"]
+        definition = (
+            dict(dashboard.definition)
+            if isinstance(dashboard.definition, dict)
+            else {}
+        )
+        components = definition.get("forecast_components", [])
+        if not isinstance(components, list):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "dashboard_definition_invalid",
+                    "message": "The dashboard forecast components could not be read.",
+                },
+            )
+        existing = next(
+            (
+                item
+                for item in components
+                if isinstance(item, dict)
+                and item.get("workflow_id") == forecast["workflow_id"]
+            ),
+            None,
+        )
+        chart = result["chart"]
+        component = {
+            "workflow_id": forecast["workflow_id"],
+            "dataset_id": result["dataset_id"],
+            "file_id": result["file_id"],
+            "table_index": result["table_index"],
+            "source_fingerprint": result["source_fingerprint"],
+            "normalized_artifact_sha256": result["normalized_artifact_sha256"],
+            "date_column": result["date_column"],
+            "target_column": result["target_column"],
+            "aggregation": result["aggregation"],
+            "horizon": result["horizon"],
+            "result_sha256": result["result_sha256"],
+            "model_artifact_sha256": result["model_artifact_sha256"],
+            "chart_specification": {
+                "title": chart["title"],
+                "chart_type": chart["chart_type"],
+                "x_field": chart["x_field"],
+                "y_field": chart["y_field"],
+                "series_field": chart["series_field"],
+            },
+            "references": result["references"],
+            "forecast_completed_at": forecast["completed_at"],
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if existing is not None:
+            if any(
+                existing.get(key) != value
+                for key, value in component.items()
+                if key != "saved_at"
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "dashboard_forecast_reference_conflict",
+                        "message": "The dashboard already contains a conflicting reference to this forecast.",
+                    },
+                )
+            return {
+                "dashboard": _serialize_dashboard(dashboard),
+                "forecast_component": existing,
+                "duplicate": True,
+            }
+        if len(components) >= MAX_DASHBOARD_FORECASTS:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "dashboard_forecast_limit",
+                    "message": "The dashboard already contains the maximum number of saved forecast components.",
+                },
+            )
+        definition["forecast_components"] = [*components, component]
+        dashboard.definition = definition
+        session.commit()
+        session.refresh(dashboard)
+        return {
+            "dashboard": _serialize_dashboard(dashboard),
+            "forecast_component": component,
+            "duplicate": False,
+        }
+
+
+@app.post("/api/v1/dashboards/{dashboard_id}/analytics-results")
+def save_analytics_result_to_dashboard(
+    dashboard_id: str,
+    request: DashboardAnalyticsResultRequest,
+):
+    from app.agent.api import get_verified_analytics_workflow_result
+
+    with SessionLocal() as session:
+        owner = _require_workspace_user(session)
+        dashboard = (
+            session.query(Dashboard)
+            .filter(
+                Dashboard.id == dashboard_id,
+                Dashboard.owner_user_id == owner.id,
+            )
+            .with_for_update()
+            .one_or_none()
+        )
+        if dashboard is None:
+            raise HTTPException(status_code=404, detail="Dashboard not found.")
+
+        result = get_verified_analytics_workflow_result(
+            session,
+            owner,
+            request.workflow_id.lower(),
+            request.task_id,
+        )
+        definition = (
+            dict(dashboard.definition)
+            if isinstance(dashboard.definition, dict)
+            else {}
+        )
+        components = definition.get("analytics_components", [])
+        if not isinstance(components, list):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "dashboard_definition_invalid",
+                    "message": "The dashboard analytics references could not be read.",
+                },
+            )
+        component = {
+            "workflow_id": result["workflow_id"],
+            "task_id": result["task_id"],
+            "operation": result["operation"],
+            "result_sha256": result["result_sha256"],
+            "source_references": result["source_references"],
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        }
+        existing = next(
+            (
+                item
+                for item in components
+                if isinstance(item, dict)
+                and item.get("workflow_id") == component["workflow_id"]
+                and item.get("task_id") == component["task_id"]
+            ),
+            None,
+        )
+        if existing is not None:
+            if any(
+                existing.get(key) != value
+                for key, value in component.items()
+                if key != "saved_at"
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "dashboard_analytics_reference_conflict",
+                        "message": "The dashboard already contains a conflicting reference to this workflow result.",
+                    },
+                )
+            return {
+                "dashboard": _serialize_dashboard(dashboard),
+                "analytics_component": existing,
+                "duplicate": True,
+            }
+        if len(components) >= MAX_DASHBOARD_ANALYTICS_RESULTS:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "dashboard_analytics_result_limit",
+                    "message": "The dashboard already contains the maximum number of saved analytics results.",
+                },
+            )
+        definition["analytics_components"] = [*components, component]
+        dashboard.definition = definition
+        session.commit()
+        session.refresh(dashboard)
+        return {
+            "dashboard": _serialize_dashboard(dashboard),
+            "analytics_component": component,
+            "duplicate": False,
+        }
+
+
 @app.get("/api/v1/dashboards/{dashboard_id}")
 def get_dashboard(dashboard_id: str):
     with SessionLocal() as session:
@@ -2992,18 +4596,49 @@ def update_dashboard(dashboard_id: str, request: DashboardDefinitionRequest):
         try:
             owner = _require_workspace_user(session)
             dashboard = _require_dashboard_access(session, dashboard_id, owner)
-            _analytics_result_for_report(
-                session,
-                owner,
-                request.analysis_request,
-                request.chart_requests,
-            )
+            if request.analysis_request is not None:
+                _analytics_result_for_report(
+                    session,
+                    owner,
+                    request.analysis_request,
+                    request.chart_requests,
+                )
             title = request.title.strip()
             if not title:
                 raise HTTPException(status_code=422, detail="Dashboard title is required.")
+            forecast_components = (
+                dashboard.definition.get("forecast_components", [])
+                if isinstance(dashboard.definition, dict)
+                else []
+            )
+            analytics_components = (
+                dashboard.definition.get("analytics_components", [])
+                if isinstance(dashboard.definition, dict)
+                else []
+            )
+            if not isinstance(forecast_components, list):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "dashboard_definition_invalid",
+                        "message": "The dashboard forecast components could not be preserved.",
+                    },
+                )
+            if not isinstance(analytics_components, list):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "dashboard_definition_invalid",
+                        "message": "The dashboard analytics references could not be preserved.",
+                    },
+                )
             dashboard.title = title
             dashboard.description = request.description
-            dashboard.definition = _dashboard_definition(request)
+            dashboard.definition = _dashboard_definition(
+                request,
+                forecast_components,
+                analytics_components,
+            )
             session.commit()
             session.refresh(dashboard)
             return _serialize_dashboard(dashboard)

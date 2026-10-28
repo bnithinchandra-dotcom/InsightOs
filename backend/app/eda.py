@@ -25,6 +25,10 @@ from app.execution import (
     ExecutionBudgetExceeded,
     estimate_decoded_python_string_bytes,
 )
+from app.ml_intelligence import (
+    DEFAULT_ROBUST_Z_THRESHOLD,
+    detect_univariate_anomalies,
+)
 from app.task_execution import (
     CapabilityRegistry,
     ExecutionContext,
@@ -69,7 +73,12 @@ MAX_EDA_SCAN_BYTES = DEFAULT_MAX_OUTPUT_BYTES
 EDA_BATCH_SIZE = 4096
 _COLUMN_NAME_LIMIT = 256
 _BUCKET_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
-_SUPPORTED_ANALYSIS_TYPES = {"univariate", "bivariate", "multivariate"}
+_SUPPORTED_ANALYSIS_TYPES = {
+    "univariate",
+    "bivariate",
+    "multivariate",
+    "anomaly_detection",
+}
 
 
 def _algorithm_version_for_analysis(analysis_type: str) -> str:
@@ -77,6 +86,7 @@ def _algorithm_version_for_analysis(analysis_type: str) -> str:
         "univariate": "univariate-1",
         "bivariate": "bivariate-1",
         "multivariate": "multivariate-1",
+        "anomaly_detection": "robust-anomaly-1",
     }.get(analysis_type, EDA_ALGORITHM_VERSION)
 
 
@@ -100,6 +110,7 @@ class EDAConfiguration:
     max_result_bytes: int = DEFAULT_EDA_RESULT_BYTES
     max_pairs: int = 32
     max_features: int = 16
+    anomaly_threshold: float = DEFAULT_ROBUST_Z_THRESHOLD
 
     def __post_init__(self) -> None:
         _validate_configuration(self)
@@ -117,6 +128,7 @@ class EDAConfiguration:
             "max_result_bytes": self.max_result_bytes,
             "max_pairs": self.max_pairs,
             "max_features": self.max_features,
+            "anomaly_threshold": self.anomaly_threshold,
         }
 
 
@@ -202,6 +214,7 @@ class EDAResult:
     failure: EDAFailure | None = None
     pair_results: tuple[EDAColumnPairResult, ...] = ()
     multivariate_summary: dict[str, Any] = field(default_factory=dict)
+    anomaly_summary: dict[str, Any] = field(default_factory=dict)
     provenance: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
@@ -231,6 +244,7 @@ class EDAResult:
             "failure": self.failure.as_dict() if self.failure else None,
             "pair_results": [pair.as_dict() for pair in self.pair_results],
             "multivariate_summary": self.multivariate_summary,
+            "anomaly_summary": self.anomaly_summary,
             "provenance": self.provenance,
         }
 
@@ -278,7 +292,7 @@ def _validate_configuration(configuration: EDAConfiguration) -> None:
     ):
         raise EDAError(
             "unsupported_analysis_type",
-            "EDA analysis type is unsupported. Supported values are 'univariate', 'bivariate', and 'multivariate'.",
+            "EDA analysis type is unsupported. Supported values are 'univariate', 'bivariate', 'multivariate', and 'anomaly_detection'.",
         )
     if (
         isinstance(configuration.table_index, bool)
@@ -308,6 +322,11 @@ def _validate_configuration(configuration: EDAConfiguration) -> None:
         raise EDAError("invalid_selected_columns", "Bivariate EDA requires at least two selected columns.")
     if configuration.analysis_type == "multivariate" and len(columns) < 2:
         raise EDAError("invalid_selected_columns", "Multivariate EDA requires at least two selected columns.")
+    if configuration.analysis_type == "anomaly_detection" and len(columns) != 1:
+        raise EDAError(
+            "invalid_selected_columns",
+            "Anomaly detection requires exactly one explicitly selected numeric column.",
+        )
     if configuration.column_pairs:
         if configuration.analysis_type != "bivariate":
             raise EDAError(
@@ -396,6 +415,16 @@ def _validate_configuration(configuration: EDAConfiguration) -> None:
             "invalid_max_features",
             f"max_features must be between 1 and {MAX_EDA_MULTIVARIATE_FEATURES}.",
         )
+    if (
+        isinstance(configuration.anomaly_threshold, bool)
+        or not isinstance(configuration.anomaly_threshold, (int, float))
+        or not math.isfinite(configuration.anomaly_threshold)
+        or not 2.0 <= configuration.anomaly_threshold <= 8.0
+    ):
+        raise EDAError(
+            "invalid_anomaly_threshold",
+            "anomaly_threshold must be finite and between 2.0 and 8.0.",
+        )
 
 
 def eda_configuration_from_dict(value: dict) -> EDAConfiguration:
@@ -413,6 +442,7 @@ def eda_configuration_from_dict(value: dict) -> EDAConfiguration:
         "max_result_bytes",
         "max_pairs",
         "max_features",
+        "anomaly_threshold",
     }
     if set(value) - allowed:
         raise EDAError("invalid_configuration", "EDA configuration has unsupported fields.")
@@ -2109,6 +2139,107 @@ def _analyze_local_parquet(
                 requested_for_relationship = list(configuration.selected_columns)
             if not requested_for_relationship:
                 raise EDAError("unknown_column", "Selected relationship columns are not in the normalized schema.")
+            if configuration.analysis_type == "anomaly_detection":
+                selected_name = configuration.selected_columns[0]
+                selected_type = _arrow_kind(schema.field(selected_name).type)
+                if selected_type != "numeric":
+                    raise EDAError(
+                        "anomaly_numeric_column_required",
+                        "Anomaly detection requires one numeric column.",
+                    )
+                if parquet.metadata.num_rows > MAX_EDA_NUMERIC_VALUES:
+                    raise EDAError(
+                        "anomaly_row_limit",
+                        f"Anomaly screening is limited to {MAX_EDA_NUMERIC_VALUES} rows per table.",
+                    )
+                _validate_scan_size(parquet, [selected_name])
+                values: list[float] = []
+                row_indices: list[int] = []
+                scanned_rows = 0
+                for batch in parquet.iter_batches(
+                    batch_size=EDA_BATCH_SIZE,
+                    columns=[selected_name],
+                    use_threads=False,
+                ):
+                    for value in batch.column(0).to_pylist():
+                        scanned_rows += 1
+                        converted = _to_finite_float(value)
+                        if converted is not None:
+                            values.append(converted)
+                            row_indices.append(scanned_rows)
+                if scanned_rows != table["row_count"]:
+                    raise EDAError(
+                        "artifact_metadata_mismatch",
+                        "Anomaly scan row count did not match normalization metadata.",
+                    )
+                try:
+                    anomaly_summary = detect_univariate_anomalies(
+                        values,
+                        row_indices=row_indices,
+                        threshold=configuration.anomaly_threshold,
+                    )
+                except ValueError as error:
+                    raise EDAError(
+                        "anomaly_configuration_invalid",
+                        "Anomaly detection parameters are invalid.",
+                    ) from error
+                result_status: Literal["completed", "partially_completed"] = (
+                    "partially_completed"
+                    if anomaly_summary["status"] == "insufficient_data"
+                    else "completed"
+                )
+                warnings = list(anomaly_summary.get("warnings", []))
+                if scanned_rows > len(values):
+                    warnings.append(
+                        f"{scanned_rows - len(values)} null or non-finite observations were excluded."
+                    )
+                configuration_dict = configuration.as_dict()
+                encoded_configuration = _canonical_json(configuration_dict)
+                result = EDAResult(
+                    schema_version=EDA_RESULT_SCHEMA_VERSION,
+                    analysis_type=configuration.analysis_type,
+                    status=result_status,
+                    dataset_id=dataset_id,
+                    file_id=file_id,
+                    table_index=configuration.table_index,
+                    table_name=table.get("table_name"),
+                    artifact_sha256=table["sha256"],
+                    normalization_version=normalization_result["pipeline_version"],
+                    algorithm_version=_algorithm_version_for_analysis(
+                        configuration.analysis_type
+                    ),
+                    configuration=configuration_dict,
+                    configuration_sha256=hashlib.sha256(encoded_configuration).hexdigest(),
+                    executed_at=datetime.now(timezone.utc).isoformat(),
+                    requested_columns=configuration.selected_columns,
+                    analyzed_columns=(selected_name,),
+                    rows_analyzed=scanned_rows,
+                    exact=True,
+                    sampling=None,
+                    columns=(),
+                    warnings=tuple(warnings),
+                    anomaly_summary=anomaly_summary,
+                    provenance=_eda_provenance(
+                        dataset_id=dataset_id,
+                        file_id=file_id,
+                        source_sha256=source_sha256,
+                        source_size_bytes=normalization_result["source"][
+                            "file_size_bytes"
+                        ],
+                        normalization_result=normalization_result,
+                        table=table,
+                        schema=schema,
+                        configuration=configuration,
+                        result_status=result_status,
+                        verification_status="verified",
+                    ),
+                )
+                if len(_canonical_json(result.as_dict())) > configuration.max_result_bytes:
+                    raise EDAError(
+                        "result_size_limit",
+                        "EDA result exceeds the configured serialized size limit.",
+                    )
+                return result
             if parquet.metadata.num_rows > MAX_EDA_ROWS:
                 raise EDAError(
                     "row_limit",
