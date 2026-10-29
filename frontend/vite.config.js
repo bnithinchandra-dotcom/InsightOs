@@ -28,6 +28,19 @@ export default defineConfig(({ mode }) => {
     preview: {
       host: '0.0.0.0',
       port: 4173,
+      // Mirror the dev-server proxy so that `vite preview` also reaches the backend
+      // without cross-origin requests. When the frontend is deployed behind a
+      // reverse proxy, CORS_ALLOWED_ORIGINS on the backend covers the gap instead.
+      proxy: {
+        '/health': {
+          target: apiBaseUrl,
+          changeOrigin: true,
+        },
+        '/api': {
+          target: apiBaseUrl,
+          changeOrigin: true,
+        },
+      },
     },
   }
 })

@@ -37,6 +37,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.middleware.cors import CORSMiddleware
 from urllib3.exceptions import HTTPError
 
 from app.database import SessionLocal
@@ -515,6 +516,24 @@ class UploadFilenameSafetyMiddleware:
 
 
 app.add_middleware(UploadFilenameSafetyMiddleware)
+
+# CORS: allow the Vite dev server (5173) and preview server (4173).
+# Set CORS_ALLOWED_ORIGINS (comma-separated) in deployment for other origins.
+_CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        "http://localhost:5173,http://localhost:4173",
+    ).split(",")
+    if origin.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_CORS_ORIGINS,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    allow_credentials=False,
+)
 
 
 class DatasetCreate(BaseModel):
