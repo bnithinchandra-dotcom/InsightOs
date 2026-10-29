@@ -970,6 +970,44 @@ class AgentProviderTests(unittest.TestCase):
         self.assertEqual(outcome.assistant_text, "20")
         self.assertEqual(provider.requests[0].messages[-1].content, "10+10")
 
+    def test_runtime_arithmetic_regression_terse_expression_returns_398_and_readable(self):
+        provider = SequenceProvider([
+            ModelResponse(
+                ProviderMessage(role="assistant", content="301 + 90 + 7 = 398"),
+                finish_reason="stop",
+            )
+        ])
+        outcome = execute_agent_request(
+            user_message="301+90+07=",
+            history=[],
+            settings=settings(),
+            provider=provider,
+        )
+        self.assertEqual(outcome.status, "completed")
+        self.assertIn("398", outcome.assistant_text)
+        self.assertFalse(outcome.assistant_text.strip().startswith("{"), "User-facing answer must be readable text, not raw JSON")
+        self.assertNotIn("claims", outcome.assistant_text)
+        self.assertEqual(provider.requests[0].messages[-1].content, "301+90+07=")
+
+    def test_runtime_arithmetic_regression_natural_language_returns_398_and_readable(self):
+        provider = SequenceProvider([
+            ModelResponse(
+                ProviderMessage(role="assistant", content="301 + 90 + 7 = 398"),
+                finish_reason="stop",
+            )
+        ])
+        outcome = execute_agent_request(
+            user_message="What is 301 + 90 + 7?",
+            history=[],
+            settings=settings(),
+            provider=provider,
+        )
+        self.assertEqual(outcome.status, "completed")
+        self.assertIn("398", outcome.assistant_text)
+        self.assertFalse(outcome.assistant_text.strip().startswith("{"), "User-facing answer must be readable text, not raw JSON")
+        self.assertNotIn("claims", outcome.assistant_text)
+        self.assertEqual(provider.requests[0].messages[-1].content, "What is 301 + 90 + 7?")
+
     def test_runtime_rejects_empty_responses_without_claiming_success(self):
         provider = SequenceProvider([
             ModelResponse(
