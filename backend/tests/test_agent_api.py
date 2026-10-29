@@ -258,7 +258,7 @@ class ConversationApiTests(unittest.TestCase):
         settings = AgentSettings(
             provider="ollama",
             base_url="http://127.0.0.1:11434",
-            model="qwen3:4b-instruct",
+            model="qwen3:8b",
             api_key=None,
             timeout_seconds=1,
             max_output_tokens=32,
@@ -1213,7 +1213,7 @@ class ConversationApiTests(unittest.TestCase):
         settings = AgentSettings(
             provider="ollama",
             base_url="http://127.0.0.1:11434",
-            model="qwen3:4b-instruct",
+            model="qwen3:8b",
             api_key=None,
             timeout_seconds=1,
             max_output_tokens=32,
@@ -1340,7 +1340,7 @@ class ConversationApiTests(unittest.TestCase):
         settings = AgentSettings(
             provider="ollama",
             base_url="http://localhost:11434",
-            model="fixture-model",
+            model="qwen3:8b",
             api_key=None,
             timeout_seconds=1,
             max_output_tokens=32,
@@ -1375,7 +1375,7 @@ class ConversationApiTests(unittest.TestCase):
         settings = AgentSettings(
             provider="ollama",
             base_url="http://localhost:11434",
-            model="fixture-model",
+            model="qwen3:8b",
             api_key=None,
             timeout_seconds=1,
             max_output_tokens=32,
@@ -1425,7 +1425,7 @@ class ConversationApiTests(unittest.TestCase):
         settings = AgentSettings(
             provider="ollama",
             base_url="http://localhost:11434",
-            model="fixture-model",
+            model="qwen3:8b",
             api_key=None,
             timeout_seconds=1,
             max_output_tokens=32,

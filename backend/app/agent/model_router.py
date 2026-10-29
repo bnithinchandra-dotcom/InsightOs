@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from dataclasses import dataclass, replace
@@ -7,7 +8,10 @@ from typing import Literal
 
 from app.agent.config import AgentSettings
 from app.agent.contracts import ModelRequest, ModelResponse, ProviderError
+from app.agent.model_registry import REGISTRY
 from app.agent.providers import ModelProvider
+
+logger = logging.getLogger(__name__)
 
 
 AgentRole = Literal[
@@ -61,6 +65,17 @@ class AgentModelRouter:
                 "provider_configuration_invalid",
                 f"The configured model identifier for {role} is too long.",
             )
+        # Registry gate: only applies to the Ollama provider.
+        # OpenAI-compatible providers manage their own model namespaces.
+        if self._settings.provider == "ollama":
+            entry = REGISTRY.require_eligible(model, role)
+            if entry.validation_status == "candidate":
+                logger.warning(
+                    "Dispatching candidate (unvalidated) model %r for role %r. "
+                    "Run an approved live validation before enabling in production.",
+                    model,
+                    role,
+                )
         return model
 
     @property

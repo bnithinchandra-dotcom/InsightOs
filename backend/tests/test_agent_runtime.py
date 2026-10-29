@@ -26,7 +26,7 @@ from app.agent.runtime import SYSTEM_INSTRUCTIONS, execute_agent_request
 from app.agent.tools import StrictArguments, ToolDefinition, ToolRegistry
 
 
-def settings(provider="ollama", model="fixture-model", api_key=None):
+def settings(provider="ollama", model="qwen3:8b", api_key=None):
     return AgentSettings(
         provider=provider,
         base_url="http://provider.invalid",
@@ -201,14 +201,14 @@ class AgentProviderTests(unittest.TestCase):
         with patch("app.agent.providers.httpx2.Client", return_value=client):
             with patch.dict(
                 os.environ,
-                {"INSIGHTOS_LLM_MODEL_DATA_INTELLIGENCE": "qwen3:0.6b"},
+                {"INSIGHTOS_LLM_MODEL_DATA_INTELLIGENCE": "qwen3:4b"},
             ):
                 router.complete(
                     "data_intelligence",
                     ModelRequest("ignored", (), (), 32),
                 )
 
-        self.assertEqual(client.request[2]["model"], "qwen3:0.6b")
+        self.assertEqual(client.request[2]["model"], "qwen3:4b")
 
     def test_ollama_default_model_fallback_reaches_generation_payload(self):
         client = FakeHttpClient(
@@ -535,7 +535,7 @@ class AgentProviderTests(unittest.TestCase):
         available_client = FakeHttpClient(
             FakeHttpResponse({
                 "models": [{
-                    "name": "fixture-model",
+                    "name": "qwen3:8b",
                     "digest": "fixture-digest",
                 }],
             })
@@ -555,7 +555,7 @@ class AgentProviderTests(unittest.TestCase):
                 runtime_version="0.13.0",
                 model_identity=ModelIdentity(
                     provider="ollama",
-                    model="fixture-model",
+                    model="qwen3:8b",
                     digest="fixture-digest",
                 ),
                 capabilities=OllamaProvider.capabilities,
@@ -574,7 +574,7 @@ class AgentProviderTests(unittest.TestCase):
 
     def test_openai_health_uses_authenticated_model_list(self):
         client = FakeHttpClient(
-            FakeHttpResponse({"data": [{"id": "fixture-model"}]})
+            FakeHttpResponse({"data": [{"id": "qwen3:8b"}]})
         )
         with patch("app.agent.providers.httpx2.Client", return_value=client):
             health = OpenAICompatibleProvider(
@@ -586,7 +586,7 @@ class AgentProviderTests(unittest.TestCase):
                 status="healthy",
                 model_identity=ModelIdentity(
                     provider="openai_compatible",
-                    model="fixture-model",
+                    model="qwen3:8b",
                 ),
                 capabilities=OpenAICompatibleProvider.capabilities,
             ),

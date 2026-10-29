@@ -475,7 +475,7 @@ class ClaimValidationTests(unittest.TestCase):
             settings=AgentSettings(
                 provider="ollama",
                 base_url="http://localhost:11434",
-                model="fixture-model",
+                model="qwen3:8b",
                 api_key=None,
                 timeout_seconds=1,
                 max_output_tokens=256,

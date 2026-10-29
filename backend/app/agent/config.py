@@ -26,6 +26,9 @@ class AgentSettings:
     max_model_turns: int
     max_tool_calls: int
     max_history_messages: int
+    # Optional Ollama keep_alive value in seconds. None uses Ollama default TTL.
+    # Configure via INSIGHTOS_OLLAMA_KEEP_ALIVE. Only relevant for ollama provider.
+    ollama_keep_alive_seconds: int | None = None
 
 
 def _positive_int(name: str, default: int, maximum: int) -> int:
@@ -102,6 +105,22 @@ def get_agent_settings() -> AgentSettings:
     )
 
     if provider == "ollama":
+        keep_alive_seconds = None
+        _raw_keep_alive = getenv("INSIGHTOS_OLLAMA_KEEP_ALIVE", "").strip()
+        if _raw_keep_alive:
+            try:
+                _ka = int(_raw_keep_alive)
+            except ValueError:
+                raise ProviderError(
+                    "provider_configuration_invalid",
+                    "INSIGHTOS_OLLAMA_KEEP_ALIVE must be a whole number of seconds.",
+                ) from None
+            if _ka < 0:
+                raise ProviderError(
+                    "provider_configuration_invalid",
+                    "INSIGHTOS_OLLAMA_KEEP_ALIVE must be zero or a positive number of seconds.",
+                )
+            keep_alive_seconds = _ka
         return AgentSettings(
             provider=provider,
             base_url=_base_url(
@@ -115,6 +134,7 @@ def get_agent_settings() -> AgentSettings:
             max_model_turns=max_model_turns,
             max_tool_calls=max_tool_calls,
             max_history_messages=max_history_messages,
+            ollama_keep_alive_seconds=keep_alive_seconds,
         )
     if provider == "openai_compatible":
         return AgentSettings(

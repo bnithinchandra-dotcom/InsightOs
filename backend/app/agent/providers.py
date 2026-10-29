@@ -382,6 +382,14 @@ class OllamaProvider(_HttpProvider):
             if request.model.casefold().startswith("qwen3")
             else {}
         )
+        # Pass keep_alive when configured; omit the key entirely when None
+        # so Ollama applies its own default TTL without our interference.
+        keep_alive_seconds = getattr(self.settings, "ollama_keep_alive_seconds", None)
+        keep_alive_option = (
+            {"keep_alive": keep_alive_seconds}
+            if isinstance(keep_alive_seconds, int) and keep_alive_seconds >= 0
+            else {}
+        )
         payload = self._post(
             f"{self.settings.base_url}/api/chat",
             {
@@ -393,6 +401,7 @@ class OllamaProvider(_HttpProvider):
                 "stream": False,
                 "options": {"num_predict": request.max_output_tokens},
                 **thinking_options,
+                **keep_alive_option,
                 **({"format": "json"} if request.response_format == "json" else {}),
             },
             {},
