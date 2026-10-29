@@ -45,6 +45,7 @@ from app.agent.specialist_agents import (
     run_presentation,
     verified_schema_summary,
 )
+from app.agent.arithmetic import execute_deterministic_arithmetic
 from app.agent.tools import TOOL_DEFINITIONS, ToolRegistry
 
 
@@ -65,7 +66,7 @@ UNVALIDATED_DATA_MESSAGE = (
     "validated against current structured evidence."
 )
 
-SYSTEM_INSTRUCTIONS = """You are the InsightOS assistant. Answer general questions and standalone arithmetic directly when they do not depend on InsightOS data. For user/workspace data tasks, use only the approved deterministic InsightOS tools to retrieve or analyze that data.
+SYSTEM_INSTRUCTIONS = """You are the InsightOS assistant. Answer general questions and standalone arithmetic directly when they do not depend on InsightOS data. Standalone arithmetic expressions are evaluated deterministically by the platform. For user/workspace data tasks, use only the approved deterministic InsightOS tools to retrieve or analyze that data.
 
 Safety and evidence rules:
 - Call only the tools provided in this request. Never propose arbitrary code, SQL, shell commands, filesystem access, or network access.
@@ -80,7 +81,7 @@ Safety and evidence rules:
 - For a churn-rate request, identify missing customer count, churn count, and time period separately; never invent a rate.
 - Identify missing definitions, fields, denominators, or time periods and ask a concise clarification rather than inventing them.
 - Clearly label a proposed analysis plan as a plan. Claim a tool ran or report a result only when the corresponding tool result is present.
-- For every data-specific final answer, return only a JSON object with a `claims` array. Each claim must contain `claim_type`, `dataset_id`, `file_id`, `claim_key`, `value`, `unit`, `denominator`, and `evidence_reference` (`handoff_id`, `dataset_id`, `file_id`). Do not include user-facing prose in the envelope; trusted backend code constructs the final answer from validated evidence. Do not assert your own verification status.
+- For every data-specific final answer following an executed dataset tool, return only a JSON object with a `claims` array. Each claim must contain `claim_type`, `dataset_id`, `file_id`, `claim_key`, `value`, `unit`, `denominator`, and `evidence_reference` (`handoff_id`, `dataset_id`, `file_id`). Do not include user-facing prose in the envelope; trusted backend code constructs the final answer from validated evidence. Do NOT emit a claims envelope for general conversation, standalone questions, or when no dataset tool was executed. Do not assert your own verification status.
 - Supported claim keys use only the structured inspection handoff: `table[<index>].row_count`, `.column_count`, `.duplicate_row_count`; `column[<table-index>,<column-index>].name`, `.physical_types`, `.missing_value_count`, `.empty_value_count`, `.distinct_value_count`; `quality_findings[<finding-id>]`; `relationships[<index>].status`; and `recommendations[<operation-id>]`.
 - For count claims, provide the exact `unit`; duplicate, missing, empty, and distinct counts also require a denominator object such as `{"unit":"rows","count":<table-row-count>}`. Unsupported, stale, failed, or unavailable results must not be phrased as findings.
 - Relationships, key candidates, column roles, fact/dimension labels, and model proposals are hypotheses, not confirmed business meaning or constraints.
@@ -95,6 +96,17 @@ TOOL_CALL_LIMIT_MESSAGE = (
 TURN_LIMIT_MESSAGE = (
     "I reached the model-turn limit before completing the request. Any completed analysis results are preserved."
 )
+
+
+def _is_raw_claims_envelope(text: str) -> bool:
+    stripped = text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return False
+    try:
+        payload = json.loads(stripped)
+        return isinstance(payload, dict) and "claims" in payload and isinstance(payload["claims"], list)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
 
 
 def _json_bytes(value: Any) -> int:
@@ -437,6 +449,13 @@ def execute_agent_request(
     )
     if orchestrated_outcome is not None:
         return orchestrated_outcome
+
+    arithmetic_outcome = execute_deterministic_arithmetic(
+        user_message=user_message,
+        context=context,
+    )
+    if arithmetic_outcome is not None:
+        return arithmetic_outcome
 
     try:
         selected_settings = settings or get_agent_settings()
@@ -1390,6 +1409,25 @@ def execute_agent_request(
                 if status == "partial"
                 else None
             ),
+        )
+
+    if _is_raw_claims_envelope(final_text):
+        logger.warning("Rejected unvalidated claims envelope on a conversational non-data path.")
+        envelope_warnings = list(warnings)
+        envelope_warnings.append(
+            "An unvalidated structured claims envelope was rejected on a conversational path."
+        )
+        return AgentOutcome(
+            status="failed",
+            assistant_text=(
+                "I could not complete this request because the response contained an internal "
+                "structured format instead of a readable conversational answer. Please retry your question."
+            ),
+            activities=tuple(activities),
+            structured_results=tuple(structured_results),
+            warnings=tuple(dict.fromkeys(envelope_warnings)),
+            usage=UsageMetadata(input_tokens or None, output_tokens or None),
+            error_code="unvalidated_claim_envelope",
         )
 
     return AgentOutcome(

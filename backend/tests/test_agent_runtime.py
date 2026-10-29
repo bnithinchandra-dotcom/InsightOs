@@ -953,13 +953,8 @@ class AgentProviderTests(unittest.TestCase):
             "claim_envelope_invalid",
         )
 
-    def test_runtime_passes_arithmetic_prompt_to_provider_and_returns_its_answer(self):
-        provider = SequenceProvider([
-            ModelResponse(
-                ProviderMessage(role="assistant", content="20"),
-                finish_reason="stop",
-            )
-        ])
+    def test_runtime_passes_arithmetic_prompt_to_deterministic_evaluator(self):
+        provider = SequenceProvider([])
         outcome = execute_agent_request(
             user_message="10+10",
             history=[],
@@ -967,16 +962,11 @@ class AgentProviderTests(unittest.TestCase):
             provider=provider,
         )
         self.assertEqual(outcome.status, "completed")
-        self.assertEqual(outcome.assistant_text, "20")
-        self.assertEqual(provider.requests[0].messages[-1].content, "10+10")
+        self.assertEqual(outcome.assistant_text, "10 + 10 = 20")
+        self.assertEqual(len(provider.requests), 0)
 
     def test_runtime_arithmetic_regression_terse_expression_returns_398_and_readable(self):
-        provider = SequenceProvider([
-            ModelResponse(
-                ProviderMessage(role="assistant", content="301 + 90 + 7 = 398"),
-                finish_reason="stop",
-            )
-        ])
+        provider = SequenceProvider([])
         outcome = execute_agent_request(
             user_message="301+90+07=",
             history=[],
@@ -984,18 +974,13 @@ class AgentProviderTests(unittest.TestCase):
             provider=provider,
         )
         self.assertEqual(outcome.status, "completed")
-        self.assertIn("398", outcome.assistant_text)
+        self.assertEqual(outcome.assistant_text, "301 + 90 + 7 = 398")
         self.assertFalse(outcome.assistant_text.strip().startswith("{"), "User-facing answer must be readable text, not raw JSON")
         self.assertNotIn("claims", outcome.assistant_text)
-        self.assertEqual(provider.requests[0].messages[-1].content, "301+90+07=")
+        self.assertEqual(len(provider.requests), 0)
 
     def test_runtime_arithmetic_regression_natural_language_returns_398_and_readable(self):
-        provider = SequenceProvider([
-            ModelResponse(
-                ProviderMessage(role="assistant", content="301 + 90 + 7 = 398"),
-                finish_reason="stop",
-            )
-        ])
+        provider = SequenceProvider([])
         outcome = execute_agent_request(
             user_message="What is 301 + 90 + 7?",
             history=[],
@@ -1003,10 +988,10 @@ class AgentProviderTests(unittest.TestCase):
             provider=provider,
         )
         self.assertEqual(outcome.status, "completed")
-        self.assertIn("398", outcome.assistant_text)
+        self.assertEqual(outcome.assistant_text, "301 + 90 + 7 = 398")
         self.assertFalse(outcome.assistant_text.strip().startswith("{"), "User-facing answer must be readable text, not raw JSON")
         self.assertNotIn("claims", outcome.assistant_text)
-        self.assertEqual(provider.requests[0].messages[-1].content, "What is 301 + 90 + 7?")
+        self.assertEqual(len(provider.requests), 0)
 
     def test_runtime_rejects_empty_responses_without_claiming_success(self):
         provider = SequenceProvider([
@@ -1020,7 +1005,7 @@ class AgentProviderTests(unittest.TestCase):
             )
         ])
         outcome = execute_agent_request(
-            user_message="10+10",
+            user_message="Hello, how are you?",
             history=[],
             settings=settings(),
             provider=provider,
@@ -1040,7 +1025,7 @@ class AgentProviderTests(unittest.TestCase):
                 )
 
         outcome = execute_agent_request(
-            user_message="10+10",
+            user_message="Hello, how are you?",
             history=[],
             settings=settings(),
             provider=InvalidResponseProvider(),
