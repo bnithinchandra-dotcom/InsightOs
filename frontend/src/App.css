@@ -2372,3 +2372,444 @@ a:focus-visible {
     flex-basis: auto;
   }
 }
+
+
+/* ── Milestone 18: Agent-First UX & Workflow Integration ──────────────────── */
+
+/* Provider badge (compact inline) */
+.provider-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+
+.provider-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #67758a;
+  flex: 0 0 auto;
+}
+
+.provider-badge.provider-healthy .provider-dot,
+.provider-badge.provider-configured .provider-dot {
+  background: var(--green);
+}
+
+.provider-badge.provider-not_configured .provider-dot,
+.provider-badge.provider-invalid_configuration .provider-dot {
+  background: var(--yellow);
+}
+
+.provider-badge.provider-unavailable .provider-dot,
+.provider-badge.provider-failed .provider-dot {
+  background: var(--red);
+}
+
+/* Capability notice */
+.capability-notice {
+  padding: 10px 13px;
+  border: 1px solid #3d4f2e;
+  border-radius: 8px;
+  background: #171e13;
+  color: #a8d48a;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.capability-notice a {
+  color: var(--accent);
+}
+
+/* Tool activity timeline */
+.tool-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin-top: 10px;
+  padding-left: 10px;
+  border-left: 2px solid #263040;
+}
+
+.tool-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: 10px;
+}
+
+.tool-step-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-top: 3px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: 0 0 auto;
+}
+
+.tool-step-succeeded .tool-step-dot { background: var(--green); }
+.tool-step-failed .tool-step-dot { background: var(--red); }
+
+.tool-step-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tool-step-body strong {
+  color: var(--text);
+  font-size: 10px;
+}
+
+.tool-step-body span {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+/* Result card */
+.result-card {
+  margin-top: 10px;
+  padding: 11px 13px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #0e1724;
+}
+
+.result-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 7px;
+}
+
+.result-card-tool {
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.result-card-status {
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.result-status-succeeded,
+.result-status-completed {
+  border: 1px solid #2b604e;
+  color: var(--green);
+}
+
+.result-status-failed,
+.result-status-error {
+  border: 1px solid #683b3b;
+  color: var(--red);
+}
+
+.result-status-partial {
+  border: 1px solid #69562e;
+  color: var(--yellow);
+}
+
+.result-card-summary {
+  margin: 0 0 8px;
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.result-finding {
+  margin: 4px 0;
+  padding: 5px 8px;
+  border-left: 2px solid var(--accent);
+  color: #c3d0e6;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.result-technical {
+  margin-top: 8px;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.result-technical summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 9px;
+  user-select: none;
+}
+
+.result-technical pre {
+  margin: 6px 0 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface-muted);
+  color: var(--text);
+  font-size: 9px;
+  overflow: auto;
+  max-height: 300px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.result-save-btn {
+  margin-top: 8px;
+}
+
+/* Analytics execution result */
+.analytics-exec-result {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #0e1724;
+  margin-top: 10px;
+}
+
+.analytics-exec-header {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+/* Sending indicator */
+.sending-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.sending-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--muted);
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+
+.sending-dot:nth-child(2) { animation-delay: 0.2s; }
+.sending-dot:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes pulse-dot {
+  0%, 80%, 100% { opacity: 0.3; transform: scale(0.85); }
+  40% { opacity: 1; transform: scale(1); }
+}
+
+/* Assistant welcome / empty state */
+.assistant-welcome {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  padding: 40px 24px;
+  min-height: 60vh;
+}
+
+.assistant-welcome-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  width: 100%;
+  max-width: 600px;
+}
+
+.assistant-hero {
+  text-align: center;
+}
+
+.assistant-hero-mark {
+  display: inline-block;
+  font-size: 28px;
+  color: var(--accent);
+  margin-bottom: 14px;
+  line-height: 1;
+}
+
+.assistant-hero h2 {
+  margin: 0 0 10px;
+  color: #e8eefa;
+  font-size: clamp(20px, 3vw, 28px);
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  line-height: 1.25;
+}
+
+.assistant-hero p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+  max-width: 500px;
+  margin-inline: auto;
+}
+
+.assistant-example-goals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+}
+
+.example-goal-chip {
+  padding: 7px 13px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-raised);
+  color: #b8c5da;
+  font-size: 11px;
+  cursor: pointer;
+  transition: border-color 120ms ease, color 120ms ease, background-color 120ms ease;
+}
+
+.example-goal-chip:hover {
+  border-color: #3d507a;
+  background: #172238;
+  color: #dde6ff;
+}
+
+.assistant-start-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.assistant-start-textarea {
+  width: 100%;
+  resize: vertical;
+  padding: 13px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-raised);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+  box-sizing: border-box;
+  transition: border-color 120ms ease;
+}
+
+.assistant-start-textarea:focus {
+  outline: none;
+  border-color: #4759a0;
+  box-shadow: 0 0 0 2px rgba(142, 157, 255, 0.12);
+}
+
+.assistant-start-btn {
+  align-self: flex-end;
+  padding: 10px 24px;
+  font-size: 13px;
+}
+
+.assistant-meta {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.assistant-meta-item {
+  font-size: 10px;
+}
+
+/* Sidebar provider status */
+.sidebar-provider-status {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+/* Save notice */
+.save-notice {
+  padding: 8px 11px;
+  border: 1px solid #2b604e;
+  border-radius: 7px;
+  background: #0f1e17;
+  color: var(--green);
+  font-size: 11px;
+}
+
+/* Advanced analytics panels */
+.advanced-analytics-panel {
+  margin-top: 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-muted);
+}
+
+.advanced-analytics-panel > summary {
+  padding: 12px 16px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+  letter-spacing: 0.01em;
+}
+
+.advanced-analytics-panel > summary:hover {
+  color: var(--text);
+}
+
+.advanced-analytics-panel[open] > summary {
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+
+.advanced-analytics-body {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Plan operation card */
+.plan-operation-card {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #0d1522;
+  margin-top: 8px;
+}
+
+.plan-op-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.plan-op-header strong {
+  font-size: 11px;
+  color: var(--text);
+}
+
+/* Text link */
+.text-link {
+  color: var(--accent);
+  text-decoration: underline;
+  font-size: inherit;
+}

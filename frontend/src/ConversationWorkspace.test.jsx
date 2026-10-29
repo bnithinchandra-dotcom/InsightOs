@@ -737,4 +737,71 @@ describe('conversation workspace', () => {
       dataset_id: 42,
     }]))
   })
+it('displays human-readable error when analytics capabilities return 404', async () => {
+    globalThis.fetch.mockImplementation(async (input) => {
+      const url = new URL(String(input), window.location.origin)
+      if (url.pathname === '/api/v1/chat/conversations') return jsonResponse([])
+      if (url.pathname === '/api/v1/chat/provider-status') {
+        return jsonResponse({ provider: 'none', status: 'not_configured', message: '' })
+      }
+      if (url.pathname === '/api/v1/projects') return jsonResponse([])
+      if (url.pathname === '/api/v1/chat/analytics/capabilities') {
+        return jsonResponse({ detail: 'Not Found' }, 404)
+      }
+      return jsonResponse({ detail: 'Unexpected request.' }, 500)
+    })
+
+    render(<ConversationWorkspace />)
+    expect(await screen.findByRole('alert')).toBeTruthy()
+    expect(screen.getByRole('alert').textContent).toContain('Analytics capabilities endpoint not found')
+  })
+
+  it('displays human-readable error when analytics capabilities return 409 profile required', async () => {
+    globalThis.fetch.mockImplementation(async (input) => {
+      const url = new URL(String(input), window.location.origin)
+      if (url.pathname === '/api/v1/chat/conversations') return jsonResponse([])
+      if (url.pathname === '/api/v1/chat/provider-status') {
+        return jsonResponse({ provider: 'none', status: 'not_configured', message: '' })
+      }
+      if (url.pathname === '/api/v1/projects') return jsonResponse([])
+      if (url.pathname === '/api/v1/chat/analytics/capabilities') {
+        return jsonResponse({
+          detail: {
+            code: 'workspace_profile_required',
+            message: 'Create a local workspace profile before using protected workspace data.',
+          },
+        }, 409)
+      }
+      return jsonResponse({ detail: 'Unexpected request.' }, 500)
+    })
+
+    render(<ConversationWorkspace />)
+    expect(await screen.findByRole('alert')).toBeTruthy()
+    expect(screen.getByRole('alert').textContent).toContain('No workspace profile found')
+  })
+
+  it('renders example goal chips in initial state and fills draft on click', async () => {
+    globalThis.fetch.mockImplementation(async (input) => {
+      const url = new URL(String(input), window.location.origin)
+      if (url.pathname === '/api/v1/chat/conversations') return jsonResponse([])
+      if (url.pathname === '/api/v1/chat/provider-status') {
+        return jsonResponse({ provider: 'none', status: 'not_configured', message: '' })
+      }
+      if (url.pathname === '/api/v1/projects') return jsonResponse([])
+      if (url.pathname === '/api/v1/chat/analytics/capabilities') {
+        return jsonResponse({ operations: [] })
+      }
+      return jsonResponse({ detail: 'Unexpected request.' }, 500)
+    })
+
+    render(<ConversationWorkspace />)
+    expect(await screen.findByText('What would you like to understand about your data?')).toBeTruthy()
+    const chip = screen.getByRole('button', { name: 'Explore my dataset with EDA' })
+    expect(chip).toBeTruthy()
+    fireEvent.click(chip)
+
+    const textarea = screen.getByLabelText('Your message')
+    expect(textarea.value).toBe('Explore my dataset with EDA')
+  })
 })
+

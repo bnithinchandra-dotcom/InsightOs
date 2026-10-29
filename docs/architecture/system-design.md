@@ -616,6 +616,23 @@ Shared semantics do not impose identical algorithms or numerical limits:
   persisted freshness/provenance, and conditional dimensional-model hypotheses.
   It never creates database constraints or materializes warehouse tables.
 
+## Milestone 18: Agent-First UX & End-to-End Workflow Integration
+
+### Assistant-First User Journey
+
+InsightOS centers user interaction on the Assistant workspace:
+1. **Initial View:** Users are presented with a natural goal prompt ("What would you like to understand about your data?"), verified example goals reflecting real backend capabilities, an active composer, and compact provider/system status indicators.
+2. **Intent & Data Context:** Optional project and dataset context selectors scope the conversational session. If no workspace profile exists, a clear actionable notice guides users to initialize their profile rather than showing cryptic API failures.
+3. **Execution Transparency:** Live tool activities (`get_profile`, `generate_evidence_report`, etc.) render as an honest progress timeline reflecting real backend states. Failed steps are reported explicitly; simulated percentages or synthetic completion states are strictly forbidden.
+4. **Structured Results:** Verified outcomes display human-readable summaries, key findings, and interactive visual charts (`ChartCard`), while raw JSON payloads are tucked behind expandable technical-details disclosures.
+5. **Durable Dashboard Persistence:** Verified reports produced by analytical workflows can be saved directly to existing or new dashboards by immutable reference without recomputing data.
+6. **Advanced Workflows:** Direct parameter JSON execution and multi-operation dependency plans remain fully accessible inside dedicated collapsible disclosure panels, preserving advanced engineering controls without overwhelming general users.
+
+### API Architecture & Route Alignment
+
+- **Analytics Capabilities:** Registered tool capabilities are exposed at `/api/v1/chat/analytics/capabilities` (defined in `backend/app/agent/api.py` under the router prefix `/api/v1/chat`).
+- **Profile Requirement vs 404:** When no local workspace profile exists, `_require_workspace_owner` raises HTTP 409 (`workspace_profile_required`), which is surfaced by the frontend API helper as actionable workspace setup guidance rather than an unhandled 404.
+
 ## Test and verification status
 
 Backend CI runs compile checks and `unittest` discovery on Python 3.14.3. Unit
@@ -653,6 +670,7 @@ authentication boundary, or remote deployment profile.
 | EDA (Stage 3.7 API & persistence) | **Partial; API and PostgreSQL persistence, Data Workspace EDA/anomaly screening, durable evidence reporting, and explicit dashboard save implemented; broader analysis workflows remain** |
 | ML task suitability, anomaly screening and supervised evaluation | **Partial; verified-source metadata assessment, persisted bounded univariate anomaly screening, and held-out regression/classification evaluation; executable model persistence and dashboard integration are not implemented** |
 | Schema Architect (Phase 4) | **Partial; deterministic API, persistence, frontend workflow, and disposable PostgreSQL/MinIO browser verification implemented** |
+| Agent-First UX & Assistant Integration (Milestone 18) | **Implemented; natural language intent routing, registered tool discovery, honest timeline progress, verified result cards with expandable technical details, and advanced structured/plan execution panels** |
 | Semantic layer, agents, NL-BI, ML, monitoring, governance, production deployment | **Planned** |
 
 The historical phase sequence is retained in the root README. Stage completion

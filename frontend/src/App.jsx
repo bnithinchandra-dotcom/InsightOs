@@ -9,14 +9,13 @@ import './App.css'
 
 const primaryNavigation = [
   { id: 'chat', label: 'Assistant', icon: 'spark' },
-  { id: 'overview', label: 'Overview', icon: 'grid' },
-  { id: 'projects', label: 'Projects', icon: 'folder' },
-  { id: 'datasets', label: 'Datasets', icon: 'database' },
-  { id: 'analysis', label: 'Schema Architect', icon: 'activity' },
+  { id: 'datasets', label: 'Data', icon: 'database' },
   { id: 'dashboards', label: 'Dashboards', icon: 'chart' },
 ]
 
 const secondaryNavigation = [
+  { id: 'projects', label: 'Projects', icon: 'folder' },
+  { id: 'analysis', label: 'Schema Architect', icon: 'activity' },
   { id: 'system', label: 'System', icon: 'pulse' },
   { id: 'settings', label: 'Settings', icon: 'settings' },
 ]
@@ -42,7 +41,11 @@ const pageDetails = {
     description: 'Organize datasets, analysis, and dashboards in one place.',
   },
   datasets: {
-    title: 'Datasets',
+    title: 'Data Workspace',
+    description: 'Bring your data into an InsightOS project and prepare it for analysis.',
+  },
+  data: {
+    title: 'Data Workspace',
     description: 'Bring your data into an InsightOS project and prepare it for analysis.',
   },
   analysis: {
@@ -339,7 +342,9 @@ function SettingsPage({ systemInfo }) {
 function PageContent({ page, props }) {
   if (page === 'chat') return <ConversationWorkspace />
   if (page === 'overview') return <Overview {...props} />
-  if (page === 'projects' || page === 'datasets') return <DataWorkspace page={page} />
+  if (page === 'projects' || page === 'datasets' || page === 'data') {
+    return <DataWorkspace page={page === 'projects' ? 'projects' : 'datasets'} />
+  }
   if (page === 'analysis') {
     return <SchemaArchitect />
   }

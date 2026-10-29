@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   createDashboard,
   createConversation,
@@ -18,6 +18,14 @@ import { ChartCard } from './Dashboards'
 
 const CONVERSATION_PAGE_SIZE = 25
 const MESSAGE_PAGE_SIZE = 25
+
+const EXAMPLE_GOALS = [
+  'Explore my dataset with EDA',
+  'Run a data quality check',
+  'Generate an evidence report',
+  'Check forecasting suitability',
+  'Summarize my project datasets',
+]
 
 function validateAnalyticsPlanDraft(plan, capabilities, limits) {
   if (!plan || typeof plan !== 'object' || Array.isArray(plan)) {
@@ -92,6 +100,77 @@ function validateAnalyticsPlanDraft(plan, capabilities, limits) {
   return ''
 }
 
+function ProviderBadge({ status, message }) {
+  if (!status) return null
+  const label = status.status.replaceAll('_', ' ')
+  const cls = `provider-badge provider-${status.status}`
+  return (
+    <span className={cls} title={message ?? label}>
+      <span className="provider-dot" />
+      Model: {label}
+    </span>
+  )
+}
+
+function ToolActivityTimeline({ activities }) {
+  if (!activities?.length) return null
+  return (
+    <div className="tool-timeline" aria-label="Agent steps">
+      {activities.map((activity, index) => (
+        <div className={`tool-activity tool-step tool-${activity.status}`} key={`${activity.tool_name}-${index}`}>
+          <span className="tool-step-dot" aria-hidden="true" />
+          <div className="tool-step-body">
+            <strong>{activity.label}</strong>
+            {activity.summary && <span>{activity.summary}</span>}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function StructuredResultCard({ result, onSave }) {
+  const [expanded, setExpanded] = useState(false)
+  const isReport = ['generate_evidence_report', 'generate_eda_evidence_report'].includes(result.tool)
+  const saveRefs = isReport && result.status === 'succeeded'
+    ? (result.references ?? []).filter(
+        (reference) =>
+          reference.type === 'analytics_workflow_result'
+          && typeof reference.workflow_id === 'string'
+          && typeof reference.task_id === 'string',
+      )
+    : []
+
+  return (
+    <details className="structured-chat-result result-card" open>
+      <summary>{result.tool.replaceAll('_', ' ')} result</summary>
+      {result.summary && <p className="result-card-summary">{result.summary}</p>}
+      {result.data?.charts?.map((chart) => (
+        <ChartCard chart={chart} key={`${chart.title}-${chart.x_field}-${chart.y_field}`} />
+      ))}
+      {result.data?.findings?.slice(0, 10).map((finding) => (
+        <p className="result-finding" key={finding.id ?? finding.statement}>{finding.statement}</p>
+      ))}
+      {saveRefs.map((reference) => (
+        <button
+          className="button button-secondary result-save-btn"
+          type="button"
+          key={`${reference.workflow_id}-${reference.task_id}`}
+          onClick={() => onSave(reference)}
+        >
+          Save verified report to dashboard
+        </button>
+      ))}
+      {result.data !== null && result.data !== undefined && (
+        <details className="result-technical" onToggle={(e) => setExpanded(e.target.open)}>
+          <summary>{expanded ? 'Hide technical details' : 'Show technical details'}</summary>
+          <pre>{JSON.stringify(result.data, null, 2)}</pre>
+        </details>
+      )}
+    </details>
+  )
+}
+
 function ConversationWorkspace() {
   const [conversations, setConversations] = useState([])
   const [conversationOffset, setConversationOffset] = useState(0)
@@ -124,6 +203,7 @@ function ConversationWorkspace() {
   const [runningAnalyticsPlan, setRunningAnalyticsPlan] = useState(false)
   const [analyticsPlanLimits, setAnalyticsPlanLimits] = useState(null)
   const [capabilityError, setCapabilityError] = useState('')
+  const messagesEndRef = useRef(null)
 
   const loadConversations = useCallback(async (offset = 0, append = false) => {
     const items = await getConversations({ limit: CONVERSATION_PAGE_SIZE, offset })
@@ -184,6 +264,12 @@ function ConversationWorkspace() {
     return () => controller.abort()
   }, [projectId])
 
+  useEffect(() => {
+    if (typeof messagesEndRef.current?.scrollIntoView === 'function' && messages.length > 0) {
+      messagesEndRef.current.scrollIntoView({ behavior: 'smooth' })
+    }
+  }, [messages])
+
   async function openConversation(id) {
     setError('')
     try {
@@ -216,8 +302,10 @@ function ConversationWorkspace() {
       setMessages([])
       setHasOlderMessages(false)
       setConversations((current) => [created, ...current.filter((item) => item.id !== created.id)])
+      return created
     } catch (requestError) {
       setError(requestError.message)
+      return null
     }
   }
 
@@ -249,11 +337,18 @@ function ConversationWorkspace() {
   async function submitMessage(event) {
     event.preventDefault()
     const content = draft.trim()
-    if (!conversation || !content || sending) return
+    if (!content || sending) return
+
     setSending(true)
     setError('')
     try {
-      const response = await sendConversationMessage(conversation.id, content)
+      let activeConversation = conversation
+      if (!activeConversation) {
+        activeConversation = await startConversation()
+        if (!activeConversation) return
+      }
+
+      const response = await sendConversationMessage(activeConversation.id, content)
       setConversation(response.conversation)
       const nextMessages = [
         ...messages,
@@ -464,6 +559,9 @@ function ConversationWorkspace() {
             </button>
           )}
         </div>
+        <div className="sidebar-provider-status">
+          <ProviderBadge status={providerStatus} message={providerStatus?.message} />
+        </div>
       </aside>
 
       <div className="conversation-main">
@@ -483,274 +581,62 @@ function ConversationWorkspace() {
           <p className="provider-notice" role="status">{providerStatus.message}</p>
         )}
         {error && <p className="conversation-error" role="alert">{error}</p>}
-
-        <section className="structured-chat-result" aria-label="Unified analytics workflow">
-          <h3>Structured analytics workflow</h3>
-          <p className="muted">
-            Select a registered evidence-report operation and provide its validated parameters as JSON.
-            The operation runs through the persisted workflow system; it does not invoke a model.
-          </p>
-          {capabilityError && (
-            <p className="conversation-error" role="alert">
-              Analytics capabilities could not be loaded: {capabilityError}
-            </p>
-          )}
-          {structuredReportCapabilities.length > 0 ? (
-            <form className="conversation-composer" onSubmit={submitStructuredAnalytics}>
-              <label>
-                Evidence-report operation
-                <select
-                  value={analyticsOperation}
-                  onChange={(event) => {
-                    setAnalyticsOperation(event.target.value)
-                    setAnalyticsExecution(null)
-                    setPendingAnalyticsSave(null)
-                  }}
-                  disabled={runningAnalytics}
-                >
-                  {structuredReportCapabilities.map((capability) => (
-                    <option key={capability.operation} value={capability.operation}>
-                      {capability.operation.replaceAll('_', ' ')}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="visually-hidden" htmlFor="analytics-parameters">
-                Operation parameters as JSON
-              </label>
-              <textarea
-                id="analytics-parameters"
-                value={analyticsParameters}
-                onChange={(event) => setAnalyticsParameters(event.target.value)}
-                maxLength={4096}
-                placeholder="Paste an object matching the selected operation schema."
-                rows={5}
-                spellCheck="false"
-                aria-describedby="analytics-parameter-schema"
-                disabled={runningAnalytics}
-              />
-              <button
-                className="button button-primary"
-                type="submit"
-                disabled={runningAnalytics || !analyticsOperation}
-              >
-                {runningAnalytics ? 'Running workflow…' : 'Run structured analytics'}
-              </button>
-            </form>
-          ) : !capabilityError && analyticsCapabilities.length === 0 ? (
-            <p className="muted">Loading registered analytics capabilities…</p>
-          ) : !capabilityError ? (
-            <p className="muted">
-              Registered analytics capabilities are available through existing paths, but no report operation is enabled for structured workflow submission.
-            </p>
-          ) : null}
-          {selectedAnalyticsCapability && (
-            <>
-              <p className="muted">{selectedAnalyticsCapability.description}</p>
-              <details className="structured-chat-result">
-                <summary>Registered analytics capabilities ({analyticsCapabilities.length})</summary>
-                {analyticsCapabilities.map((capability) => (
-                  <article key={capability.operation}>
-                    <strong>{capability.operation}</strong>
-                    <p>{capability.description}</p>
-                    <p className="muted">
-                      {capability.source_scope} · {capability.execution_kind} · outputs:{' '}
-                      {capability.supported_outputs.join(', ')} ·{' '}
-                      {capability.workflow_report_result
-                        ? 'available in this workflow'
-                        : 'available through its existing registered path'}
-                    </p>
-                  </article>
-                ))}
-              </details>
-              <details id="analytics-parameter-schema" className="structured-chat-result">
-                <summary>Parameter schema</summary>
-                <pre>{JSON.stringify(selectedAnalyticsCapability.parameter_schema, null, 2)}</pre>
-              </details>
-            </>
-          )}
-          {analyticsExecution && (
-            <div className="structured-chat-result" aria-live="polite">
-              <strong>
-                Workflow {analyticsExecution.workflow_id}
-                {analyticsExecution.task_id && ` · task ${analyticsExecution.task_id}`}
-              </strong>
-              <p>
-                {analyticsExecution.operation.replaceAll('_', ' ')} · workflow{' '}
-                {analyticsExecution.workflow_status} · operation {analyticsExecution.task_status}
-              </p>
-              {analyticsExecution.summary && <p>{analyticsExecution.summary}</p>}
-              {analyticsExecution.error_code && (
-                <p className="conversation-error" role="alert">
-                  {analyticsExecution.error_code}
-                </p>
-              )}
-              {analyticsExecution.result && (
-                <>
-                  {analyticsExecution.source_references?.length > 0 && (
-                    <details className="structured-chat-result">
-                      <summary>Verified sources</summary>
-                      {analyticsExecution.source_references.map((source) => (
-                        <p key={`${source.dataset_id}-${source.file_id}-${source.table_index}`}>
-                          {source.alias ?? 'source'} · dataset {source.dataset_id} · file {source.file_id} ·
-                          {' '}table {source.table_index} · source {source.source_fingerprint} ·
-                          {' '}artifact {source.normalized_artifact_sha256}
-                        </p>
-                      ))}
-                    </details>
-                  )}
-                  <p className="muted">
-                    Result SHA-256 {analyticsExecution.result_sha256} · provenance{' '}
-                    {analyticsExecution.provenance.operation_id}
-                  </p>
-                  {analyticsExecution.result.summary && (
-                    <pre>{JSON.stringify(analyticsExecution.result.summary, null, 2)}</pre>
-                  )}
-                  {analyticsExecution.result.charts?.map((chart) => (
-                    <ChartCard
-                      chart={chart}
-                      key={`${chart.title}-${chart.x_field}-${chart.y_field}`}
-                    />
-                  ))}
-                  {analyticsExecution.result.findings?.slice(0, 20).map((finding) => (
-                    <p key={finding.id}>{finding.statement}</p>
-                  ))}
-                  {analyticsExecution.warnings?.map((warning, index) => (
-                    <p className="chat-warning" key={`${warning}-${index}`}>{warning}</p>
-                  ))}
-                </>
-              )}
-            </div>
-          )}
-          <section className="structured-chat-result" aria-label="Multi-operation analytics plan">
-            <h4>Multi-operation plan</h4>
-            <p className="muted">
-              Submit up to {analyticsPlanLimits?.maximum_operations ?? 5} registered evidence-report
-              operations, with dependency ordering up to {analyticsPlanLimits?.maximum_dependency_depth ?? 4}
-              {' '}operations deep. Dependencies gate execution only; report outputs cannot be passed as inputs.
-              A failed operation does not prevent unrelated operations from running.
-            </p>
-            <form className="conversation-composer" onSubmit={submitAnalyticsPlan}>
-              <label htmlFor="analytics-plan-json">Analytics plan as JSON</label>
-              <textarea
-                id="analytics-plan-json"
-                value={analyticsPlanDraft}
-                onChange={(event) => setAnalyticsPlanDraft(event.target.value)}
-                maxLength={32 * 1024}
-                rows={8}
-                spellCheck="false"
-                placeholder={'{"operations":[{"operation_id":"report","operation":"generate_evidence_report","parameters":{},"depends_on":[]}]}'
-                }
-                disabled={runningAnalyticsPlan}
-              />
-              <button
-                className="button button-primary"
-                type="submit"
-                disabled={runningAnalyticsPlan || analyticsCapabilities.length === 0}
-              >
-                {runningAnalyticsPlan ? 'Running plan…' : 'Validate and run plan'}
-              </button>
-            </form>
-            {analyticsPlanExecution && (
-              <div aria-live="polite">
-                <h5>
-                  Plan {analyticsPlanExecution.plan_id} · {analyticsPlanExecution.status}
-                </h5>
-                <p className="muted">
-                  {analyticsPlanExecution.operations.length} persisted operation(s)
-                  {analyticsPlanExecution.status === 'partial'
-                    ? ' · successful results can be saved individually'
-                    : ''}
-                </p>
-                {analyticsPlanExecution.operations.map((operation) => (
-                  <article
-                    className="structured-chat-result"
-                    aria-label={`Operation ${operation.operation_id}: ${operation.status}`}
-                    key={operation.operation_id}
-                  >
-                    <strong>
-                      {operation.operation_id} · {operation.operation.replaceAll('_', ' ')} ·{' '}
-                      {operation.status}
-                    </strong>
-                    <p className="muted">
-                      Depends on: {operation.depends_on.length
-                        ? operation.depends_on.join(', ')
-                        : 'none'}
-                    </p>
-                    {operation.error_code && (
-                      <p className="conversation-error" role="status">
-                        {operation.error_code}{operation.reason ? ` · ${operation.reason}` : ''}
-                      </p>
-                    )}
-                    {operation.result && (
-                      <>
-                        <p className="muted">
-                          Result SHA-256 {operation.result_reference?.result_sha256 ?? 'unavailable'} · provenance{' '}
-                          {operation.provenance?.operation_id ?? 'unavailable'}
-                        </p>
-                        {operation.source_references.map((source) => (
-                          <p className="muted" key={`${source.dataset_id}-${source.file_id}-${source.table_index}`}>
-                            {source.alias} · dataset {source.dataset_id} · file {source.file_id} ·
-                            {' '}table {source.table_index} · source {source.source_fingerprint} ·
-                            {' '}artifact {source.normalized_artifact_sha256}
-                          </p>
-                        ))}
-                        {operation.result.summary && (
-                          <pre>{JSON.stringify(operation.result.summary, null, 2)}</pre>
-                        )}
-                        {operation.result.charts?.map((chart) => (
-                          <ChartCard
-                            chart={chart}
-                            key={`${chart.title}-${chart.x_field}-${chart.y_field}`}
-                          />
-                        ))}
-                        {operation.result.findings?.slice(0, 20).map((finding) => (
-                          <p key={finding.id}>{finding.statement}</p>
-                        ))}
-                        {operation.warnings.map((warning, index) => (
-                          <p className="chat-warning" key={`${warning}-${index}`}>{warning}</p>
-                        ))}
-                        {operation.status === 'completed'
-                          && operation.result_reference
-                          && typeof operation.result_reference.workflow_id === 'string'
-                          && typeof operation.result_reference.task_id === 'string' && (
-                            <button
-                              className="button button-secondary"
-                              type="button"
-                              onClick={() => beginAnalyticsSave({
-                                workflow_id: operation.result_reference.workflow_id,
-                                task_id: operation.result_reference.task_id,
-                              })}
-                            >
-                              Save verified result to dashboard
-                            </button>
-                        )}
-                      </>
-                    )}
-                  </article>
-                ))}
-              </div>
-            )}
-          </section>
-        </section>
+        {saveNotice && <p className="save-notice" role="status">{saveNotice}</p>}
 
         <div className="conversation-messages" aria-live="polite">
-            {hasOlderMessages && (
-              <button className="text-button" type="button" onClick={loadOlderMessages}>
-                Load older messages
-              </button>
-            )}
+          {hasOlderMessages && (
+            <button className="text-button" type="button" onClick={loadOlderMessages}>
+              Load older messages
+            </button>
+          )}
           {!conversation && (
-            <div className="conversation-empty">
-              <h3>What would you like to understand about your data?</h3>
-              <p>Start a saved conversation. The assistant uses only available InsightOS analysis tools and reports when a model provider is unavailable.</p>
+            <div className="conversation-empty assistant-welcome-inner">
+              <div className="assistant-hero">
+                <span className="assistant-hero-mark" aria-hidden="true">✦</span>
+                <h3>What would you like to understand about your data?</h3>
+                <p>
+                  Describe what you want to achieve. InsightOS coordinates verified analysis tools,
+                  executes deterministic workflows, and explains results honestly.
+                </p>
+              </div>
+              <div className="assistant-example-goals" aria-label="Example goals">
+                {EXAMPLE_GOALS.map((goal) => (
+                  <button
+                    key={goal}
+                    className="example-goal-chip"
+                    type="button"
+                    onClick={() => setDraft(goal)}
+                  >
+                    {goal}
+                  </button>
+                ))}
+              </div>
+              <p className="muted" style={{ marginTop: '12px', fontSize: '11px' }}>
+                Start a saved conversation. The assistant uses only available InsightOS analysis tools and reports when a model provider is unavailable.
+              </p>
               <button className="button button-primary" type="button" onClick={startConversation}>
                 Start a conversation
               </button>
             </div>
           )}
           {conversation && messages.length === 0 && (
-            <p className="muted">Ask a question about your existing projects, datasets, profiles, quality reports, EDA, or schema analyses.</p>
+            <div className="conversation-empty">
+              <p className="muted">
+                Ask a question about your existing projects, datasets, profiles, quality reports, EDA, or schema analyses.
+              </p>
+              <div className="assistant-example-goals" aria-label="Example goals" style={{ marginTop: '10px' }}>
+                {EXAMPLE_GOALS.map((goal) => (
+                  <button
+                    key={goal}
+                    className="example-goal-chip"
+                    type="button"
+                    onClick={() => setDraft(goal)}
+                  >
+                    {goal}
+                  </button>
+                ))}
+              </div>
+            </div>
           )}
           {messages.map((message) => {
             const executionStatus = message.metadata?.execution_status
@@ -774,39 +660,13 @@ function ConversationWorkspace() {
                 >
                   {content}
                 </p>
-                {message.metadata?.tool_activities?.map((activity, index) => (
-                  <div className={`tool-activity tool-${activity.status}`} key={`${activity.tool_name}-${index}`}>
-                    <strong>{activity.label}</strong>
-                    <span>{activity.summary}</span>
-                  </div>
-                ))}
+                <ToolActivityTimeline activities={message.metadata?.tool_activities} />
                 {message.metadata?.structured_results?.map((result, index) => (
-                  <details className="structured-chat-result" key={`${result.tool}-${index}`}>
-                    <summary>{result.tool.replaceAll('_', ' ')} result</summary>
-                    <p>{result.summary}</p>
-                    {result.data !== null && result.data !== undefined && (
-                      <pre>{JSON.stringify(result.data, null, 2)}</pre>
-                    )}
-                    {[
-                      'generate_evidence_report',
-                      'generate_eda_evidence_report',
-                    ].includes(result.tool) && result.status === 'succeeded' && (
-                      result.references ?? []
-                    ).filter((reference) => (
-                      reference.type === 'analytics_workflow_result'
-                      && typeof reference.workflow_id === 'string'
-                      && typeof reference.task_id === 'string'
-                    )).map((reference) => (
-                      <button
-                        className="button button-secondary"
-                        type="button"
-                        key={`${reference.workflow_id}-${reference.task_id}`}
-                        onClick={() => beginAnalyticsSave(reference)}
-                      >
-                        Save verified report to dashboard
-                      </button>
-                    ))}
-                  </details>
+                  <StructuredResultCard
+                    key={`${result.tool}-${index}`}
+                    result={result}
+                    onSave={beginAnalyticsSave}
+                  />
                 ))}
                 {message.metadata?.warnings?.map((warning, index) => (
                   <p className="chat-warning" key={`${index}-${warning}`}>{warning}</p>
@@ -814,10 +674,15 @@ function ConversationWorkspace() {
               </article>
             )
           })}
-          {sending && <p className="muted" role="status">Working on your request…</p>}
+          {sending && (
+            <div className="sending-indicator" role="status">
+              <span className="sending-dot" /><span className="sending-dot" /><span className="sending-dot" />
+              <span>Working on your request…</span>
+            </div>
+          )}
+          <div ref={messagesEndRef} />
         </div>
 
-        {saveNotice && <p className="muted" role="status">{saveNotice}</p>}
         {pendingAnalyticsSave && (
           <form className="conversation-composer" onSubmit={saveAnalyticsResult}>
             <label>
@@ -871,19 +736,280 @@ function ConversationWorkspace() {
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             maxLength={8000}
-            placeholder={conversation ? 'Ask about your data…' : 'Start a conversation first…'}
-            disabled={!conversation || sending}
+            placeholder={conversation ? 'Ask about your data…' : 'Describe what you want to explore or understand…'}
+            disabled={sending}
             rows={3}
           />
           <button
             className="button button-primary"
             type="submit"
-            disabled={!conversation || !draft.trim() || sending}
+            disabled={!draft.trim() || sending}
           >
             {sending ? 'Sending…' : 'Send'}
           </button>
         </form>
-        <p className="conversation-disclaimer">Analysis results are deterministic where supported. Model-generated interpretations may be incomplete; verify results against source data.</p>
+        <p className="conversation-disclaimer">
+          Analysis results are deterministic where supported. Model-generated interpretations may be incomplete; verify results against source data.
+        </p>
+
+        {/* Advanced section for direct technical workflow execution */}
+        <details className="advanced-analytics-panel">
+          <summary>Advanced: Structured analytics workflow</summary>
+          <div className="advanced-analytics-body">
+            <section className="structured-chat-result" aria-label="Unified analytics workflow" style={{ border: 'none', padding: 0 }}>
+              <p className="muted">
+                Select a registered evidence-report operation and provide its validated parameters as JSON.
+                The operation runs through the persisted workflow system; it does not invoke a model.
+              </p>
+              {capabilityError && (
+                <p className="conversation-error" role="alert">
+                  Analytics capabilities could not be loaded: {capabilityError}
+                </p>
+              )}
+              {structuredReportCapabilities.length > 0 ? (
+                <form className="conversation-composer" onSubmit={submitStructuredAnalytics}>
+                  <label>
+                    Evidence-report operation
+                    <select
+                      value={analyticsOperation}
+                      onChange={(event) => {
+                        setAnalyticsOperation(event.target.value)
+                        setAnalyticsExecution(null)
+                        setPendingAnalyticsSave(null)
+                      }}
+                      disabled={runningAnalytics}
+                    >
+                      {structuredReportCapabilities.map((capability) => (
+                        <option key={capability.operation} value={capability.operation}>
+                          {capability.operation.replaceAll('_', ' ')}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="visually-hidden" htmlFor="analytics-parameters">
+                    Operation parameters as JSON
+                  </label>
+                  <textarea
+                    id="analytics-parameters"
+                    value={analyticsParameters}
+                    onChange={(event) => setAnalyticsParameters(event.target.value)}
+                    maxLength={4096}
+                    placeholder="Paste an object matching the selected operation schema."
+                    rows={5}
+                    spellCheck="false"
+                    aria-describedby="analytics-parameter-schema"
+                    disabled={runningAnalytics}
+                  />
+                  <button
+                    className="button button-primary"
+                    type="submit"
+                    disabled={runningAnalytics || !analyticsOperation}
+                  >
+                    {runningAnalytics ? 'Running workflow…' : 'Run structured analytics'}
+                  </button>
+                </form>
+              ) : !capabilityError && analyticsCapabilities.length === 0 ? (
+                <p className="muted">Loading registered analytics capabilities…</p>
+              ) : !capabilityError ? (
+                <p className="muted">
+                  Registered analytics capabilities are available through existing paths, but no report operation is enabled for structured workflow submission.
+                </p>
+              ) : null}
+              {selectedAnalyticsCapability && (
+                <>
+                  <p className="muted">{selectedAnalyticsCapability.description}</p>
+                  <details className="structured-chat-result">
+                    <summary>Registered analytics capabilities ({analyticsCapabilities.length})</summary>
+                    {analyticsCapabilities.map((capability) => (
+                      <article key={capability.operation}>
+                        <strong>{capability.operation}</strong>
+                        <p>{capability.description}</p>
+                        <p className="muted">
+                          {capability.source_scope} · {capability.execution_kind} · outputs:{' '}
+                          {capability.supported_outputs.join(', ')} ·{' '}
+                          {capability.workflow_report_result
+                            ? 'available in this workflow'
+                            : 'available through its existing registered path'}
+                        </p>
+                      </article>
+                    ))}
+                  </details>
+                  <details id="analytics-parameter-schema" className="structured-chat-result">
+                    <summary>Parameter schema</summary>
+                    <pre>{JSON.stringify(selectedAnalyticsCapability.parameter_schema, null, 2)}</pre>
+                  </details>
+                </>
+              )}
+              {analyticsExecution && (
+                <div className="structured-chat-result" aria-live="polite">
+                  <strong>
+                    Workflow {analyticsExecution.workflow_id}
+                    {analyticsExecution.task_id && ` · task ${analyticsExecution.task_id}`}
+                  </strong>
+                  <p>
+                    {analyticsExecution.operation.replaceAll('_', ' ')} · workflow{' '}
+                    {analyticsExecution.workflow_status} · operation {analyticsExecution.task_status}
+                  </p>
+                  {analyticsExecution.summary && <p>{analyticsExecution.summary}</p>}
+                  {analyticsExecution.error_code && (
+                    <p className="conversation-error" role="alert">
+                      {analyticsExecution.error_code}
+                    </p>
+                  )}
+                  {analyticsExecution.result && (
+                    <>
+                      {analyticsExecution.source_references?.length > 0 && (
+                        <details className="structured-chat-result">
+                          <summary>Verified sources</summary>
+                          {analyticsExecution.source_references.map((source) => (
+                            <p key={`${source.dataset_id}-${source.file_id}-${source.table_index}`}>
+                              {source.alias ?? 'source'} · dataset {source.dataset_id} · file {source.file_id} ·
+                              {' '}table {source.table_index} · source {source.source_fingerprint} ·
+                              {' '}artifact {source.normalized_artifact_sha256}
+                            </p>
+                          ))}
+                        </details>
+                      )}
+                      <p className="muted">
+                        Result SHA-256 {analyticsExecution.result_sha256} · provenance{' '}
+                        {analyticsExecution.provenance?.operation_id}
+                      </p>
+                      {analyticsExecution.result.summary && (
+                        <details className="result-technical">
+                          <summary>Summary</summary>
+                          <pre>{JSON.stringify(analyticsExecution.result.summary, null, 2)}</pre>
+                        </details>
+                      )}
+                      {analyticsExecution.result.charts?.map((chart) => (
+                        <ChartCard
+                          chart={chart}
+                          key={`${chart.title}-${chart.x_field}-${chart.y_field}`}
+                        />
+                      ))}
+                      {analyticsExecution.result.findings?.slice(0, 20).map((finding) => (
+                        <p key={finding.id}>{finding.statement}</p>
+                      ))}
+                      {analyticsExecution.warnings?.map((warning, index) => (
+                        <p className="chat-warning" key={`${warning}-${index}`}>{warning}</p>
+                      ))}
+                    </>
+                  )}
+                </div>
+              )}
+            </section>
+          </div>
+        </details>
+
+        <details className="advanced-analytics-panel">
+          <summary>Advanced: Multi-operation analytics plan</summary>
+          <div className="advanced-analytics-body">
+            <section className="structured-chat-result" aria-label="Multi-operation analytics plan" style={{ border: 'none', padding: 0 }}>
+              <p className="muted">
+                Submit up to {analyticsPlanLimits?.maximum_operations ?? 5} registered evidence-report
+                operations, with dependency ordering up to {analyticsPlanLimits?.maximum_dependency_depth ?? 4}
+                {' '}operations deep. Dependencies gate execution only; report outputs cannot be passed as inputs.
+                A failed operation does not prevent unrelated operations from running.
+              </p>
+              <form className="conversation-composer" onSubmit={submitAnalyticsPlan}>
+                <label htmlFor="analytics-plan-json">Analytics plan as JSON</label>
+                <textarea
+                  id="analytics-plan-json"
+                  value={analyticsPlanDraft}
+                  onChange={(event) => setAnalyticsPlanDraft(event.target.value)}
+                  maxLength={32 * 1024}
+                  rows={8}
+                  spellCheck="false"
+                  placeholder={'{"operations":[{"operation_id":"report","operation":"generate_evidence_report","parameters":{},"depends_on":[]}]}'}
+                  disabled={runningAnalyticsPlan}
+                />
+                <button
+                  className="button button-primary"
+                  type="submit"
+                  disabled={runningAnalyticsPlan || analyticsCapabilities.length === 0}
+                >
+                  {runningAnalyticsPlan ? 'Running plan…' : 'Validate and run plan'}
+                </button>
+              </form>
+              {analyticsPlanExecution && (
+                <div aria-live="polite">
+                  <h5>
+                    Plan {analyticsPlanExecution.plan_id} · {analyticsPlanExecution.status}
+                  </h5>
+                  <p className="muted">
+                    {analyticsPlanExecution.operations.length} persisted operation(s)
+                    {analyticsPlanExecution.status === 'partial'
+                      ? ' · successful results can be saved individually'
+                      : ''}
+                  </p>
+                  {analyticsPlanExecution.operations.map((operation) => (
+                    <article
+                      className="structured-chat-result"
+                      aria-label={`Operation ${operation.operation_id}: ${operation.status}`}
+                      key={operation.operation_id}
+                    >
+                      <strong>
+                        {operation.operation_id} · {operation.operation.replaceAll('_', ' ')} ·{' '}
+                        {operation.status}
+                      </strong>
+                      <p className="muted">
+                        Depends on: {operation.depends_on.length
+                          ? operation.depends_on.join(', ')
+                          : 'none'}
+                      </p>
+                      {operation.error_code && (
+                        <p className="conversation-error" role="status">
+                          {operation.error_code}{operation.reason ? ` · ${operation.reason}` : ''}
+                        </p>
+                      )}
+                      {operation.result && (
+                        <>
+                          <p className="muted">
+                            Result SHA-256 {operation.result_reference?.result_sha256 ?? 'unavailable'} · provenance{' '}
+                            {operation.provenance?.operation_id ?? 'unavailable'}
+                          </p>
+                          {operation.source_references.map((source) => (
+                            <p className="muted" key={`${source.dataset_id}-${source.file_id}-${source.table_index}`}>
+                              {source.alias} · dataset {source.dataset_id} · file {source.file_id} ·
+                              {' '}table {source.table_index} · source {source.source_fingerprint} ·
+                              {' '}artifact {source.normalized_artifact_sha256}
+                            </p>
+                          ))}
+                          {operation.result.charts?.map((chart) => (
+                            <ChartCard
+                              chart={chart}
+                              key={`${chart.title}-${chart.x_field}-${chart.y_field}`}
+                            />
+                          ))}
+                          {operation.result.findings?.slice(0, 20).map((finding) => (
+                            <p key={finding.id}>{finding.statement}</p>
+                          ))}
+                          {operation.warnings.map((warning, index) => (
+                            <p className="chat-warning" key={`${warning}-${index}`}>{warning}</p>
+                          ))}
+                          {operation.status === 'completed'
+                            && operation.result_reference
+                            && typeof operation.result_reference.workflow_id === 'string'
+                            && typeof operation.result_reference.task_id === 'string' && (
+                              <button
+                                className="button button-secondary"
+                                type="button"
+                                onClick={() => beginAnalyticsSave({
+                                  workflow_id: operation.result_reference.workflow_id,
+                                  task_id: operation.result_reference.task_id,
+                                })}
+                              >
+                                Save verified result to dashboard
+                              </button>
+                          )}
+                        </>
+                      )}
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
+          </div>
+        </details>
       </div>
     </section>
   )

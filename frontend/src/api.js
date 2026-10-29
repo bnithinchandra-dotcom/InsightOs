@@ -220,6 +220,25 @@ export function getAnalyticsWorkflowResult(workflowId, taskId, signal) {
 export function getAnalyticsCapabilities(signal) {
   return get('/api/v1/chat/analytics/capabilities', signal)
     .then((value) => expectObject(value, 'analytics capabilities'))
+    .catch((error) => {
+      if (error.status === 404 || error.message === 'Not Found') {
+        const enhanced = new Error(
+          'Analytics capabilities endpoint not found. Verify the backend is running and the route /api/v1/chat/analytics/capabilities is registered.',
+        )
+        enhanced.status = 404
+        enhanced.code = 'endpoint_not_found'
+        throw enhanced
+      }
+      if (error.status === 409 && error.code === 'workspace_profile_required') {
+        const enhanced = new Error(
+          'No workspace profile found. Create a local workspace profile before using analytics capabilities.',
+        )
+        enhanced.status = 409
+        enhanced.code = 'workspace_profile_required'
+        throw enhanced
+      }
+      throw error
+    })
 }
 
 export function executeAnalyticsJourney(payload, signal) {

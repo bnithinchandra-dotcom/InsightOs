@@ -1555,6 +1555,64 @@ class ConversationApiTests(unittest.TestCase):
                 self.assertNotIn("conversations", names)
                 self.assertNotIn("conversation_messages", names)
 
+    def test_analytics_capabilities_route_registered_and_available(self):
+        response = self.client.get("/api/v1/chat/analytics/capabilities")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("operations", payload)
+        self.assertIn("plan_limits", payload)
+        operations = payload["operations"]
+        self.assertIsInstance(operations, list)
+        self.assertGreater(len(operations), 0)
+        first_op = operations[0]
+        self.assertIn("operation", first_op)
+        self.assertIn("description", first_op)
+        self.assertIn("workflow_report_result", first_op)
+        self.assertEqual(payload["plan_limits"]["maximum_operations"], 5)
+        self.assertEqual(payload["plan_limits"]["maximum_dependency_depth"], 4)
+
+    def test_analytics_capabilities_without_user_returns_conflict(self):
+        with self.session_factory() as session:
+            session.query(DatasetFile).delete()
+            session.query(Dataset).delete()
+            session.query(Project).delete()
+            session.query(User).delete()
+            session.commit()
+        response = self.client.get("/api/v1/chat/analytics/capabilities")
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("workspace", str(response.json()).lower())
+
+    def test_analytics_capabilities_route_prefix_is_chat_not_root(self):
+        """Regression: endpoint must be reachable at /api/v1/chat/analytics/capabilities."""
+        wrong_path = self.client.get("/analytics/capabilities")
+        self.assertEqual(wrong_path.status_code, 404)
+
+        wrong_v1 = self.client.get("/api/v1/analytics/capabilities")
+        self.assertNotEqual(
+            wrong_v1.status_code,
+            200,
+            "Capabilities must not be reachable without /chat prefix",
+        )
+
+        correct = self.client.get("/api/v1/chat/analytics/capabilities")
+        self.assertEqual(correct.status_code, 200)
+
+    def test_analytics_capabilities_409_includes_workspace_profile_code(self):
+        """Regression: 409 response must carry workspace_profile_required error code."""
+        with self.session_factory() as session:
+            session.query(DatasetFile).delete()
+            session.query(Dataset).delete()
+            session.query(Project).delete()
+            session.query(User).delete()
+            session.commit()
+        response = self.client.get("/api/v1/chat/analytics/capabilities")
+        self.assertEqual(response.status_code, 409)
+        payload = response.json()
+        detail = payload.get("detail", {})
+        self.assertIsInstance(detail, dict)
+        self.assertEqual(detail.get("code"), "workspace_profile_required")
+        self.assertIn("message", detail)
+
 
 if __name__ == "__main__":
     unittest.main()
