@@ -6,36 +6,15 @@ import DataWorkspace from './DataWorkspace'
 import Dashboards from './Dashboards'
 import Overview from './Overview'
 import SchemaArchitect from './SchemaArchitect'
+import { ModelsAgentsPage } from './WorkspacePages'
+import { applyTheme, getThemePreference, resolveTheme, saveThemePreference } from './theme'
 import './App.css'
 import './redesign.css'
 
-const navigationGroups = [
-  {
-    label: null,
-    items: [{ id: 'overview', label: 'Overview', icon: 'grid' }],
-  },
-  {
-    label: 'Workflow',
-    items: [
-      { id: 'projects', label: 'Projects', icon: 'folder', step: '1', stage: 'Connect' },
-      { id: 'datasets', label: 'Data', icon: 'database', step: '1', stage: 'Connect' },
-      { id: 'analysis', label: 'Schema Architect', icon: 'activity', step: '2', stage: 'Understand' },
-      { id: 'chat', label: 'Assistant', icon: 'spark', step: '3', stage: 'Analyze' },
-      { id: 'dashboards', label: 'Dashboards', icon: 'chart', step: '4', stage: 'Insights' },
-    ],
-  },
-  {
-    label: 'System',
-    items: [
-      { id: 'system', label: 'System', icon: 'pulse' },
-      { id: 'settings', label: 'Settings', icon: 'settings' },
-    ],
-  },
+const navigationItems = [
+  { id: 'datasets', label: 'Datasets', icon: 'database' },
+  { id: 'dashboards', label: 'Dashboards', icon: 'chart' },
 ]
-
-const stageByPage = Object.fromEntries(
-  navigationGroups.flatMap((group) => group.items).filter((item) => item.stage).map((item) => [item.id, item.stage]),
-)
 
 const services = [
   { key: 'backend', label: 'Backend' },
@@ -47,7 +26,7 @@ const services = [
 const pageDetails = {
   chat: {
     title: 'Assistant',
-    description: 'Work with your existing projects and deterministic data-analysis capabilities.',
+    description: 'Ask questions, explore your business data, and turn evidence into decisions.',
   },
   overview: {
     title: 'Overview',
@@ -58,20 +37,28 @@ const pageDetails = {
     description: 'Organize datasets, analysis, and dashboards in one place.',
   },
   datasets: {
-    title: 'Data Workspace',
-    description: 'Bring your data into an InsightOS project and prepare it for analysis.',
+    title: 'My Data',
+    description: 'Bring your files together and choose the data you want to explore.',
   },
   data: {
-    title: 'Data Workspace',
-    description: 'Bring your data into an InsightOS project and prepare it for analysis.',
+    title: 'My Data',
+    description: 'Bring your files together and choose the data you want to explore.',
+  },
+  history: {
+    title: 'History',
+    description: 'Return to a previous conversation.',
+  },
+  models: {
+    title: 'Models & Agents',
+    description: 'Advanced status and capability information for the assistant.',
   },
   analysis: {
     title: 'Schema Architect',
     description: 'Inspect normalized dataset tables and review evidence-backed model recommendations.',
   },
   dashboards: {
-    title: 'Dashboards',
-    description: 'Build interactive analytical views from your data and insights.',
+    title: 'Dashboards & Reports',
+    description: 'Review saved reports and evidence-backed analytical views.',
   },
   system: {
     title: 'System',
@@ -90,6 +77,14 @@ function subscribeToHash(callback) {
 
 function getCurrentHash() {
   return window.location.hash.slice(1).split('?')[0].split('/')[0]
+}
+
+function getNavigationPage(page) {
+  if (['overview', 'assistant', 'chat', 'history'].includes(page)) return 'assistant'
+  if (['projects', 'datasets', 'data'].includes(page)) return 'datasets'
+  if (['dashboards', 'reports'].includes(page)) return 'dashboards'
+  if (['models', 'agents', 'models-agents', 'settings'].includes(page)) return 'settings'
+  return page
 }
 
 async function fetchSystemStatus(signal) {
@@ -112,6 +107,8 @@ function Icon({ name, size = 18 }) {
     chart: <><path d="M4 19V5M4 19h17" /><path d="m7 15 4-4 3 2 6-7" /></>,
     pulse: <><path d="M3 12h4l3-8 4 16 3-8h4" /></>,
     settings: <><circle cx="12" cy="12" r="3" /><path d="m19.4 15 .1.1 1.4 1.1-1.4 2.4-1.7-.6a8 8 0 0 1-1.6.9l-.3 1.8h-2.8l-.3-1.8a8 8 0 0 1-1.6-.9l-1.7.6-1.4-2.4 1.4-1.1a7 7 0 0 1 0-1.9l-1.4-1.1 1.4-2.4 1.7.6a8 8 0 0 1 1.6-.9l.3-1.8h2.8l.3 1.8a8 8 0 0 1 1.6.9l1.7-.6 1.4 2.4-1.4 1.1a7 7 0 0 1-.1 1.8z" transform="translate(-1 -1)" /></>,
+    history: <><path d="M3 12a9 9 0 1 0 2.6-6.4L3 8" /><path d="M3 3v5h5" /><path d="M12 7v5l3 2" /></>,
+    models: <><path d="M12 3 4 7v10l8 4 8-4V7z" /><path d="m4 7 8 4 8-4M12 11v10" /></>,
     arrow: <><path d="M5 12h14" /><path d="m13 6 6 6-6 6" /></>,
     refresh: <><path d="M20 7v5h-5" /><path d="M4 17v-5h5" /><path d="M5.6 9a7 7 0 0 1 11.6-2L20 12M4 12l2.8 5a7 7 0 0 0 11.6-2" /></>,
     spark: <><path d="m12 3 1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z" /><path d="m19 16 .9 2.1L22 19l-2.1.9L19 22l-.9-2.1L16 19l2.1-.9z" /></>,
@@ -258,14 +255,47 @@ function SystemPage({ health, systemInfo, loading, error, onRefresh }) {
   )
 }
 
-function SettingsPage({ systemInfo }) {
+function SettingsPage({ systemInfo, themePreference, onThemeChange, showModels = false }) {
   return (
     <div className="settings-grid">
       <section className="panel settings-section">
         <p className="eyebrow">Appearance</p>
         <h2>Theme</h2>
-        <div className="settings-row"><span>Color theme</span><strong>Dark</strong></div>
+        <p className="muted">Use your device preference or choose a theme. Your choice is saved on this device.</p>
+        <fieldset className="theme-choice">
+          <legend className="visually-hidden">Color theme</legend>
+          {[
+            { value: 'system', label: 'System' },
+            { value: 'light', label: 'Light' },
+            { value: 'dark', label: 'Dark' },
+          ].map((option) => (
+            <label key={option.value}>
+              <input
+                type="radio"
+                name="theme"
+                value={option.value}
+                checked={themePreference === option.value}
+                onChange={() => onThemeChange(option.value)}
+              />
+              {option.label}
+            </label>
+          ))}
+        </fieldset>
       </section>
+      <section className="panel settings-section">
+        <p className="eyebrow">Advanced tools</p>
+        <h2>Schema Architect</h2>
+        <p className="muted">Inspect dataset structure and review evidence-backed model recommendations.</p>
+        <a className="settings-advanced-link" href="#analysis">Open Schema Architect <Icon name="arrow" size={16} /></a>
+      </section>
+      <details className="panel settings-section settings-models" open={showModels}>
+        <summary>
+          <span className="eyebrow">Advanced configuration</span>
+          <strong>Models &amp; Agents</strong>
+          <span className="muted">Model status and reported assistant capabilities.</span>
+        </summary>
+        <ModelsAgentsPage />
+      </details>
       <section className="panel settings-section">
         <p className="eyebrow">Application</p>
         <h2>Environment</h2>
@@ -283,23 +313,42 @@ function SettingsPage({ systemInfo }) {
 }
 
 function PageContent({ page, props }) {
-  if (page === 'chat') return <ConversationWorkspace />
   if (page === 'overview') return <Overview {...props} />
   if (page === 'projects' || page === 'datasets' || page === 'data') {
     return <DataWorkspace page={page === 'projects' ? 'projects' : 'datasets'} />
+  }
+  if (page === 'history') return null
+  if (page === 'models') {
+    return (
+      <SettingsPage
+        systemInfo={props.systemInfo}
+        themePreference={props.themePreference}
+        onThemeChange={props.onThemeChange}
+        showModels
+      />
+    )
   }
   if (page === 'analysis') {
     return <SchemaArchitect />
   }
   if (page === 'dashboards') return <Dashboards />
   if (page === 'system') return <SystemPage {...props} />
-  return <SettingsPage systemInfo={props.systemInfo} />
+  return (
+    <SettingsPage
+      systemInfo={props.systemInfo}
+      themePreference={props.themePreference}
+      onThemeChange={props.onThemeChange}
+    />
+  )
 }
 
 function App() {
   const currentHash = useSyncExternalStore(subscribeToHash, getCurrentHash, () => '')
-  const page = pageDetails[currentHash] ? currentHash : 'overview'
+  const page = pageDetails[currentHash] ? currentHash : 'chat'
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(true)
+  const [themePreference, setThemePreference] = useState(getThemePreference)
+  const [selectedConversationId, setSelectedConversationId] = useState(null)
   const [health, setHealth] = useState('loading')
   const [systemInfo, setSystemInfo] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -323,6 +372,20 @@ function App() {
       if (!signal?.aborted) setLoading(false)
     }
   }, [])
+
+  useEffect(() => {
+    const media = window.matchMedia?.('(prefers-color-scheme: dark)')
+    const applyPreference = () => applyTheme(resolveTheme(themePreference, Boolean(media?.matches)))
+    applyPreference()
+    saveThemePreference(themePreference)
+    if (themePreference !== 'system' || !media) return undefined
+    if (media.addEventListener) media.addEventListener('change', applyPreference)
+    else media.addListener?.(applyPreference)
+    return () => {
+      if (media.removeEventListener) media.removeEventListener('change', applyPreference)
+      else media.removeListener?.(applyPreference)
+    }
+  }, [themePreference])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -349,16 +412,34 @@ function App() {
   }
 
   const details = pageDetails[page] ?? pageDetails.overview
+  const activeNavigationPage = getNavigationPage(page)
+  const assistantPage = ['chat', 'history', 'overview', 'assistant'].includes(page)
   const navProps = (item) => ({
     href: `#${item.id}`,
-    className: `nav-link ${page === item.id ? 'active' : ''}`,
+    className: `nav-link ${activeNavigationPage === item.id ? 'active' : ''}`,
     onClick: () => navigate(item.id),
-    'aria-current': page === item.id ? 'page' : undefined,
+    'aria-current': activeNavigationPage === item.id ? 'page' : undefined,
+    title: sidebarCollapsed ? item.label : undefined,
   })
-  const pageProps = { health, systemInfo, loading, error, onRefresh: () => refreshStatus() }
+  const pageProps = {
+    health,
+    systemInfo,
+    loading,
+    error,
+    onRefresh: () => refreshStatus(),
+    themePreference,
+    onThemeChange: setThemePreference,
+    selectedConversationId,
+    setSelectedConversationId,
+    onNewConversation: () => setSelectedConversationId(null),
+    onSelectConversation: (id) => {
+      setSelectedConversationId(id)
+      window.location.hash = '#chat'
+    },
+  }
 
   return (
-    <div className="app-layout">
+    <div className={`app-layout ${assistantPage ? 'assistant-active' : ''} ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${mobileNavOpen ? 'mobile-nav-open' : ''}`}>
       <button
         className={`mobile-scrim ${mobileNavOpen ? 'visible' : ''}`}
         type="button"
@@ -366,29 +447,43 @@ function App() {
         onClick={() => setMobileNavOpen(false)}
       />
       <aside className={`sidebar ${mobileNavOpen ? 'open' : ''}`}>
-        <a className="brand" href="#overview" onClick={() => navigate('overview')}>
+        <div className="sidebar-brand-row">
+        <a className="brand" href="#chat" onClick={() => navigate('chat')}>
           <span className="brand-mark">I</span>
           <span><strong>InsightOS</strong><small>Data intelligence</small></span>
         </a>
+        <button
+          className="sidebar-collapse-button"
+          type="button"
+          aria-label={sidebarCollapsed ? 'Expand navigation' : 'Collapse navigation'}
+          aria-expanded={!sidebarCollapsed}
+          onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}
+        >
+          <Icon name="arrow" size={16} />
+        </button>
+        </div>
         <div className="workspace-switcher">
           <span className="workspace-avatar">W</span>
           <span><strong>My workspace</strong><small>Personal workspace</small></span>
-          <span className="switcher-caret">⌄</span>
         </div>
         <nav className="navigation" aria-label="Main navigation">
-          {navigationGroups.map((group, index) => (
-            <div className="nav-group" key={group.label ?? index}>
-              {group.label && <span className="nav-group-label">{group.label}</span>}
-              {group.items.map((item) => (
-                <a key={item.id} {...navProps(item)}>
-                  <Icon name={item.icon} />
-                  <span>{item.label}</span>
-                  {item.step && <span className="nav-step" aria-hidden="true">{item.step}</span>}
-                </a>
-              ))}
-            </div>
+          {navigationItems.map((item) => (
+            <a key={item.id} {...navProps(item)}>
+              <Icon name={item.icon} />
+              <span>{item.label}</span>
+            </a>
           ))}
         </nav>
+        <details className="sidebar-settings-menu">
+          <summary>
+            <Icon name="settings" />
+            <span>Settings</span>
+          </summary>
+          <div className="sidebar-settings-links">
+            <a href="#settings" onClick={() => navigate('settings')}>Preferences</a>
+            <a href="#models" onClick={() => navigate('models')}>Models &amp; Agents</a>
+          </div>
+        </details>
         <div className="sidebar-footer">
           <span className={`status-dot dot-${health}`} />
           <span>{health === 'healthy' ? 'All systems operational' : health === 'loading' ? 'Checking system status' : 'System status unavailable'}</span>
@@ -401,7 +496,7 @@ function App() {
             <span /><span /><span />
           </button>
           <div className="breadcrumb">
-            {stageByPage[page] ? <span className="stage-chip">{stageByPage[page]}</span> : <span>Workspace</span>}
+            <span className="breadcrumb-product">InsightOS</span>
             <span className="breadcrumb-divider">/</span><strong>{details.title}</strong>
           </div>
           <div className="topbar-actions">
@@ -414,22 +509,43 @@ function App() {
           </div>
         </header>
 
-        <main className="main-content">
-          {page !== 'overview' && (
-          <PageHeader title={details.title} description={details.description} stage={stageByPage[page]}>
-            {page === 'system' && (
-              <button className="button button-secondary" type="button" onClick={pageProps.onRefresh}>
-                <Icon name="refresh" size={16} /> Refresh status
-              </button>
-            )}
-          </PageHeader>
+        <main className={`main-content ${assistantPage ? 'assistant-page-content' : ''}`}>
+          <div className="assistant-instance" hidden={!assistantPage}>
+            <ConversationWorkspace
+              selectedConversationId={selectedConversationId}
+              onNewConversation={pageProps.onNewConversation}
+              onSelectConversation={pageProps.onSelectConversation}
+              onCloseHistory={() => { window.location.hash = '#chat' }}
+              historyOpenInitially={page === 'history'}
+              active={assistantPage}
+            />
+          </div>
+          {!assistantPage && (
+            <>
+              <PageHeader title={details.title} description={details.description}>
+                {page === 'system' && (
+                  <button className="button button-secondary" type="button" onClick={pageProps.onRefresh}>
+                    <Icon name="refresh" size={16} /> Refresh status
+                  </button>
+                )}
+              </PageHeader>
+              <PageContent page={page} props={{ ...pageProps, navigate }} />
+            </>
           )}
-          <PageContent page={page} props={{ ...pageProps, navigate }} />
         </main>
-        <footer className="app-footer">
-          <span>InsightOS</span><span>Foundation stage</span>
-        </footer>
+        {!assistantPage && (
+          <footer className="app-footer">
+            <span>InsightOS</span><span>Foundation stage</span>
+          </footer>
+        )}
       </div>
+      <nav className="mobile-navigation" aria-label="Primary navigation">
+        {navigationItems.map((item) => (
+          <a key={item.id} {...navProps(item)} onClick={() => navigate(item.id)}>
+            <Icon name={item.icon} size={19} /><span>{item.label}</span>
+          </a>
+        ))}
+      </nav>
     </div>
   )
 }

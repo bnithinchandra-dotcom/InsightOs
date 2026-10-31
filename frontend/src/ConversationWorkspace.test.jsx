@@ -116,16 +116,38 @@ describe('conversation workspace', () => {
   it('creates a conversation, sends a message, and displays the persisted result', async () => {
     render(<ConversationWorkspace />)
     expect(await screen.findByText('Provider is not configured.')).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'Start a conversation' }))
-    expect(await screen.findByText('Ask a question about your existing projects, datasets, profiles, quality reports, EDA, or schema analyses.')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'New conversation' }))
+    expect(await screen.findByRole('heading', { name: "Your business has a story. Let's uncover it." })).toBeTruthy()
+
+    fireEvent.change(document.querySelector('input[type="file"]'), {
+      target: { files: [new File(['a,b'], 'sales.csv', { type: 'text/csv' })] },
+    })
+    expect(screen.getByText(/selected on this device only/)).toBeTruthy()
 
     const input = screen.getByLabelText('Your message')
     fireEvent.change(input, { target: { value: 'Show my profile' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
 
     expect(await screen.findByText('The stored profile is ready.')).toBeTruthy()
+    expect(screen.queryByLabelText('Visualization Canvas')).toBeNull()
     expect(screen.getByText('Reviewing a data profile')).toBeTruthy()
+    const sentRequest = globalThis.fetch.mock.calls.find(([url]) => (
+      new URL(String(url), window.location.origin).pathname
+      === `/api/v1/chat/conversations/${conversation.id}/messages`
+    ))
+    expect(JSON.parse(sentRequest[1].body)).toEqual({ content: 'Show my profile' })
     expect(input.value).toBe('')
+  })
+
+  it('loads a conversation selected from History', async () => {
+    render(<ConversationWorkspace selectedConversationId={conversation.id} />)
+
+    expect(await screen.findByRole('heading', { name: 'Summarize data' })).toBeTruthy()
+    const request = globalThis.fetch.mock.calls.find(([url]) => (
+      new URL(String(url), window.location.origin).pathname
+      === `/api/v1/chat/conversations/${conversation.id}`
+    ))
+    expect(request).toBeTruthy()
   })
 
   it('creates a dashboard and saves a completed Assistant report by reference', async () => {
@@ -225,11 +247,11 @@ describe('conversation workspace', () => {
     })
 
     render(<ConversationWorkspace />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Start a conversation' }))
-    await screen.findByText('Ask a question about your existing projects, datasets, profiles, quality reports, EDA, or schema analyses.')
+    fireEvent.click(await screen.findByRole('button', { name: 'New conversation' }))
+    await screen.findByRole('heading', { name: "Your business has a story. Let's uncover it." })
     const input = screen.getByLabelText('Your message')
     fireEvent.change(input, { target: { value: 'Save the report' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
 
     expect(await screen.findByText('The verified report is ready.')).toBeTruthy()
     fireEvent.click(screen.getByText('generate evidence report result'))
@@ -593,12 +615,15 @@ describe('conversation workspace', () => {
 
   it('preserves the draft and reports an API error', async () => {
     render(<ConversationWorkspace />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Start a conversation' }))
-    await screen.findByText('Ask a question about your existing projects, datasets, profiles, quality reports, EDA, or schema analyses.')
-    globalThis.fetch.mockImplementation(async (input) => {
+    fireEvent.click(await screen.findByRole('button', { name: 'New conversation' }))
+    await screen.findByRole('heading', { name: "Your business has a story. Let's uncover it." })
+    globalThis.fetch.mockImplementation(async (input, options = {}) => {
       const url = new URL(String(input), window.location.origin)
       if (url.pathname === `/api/v1/chat/conversations/${conversation.id}/messages`) {
         return jsonResponse({ detail: 'A response is already being generated.' }, 409)
+      }
+      if (url.pathname === '/api/v1/chat/conversations' && options.method === 'POST') {
+        return jsonResponse(conversation, 201)
       }
       if (url.pathname === '/api/v1/chat/conversations') return jsonResponse([])
       if (url.pathname === '/api/v1/chat/provider-status') {
@@ -616,7 +641,7 @@ describe('conversation workspace', () => {
 
     const input = screen.getByLabelText('Your message')
     fireEvent.change(input, { target: { value: 'Keep this draft' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
 
     expect((await screen.findByRole('alert')).textContent).toContain('A response is already being generated.')
     await waitFor(() => expect(input.value).toBe('Keep this draft'))
@@ -678,20 +703,20 @@ describe('conversation workspace', () => {
     })
 
     render(<ConversationWorkspace />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Start a conversation' }))
-    await screen.findByText('Ask a question about your existing projects, datasets, profiles, quality reports, EDA, or schema analyses.')
+    fireEvent.click(await screen.findByRole('button', { name: 'New conversation' }))
+    await screen.findByRole('heading', { name: "Your business has a story. Let's uncover it." })
 
     const input = screen.getByLabelText('Your message')
     fireEvent.change(input, { target: { value: '10+10' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
 
     const failure = await screen.findByRole('alert')
     expect(failure.textContent).toContain('returned an empty response')
     expect(input.value).toBe('')
-    expect(screen.getByRole('button', { name: 'Send' }).disabled).toBe(true)
+    expect(screen.getByRole('button', { name: 'Send message' }).disabled).toBe(true)
 
     fireEvent.change(input, { target: { value: 'Try again: 10+10' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
 
     expect(await screen.findByText('20')).toBeTruthy()
     expect(screen.getAllByRole('alert')).toHaveLength(1)
@@ -730,7 +755,11 @@ describe('conversation workspace', () => {
     fireEvent.change(await screen.findByLabelText(/Dataset context/), {
       target: { value: '42' },
     })
-    fireEvent.click(screen.getByRole('button', { name: 'New chat' }))
+    fireEvent.click(screen.getByRole('button', { name: 'New conversation' }))
+    fireEvent.change(screen.getByLabelText('Your message'), {
+      target: { value: 'Summarize this dataset' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
 
     await waitFor(() => expect(createPayloads).toEqual([{
       project_id: 31,
@@ -795,13 +824,94 @@ it('displays human-readable error when analytics capabilities return 404', async
     })
 
     render(<ConversationWorkspace />)
-    expect(await screen.findByText('What would you like to understand about your data?')).toBeTruthy()
-    const chip = screen.getByRole('button', { name: 'Explore my dataset with EDA' })
+    expect(await screen.findByRole('heading', { name: "Your business has a story. Let's uncover it." })).toBeTruthy()
+    expect(screen.queryByLabelText('Saved conversations')).toBeNull()
+    expect(globalThis.fetch.mock.calls.some(([input, options]) => (
+      new URL(String(input), window.location.origin).pathname === '/api/v1/chat/conversations'
+      && options?.method !== 'POST'
+    ))).toBe(false)
+    const chip = screen.getByRole('button', { name: 'Which products generate the most revenue?' })
     expect(chip).toBeTruthy()
     fireEvent.click(chip)
 
     const textarea = screen.getByLabelText('Your message')
-    expect(textarea.value).toBe('Explore my dataset with EDA')
+    expect(textarea.value).toBe('Which products generate the most revenue?')
+  })
+
+  it('switches to visualization mode only when the persisted assistant result contains a chart', async () => {
+    const defaultFetch = globalThis.fetch.getMockImplementation()
+    globalThis.fetch.mockImplementation(async (input, options = {}) => {
+      const url = new URL(String(input), window.location.origin)
+      if (url.pathname === `/api/v1/chat/conversations/${conversation.id}/messages`) {
+        return jsonResponse({
+          conversation,
+          user_message: {
+            id: 32,
+            sequence: 1,
+            role: 'user',
+            content: 'I need help understanding this.',
+            created_at: '2026-10-19T10:01:00',
+          },
+          assistant_message: {
+            id: 33,
+            sequence: 2,
+            role: 'assistant',
+            content: 'Here is the persisted result.',
+            metadata: {
+              execution_status: 'completed',
+              tool_activities: [],
+              structured_results: [{
+                tool: 'generate_evidence_report',
+                status: 'succeeded',
+                summary: 'Monthly revenue',
+                data: {
+                  charts: [{
+                    title: 'Monthly revenue',
+                    chart_type: 'bar',
+                    x_field: 'month',
+                    y_field: 'revenue',
+                    data: {
+                      labels: ['Jan'],
+                      series: [{ name: 'Revenue', values: [12] }],
+                    },
+                  }],
+                  findings: [],
+                },
+                references: [],
+              }],
+              warnings: [],
+            },
+            created_at: '2026-10-19T10:01:01',
+          },
+          execution_status: 'completed',
+          tool_activities: [],
+          structured_results: [],
+          warnings: [],
+          error_code: null,
+        })
+      }
+      return defaultFetch(input, options)
+    })
+
+    render(<ConversationWorkspace />)
+    fireEvent.change(await screen.findByLabelText('Your message'), {
+      target: { value: 'I need help understanding this.' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+
+    expect(await screen.findByLabelText('Visualization Canvas')).toBeTruthy()
+    expect(screen.getAllByRole('heading', { name: 'Monthly revenue' }).length).toBeGreaterThan(0)
+    fireEvent.click(screen.getByRole('button', { name: 'Conversation' }))
+    expect(screen.queryByLabelText('Visualization Canvas')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Open workspace' }))
+    expect(screen.getByLabelText('Visualization Canvas')).toBeTruthy()
+    expect(screen.getAllByRole('heading', { name: 'Monthly revenue' }).length).toBeGreaterThan(0)
+  })
+
+  it('opens conversation history inside the assistant workspace', async () => {
+    render(<ConversationWorkspace />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Conversation history' }))
+    expect(await screen.findByRole('dialog', { name: 'Conversation history' })).toBeTruthy()
+    expect(screen.getByText('Your conversations will appear here.')).toBeTruthy()
   })
 })
-

@@ -8,24 +8,79 @@ import {
   getDashboards,
   getChatProviderStatus,
   getConversation,
-  getConversations,
   getProjectDatasets,
   getProjects,
   saveAnalyticsResultToDashboard,
   sendConversationMessage,
 } from './api'
 import { ChartCard } from './Dashboards'
+import ConversationComposer from './ConversationComposer'
+import DataExplorer from './DataExplorer'
+import VisualizationCanvas from './VisualizationCanvas'
+import { HistoryPage } from './WorkspacePages'
 
-const CONVERSATION_PAGE_SIZE = 25
 const MESSAGE_PAGE_SIZE = 25
 
 const EXAMPLE_GOALS = [
-  'Explore my dataset with EDA',
-  'Run a data quality check',
-  'Generate an evidence report',
-  'Check forecasting suitability',
-  'Summarize my project datasets',
+  'Analyze my sales performance.',
+  'Which products generate the most revenue?',
+  'Why did revenue decrease?',
+  "Forecast my next month's sales.",
 ]
+
+const REPORT_TOOLS = new Set([
+  'generate_evidence_report',
+  'generate_eda_evidence_report',
+])
+
+function toVisualizationArtifact(id, tool, data, summary, references = [], warnings = []) {
+  const charts = Array.isArray(data?.charts) ? data.charts : []
+  const findings = Array.isArray(data?.findings) ? data.findings : []
+  if (!charts.length && !(REPORT_TOOLS.has(tool) && findings.length)) return null
+
+  const reference = references.find((item) => (
+    item.type === 'analytics_workflow_result'
+    && typeof item.workflow_id === 'string'
+    && typeof item.task_id === 'string'
+  ))
+  return {
+    id,
+    kind: tool.replaceAll('_', ' '),
+    title: typeof summary === 'string' && summary.trim()
+      ? summary
+      : tool.replaceAll('_', ' '),
+    summary: typeof data?.summary === 'string' ? data.summary : '',
+    charts,
+    findings,
+    warnings: Array.isArray(warnings) ? warnings : [],
+    reference,
+  }
+}
+
+function artifactsFromMessages(items) {
+  return items.flatMap((message) => {
+    if (message.role !== 'assistant') return []
+    return (message.metadata?.structured_results ?? []).flatMap((result, index) => {
+      if (result.status === 'failed' || result.status === 'blocked') return []
+      const artifact = toVisualizationArtifact(
+        `message-${message.id}-${index}`,
+        result.tool ?? 'assistant result',
+        result.data,
+        result.summary,
+        result.references,
+        result.warnings,
+      )
+      return artifact ? [artifact] : []
+    })
+  })
+}
+
+function mergeArtifacts(current, incoming) {
+  if (!incoming.length) return current
+  const merged = new Map(current.map((artifact) => [artifact.id, artifact]))
+  incoming.forEach((artifact) => merged.set(artifact.id, artifact))
+  return [...merged.values()]
+}
 
 function validateAnalyticsPlanDraft(plan, capabilities, limits) {
   if (!plan || typeof plan !== 'object' || Array.isArray(plan)) {
@@ -129,7 +184,7 @@ function ToolActivityTimeline({ activities }) {
   )
 }
 
-function StructuredResultCard({ result, onSave }) {
+function StructuredResultCard({ result, onSave, showCharts = true }) {
   const [expanded, setExpanded] = useState(false)
   const isReport = ['generate_evidence_report', 'generate_eda_evidence_report'].includes(result.tool)
   const saveRefs = isReport && result.status === 'succeeded'
@@ -145,10 +200,10 @@ function StructuredResultCard({ result, onSave }) {
     <details className="structured-chat-result result-card" open>
       <summary>{result.tool.replaceAll('_', ' ')} result</summary>
       {result.summary && <p className="result-card-summary">{result.summary}</p>}
-      {result.data?.charts?.map((chart) => (
+      {showCharts && result.data?.charts?.map((chart) => (
         <ChartCard chart={chart} key={`${chart.title}-${chart.x_field}-${chart.y_field}`} />
       ))}
-      {result.data?.findings?.slice(0, 10).map((finding) => (
+      {showCharts && result.data?.findings?.slice(0, 10).map((finding) => (
         <p className="result-finding" key={finding.id ?? finding.statement}>{finding.statement}</p>
       ))}
       {saveRefs.map((reference) => (
@@ -171,12 +226,23 @@ function StructuredResultCard({ result, onSave }) {
   )
 }
 
-function ConversationWorkspace() {
-  const [conversations, setConversations] = useState([])
-  const [conversationOffset, setConversationOffset] = useState(0)
-  const [hasMoreConversations, setHasMoreConversations] = useState(false)
+function ConversationWorkspace({
+  selectedConversationId = null,
+  onNewConversation,
+  onSelectConversation,
+  onCloseHistory,
+  historyOpenInitially = false,
+  active = true,
+}) {
   const [conversation, setConversation] = useState(null)
   const [messages, setMessages] = useState([])
+  const [workspaceMode, setWorkspaceMode] = useState('conversation')
+  const [workspaceArtifacts, setWorkspaceArtifacts] = useState([])
+  const [activeVisualizationId, setActiveVisualizationId] = useState('')
+  const [dataExplorerOpen, setDataExplorerOpen] = useState(true)
+  const [selectedTable, setSelectedTable] = useState(null)
+  const [mobilePanel, setMobilePanel] = useState('assistant')
+  const [historyOpen, setHistoryOpen] = useState(false)
   const [hasOlderMessages, setHasOlderMessages] = useState(false)
   const [projects, setProjects] = useState([])
   const [datasets, setDatasets] = useState([])
@@ -204,25 +270,18 @@ function ConversationWorkspace() {
   const [analyticsPlanLimits, setAnalyticsPlanLimits] = useState(null)
   const [capabilityError, setCapabilityError] = useState('')
   const messagesEndRef = useRef(null)
-
-  const loadConversations = useCallback(async (offset = 0, append = false) => {
-    const items = await getConversations({ limit: CONVERSATION_PAGE_SIZE, offset })
-    setConversations((current) => append ? [...current, ...items] : items)
-    setConversationOffset(offset + items.length)
-    setHasMoreConversations(items.length === CONVERSATION_PAGE_SIZE)
-  }, [])
+  const composerInputRef = useRef(null)
+  const requestedConversationId = useRef(null)
+  const conversationRequestToken = useRef(0)
 
   useEffect(() => {
+    if (!active) return undefined
     const controller = new AbortController()
     Promise.all([
-      getConversations({ limit: CONVERSATION_PAGE_SIZE, signal: controller.signal }),
       getChatProviderStatus(controller.signal),
       getProjects(controller.signal),
     ])
-      .then(([items, status, projectItems]) => {
-        setConversations(items)
-        setConversationOffset(items.length)
-        setHasMoreConversations(items.length === CONVERSATION_PAGE_SIZE)
+      .then(([status, projectItems]) => {
         setProviderStatus(status)
         setProjects(projectItems)
       })
@@ -233,9 +292,10 @@ function ConversationWorkspace() {
         if (!controller.signal.aborted) setLoading(false)
       })
     return () => controller.abort()
-  }, [])
+  }, [active])
 
   useEffect(() => {
+    if (!active) return undefined
     const controller = new AbortController()
     getAnalyticsCapabilities(controller.signal)
       .then((response) => {
@@ -251,10 +311,10 @@ function ConversationWorkspace() {
         }
       })
     return () => controller.abort()
-  }, [])
+  }, [active])
 
   useEffect(() => {
-    if (!projectId) return undefined
+    if (!active || !projectId) return undefined
     const controller = new AbortController()
     getProjectDatasets(projectId, controller.signal)
       .then((items) => setDatasets(items))
@@ -262,7 +322,7 @@ function ConversationWorkspace() {
         if (requestError.name !== 'AbortError') setError(requestError.message)
       })
     return () => controller.abort()
-  }, [projectId])
+  }, [active, projectId])
 
   useEffect(() => {
     if (typeof messagesEndRef.current?.scrollIntoView === 'function' && messages.length > 0) {
@@ -270,7 +330,8 @@ function ConversationWorkspace() {
     }
   }, [messages])
 
-  async function openConversation(id) {
+  const openConversation = useCallback(async (id) => {
+    const requestToken = ++conversationRequestToken.current
     setError('')
     try {
       const result = await getConversation(id, { limit: MESSAGE_PAGE_SIZE })
@@ -281,15 +342,34 @@ function ConversationWorkspace() {
           offset: result.total_messages - MESSAGE_PAGE_SIZE,
         })
       }
+      if (requestToken !== conversationRequestToken.current) return
       setConversation(result)
       setMessages(page.messages ?? [])
+      const artifacts = artifactsFromMessages(page.messages ?? [])
+      setWorkspaceArtifacts(artifacts)
+      setActiveVisualizationId(artifacts[artifacts.length - 1]?.id ?? '')
+      setWorkspaceMode(artifacts.length ? 'visualization' : 'conversation')
+      setSelectedTable(null)
+      setMobilePanel(artifacts.length ? 'canvas' : 'assistant')
       setHasOlderMessages((page.offset ?? 0) > 0)
       setProjectId(result.project_id ? String(result.project_id) : '')
       setDatasetId(result.dataset_id ? String(result.dataset_id) : '')
     } catch (requestError) {
-      setError(requestError.message)
+      if (requestToken === conversationRequestToken.current) setError(requestError.message)
     }
-  }
+  }, [])
+
+  useEffect(() => {
+    if (
+      active
+      &&
+      selectedConversationId
+      && String(requestedConversationId.current) !== String(selectedConversationId)
+    ) {
+      requestedConversationId.current = selectedConversationId
+      openConversation(selectedConversationId)
+    }
+  }, [active, openConversation, selectedConversationId])
 
   async function startConversation() {
     setError('')
@@ -301,7 +381,6 @@ function ConversationWorkspace() {
       setConversation(created)
       setMessages([])
       setHasOlderMessages(false)
-      setConversations((current) => [created, ...current.filter((item) => item.id !== created.id)])
       return created
     } catch (requestError) {
       setError(requestError.message)
@@ -309,13 +388,22 @@ function ConversationWorkspace() {
     }
   }
 
-  async function loadMoreConversations() {
+  function startNewConversation() {
+    conversationRequestToken.current += 1
+    requestedConversationId.current = null
+    setConversation(null)
+    setMessages([])
+    setWorkspaceMode('conversation')
+    setWorkspaceArtifacts([])
+    setActiveVisualizationId('')
+    setSelectedTable(null)
+    setMobilePanel('assistant')
+    setHasOlderMessages(false)
+    setDraft('')
     setError('')
-    try {
-      await loadConversations(conversationOffset, true)
-    } catch (requestError) {
-      setError(requestError.message)
-    }
+    setSaveNotice('')
+    setPendingAnalyticsSave(null)
+    onNewConversation?.()
   }
 
   async function loadOlderMessages() {
@@ -327,6 +415,12 @@ function ConversationWorkspace() {
         limit: MESSAGE_PAGE_SIZE,
         offset,
       })
+      const olderArtifacts = artifactsFromMessages(page.messages ?? [])
+      setWorkspaceArtifacts((current) => mergeArtifacts(current, olderArtifacts))
+      if (!workspaceArtifacts.length && olderArtifacts.length) {
+        setActiveVisualizationId(olderArtifacts[olderArtifacts.length - 1].id)
+        setWorkspaceMode('visualization')
+      }
       setMessages((current) => [...page.messages, ...current])
       setHasOlderMessages(offset > 0)
     } catch (requestError) {
@@ -355,14 +449,17 @@ function ConversationWorkspace() {
         response.user_message,
         response.assistant_message,
       ]
+      const artifacts = artifactsFromMessages([response.assistant_message])
+      setWorkspaceArtifacts((current) => mergeArtifacts(current, artifacts))
+      if (artifacts.length) {
+        setActiveVisualizationId(artifacts[artifacts.length - 1].id)
+        setWorkspaceMode('visualization')
+        setMobilePanel('canvas')
+      }
       setMessages(nextMessages.slice(-MESSAGE_PAGE_SIZE))
       setHasOlderMessages(
         nextMessages.length > MESSAGE_PAGE_SIZE || nextMessages[0].sequence > 1,
       )
-      setConversations((current) => [
-        response.conversation,
-        ...current.filter((item) => item.id !== response.conversation.id),
-      ])
       setDraft('')
     } catch (requestError) {
       setError(requestError.message)
@@ -445,6 +542,20 @@ function ConversationWorkspace() {
         parameters,
       })
       setAnalyticsExecution(result)
+      const artifact = toVisualizationArtifact(
+        `workflow-${result.workflow_id}-${result.task_id}`,
+        analyticsOperation,
+        result.result,
+        result.result?.title ?? analyticsOperation,
+        result.references,
+        result.warnings,
+      )
+      if (artifact) {
+        setWorkspaceArtifacts((current) => mergeArtifacts(current, [artifact]))
+        setActiveVisualizationId(artifact.id)
+        setWorkspaceMode('visualization')
+        setMobilePanel('canvas')
+      }
       if (
         result.workflow_status === 'completed'
         && result.task_status === 'completed'
@@ -488,6 +599,30 @@ function ConversationWorkspace() {
     try {
       const result = await executeAnalyticsPlan(plan)
       setAnalyticsPlanExecution(result)
+      const artifacts = (result.operations ?? []).flatMap((operation) => {
+        if (!operation.result) return []
+        const artifact = toVisualizationArtifact(
+          `plan-${result.plan_id}-${operation.operation_id}`,
+          operation.operation,
+          operation.result,
+          operation.result.title ?? operation.operation.replaceAll('_', ' '),
+          operation.result_reference
+            ? [{
+                type: 'analytics_workflow_result',
+                workflow_id: operation.result_reference.workflow_id,
+                task_id: operation.result_reference.task_id,
+              }]
+            : [],
+          operation.warnings,
+        )
+        return artifact ? [artifact] : []
+      })
+      if (artifacts.length) {
+        setWorkspaceArtifacts((current) => mergeArtifacts(current, artifacts))
+        setActiveVisualizationId(artifacts[artifacts.length - 1].id)
+        setWorkspaceMode('visualization')
+        setMobilePanel('canvas')
+      }
     } catch (requestError) {
       setError(requestError.message)
     } finally {
@@ -502,66 +637,118 @@ function ConversationWorkspace() {
     (item) => item.operation === analyticsOperation,
   )
 
-  const selectedProject = projects.find((item) => item.id === projectId)
-  const selectedDataset = datasets.find((item) => item.id === datasetId)
   const lastAssistant = [...messages].reverse().find((item) => item.role === 'assistant')
   const lastSteps = lastAssistant?.metadata?.tool_activities ?? []
   const stepsSucceeded = lastSteps.filter((step) => step.status === 'succeeded').length
   const stepsFailed = lastSteps.filter((step) => step.status === 'failed').length
   const providerLabel = providerStatus ? providerStatus.status.replaceAll('_', ' ') : 'checking'
+  const showHistory = historyOpen || historyOpenInitially
+  const closeHistory = () => {
+    if (historyOpenInitially) onCloseHistory?.()
+    setHistoryOpen(false)
+  }
+
+  if (!active) return null
 
   return (
-    <section className="conversation-workspace panel" aria-label="InsightOS assistant">
-      <aside className="conversation-sidebar">
-        <div className="conversation-sidebar-heading">
-          <h2>Conversations</h2>
-          <button className="button button-secondary" type="button" onClick={startConversation}>
-            New chat
-          </button>
-        </div>
-        <div className="conversation-list" aria-label="Saved conversations">
-          {loading && <p className="muted">Loading conversations…</p>}
-          {!loading && conversations.length === 0 && (
-            <p className="muted">Your saved conversations will appear here.</p>
-          )}
-          {conversations.map((item) => (
-            <button
-              className={`conversation-list-item ${conversation?.id === item.id ? 'selected' : ''}`}
-              key={item.id}
-              type="button"
-              onClick={() => openConversation(item.id)}
-            >
-              <strong>{item.title}</strong>
-              <small>{item.status}</small>
-            </button>
-          ))}
-          {hasMoreConversations && (
-            <button className="text-button" type="button" onClick={loadMoreConversations}>
-              Load more conversations
-            </button>
-          )}
-        </div>
-      </aside>
-
+    <section
+      className={`conversation-workspace ${workspaceMode === 'visualization' ? 'is-visualization' : ''} ${workspaceMode === 'visualization' && !dataExplorerOpen ? 'is-data-hidden' : ''}`}
+      data-mobile-panel={mobilePanel}
+      aria-label="InsightOS assistant"
+      aria-busy={loading}
+    >
+      <DataExplorer
+        key={`scope-${projectId}-${datasetId}`}
+        projects={projects}
+        datasets={datasets}
+        projectId={projectId}
+        datasetId={datasetId}
+        conversationActive={Boolean(conversation)}
+        active={workspaceMode === 'visualization'}
+        open={dataExplorerOpen}
+        onProjectChange={(value) => {
+          setProjectId(value)
+          setDatasetId('')
+          setSelectedTable(null)
+        }}
+        onDatasetChange={(value) => {
+          setDatasetId(value)
+          setSelectedTable(null)
+        }}
+        selectedTable={selectedTable}
+        onSelectTable={(table) => {
+          setSelectedTable(table)
+          setWorkspaceMode('visualization')
+          setMobilePanel('canvas')
+        }}
+        onClose={() => {
+          setDataExplorerOpen(false)
+          setMobilePanel('canvas')
+        }}
+      />
+      {workspaceMode === 'visualization' && (
+        <VisualizationCanvas
+          artifacts={workspaceArtifacts}
+          activeArtifactId={activeVisualizationId}
+          onSelectArtifact={setActiveVisualizationId}
+          selectedTable={selectedTable}
+          conversationScopeFixed={Boolean(conversation)}
+          onSave={(reference) => {
+            setMobilePanel('assistant')
+            beginAnalyticsSave(reference)
+          }}
+          onReturnToConversation={() => {
+            setWorkspaceMode('conversation')
+            setMobilePanel('assistant')
+          }}
+          onOpenDataExplorer={() => {
+            setDataExplorerOpen(true)
+            setMobilePanel('data')
+          }}
+          dataExplorerOpen={dataExplorerOpen}
+        />
+      )}
       <div className="conversation-main">
-        <div className="conversation-header">
-          <div>
-            <p className="eyebrow">Data assistant</p>
-            <h2>{conversation?.title ?? 'Start a conversation'}</h2>
+        <header className="conversation-header">
+          <div className="assistant-workspace-identity">
+            <span className="assistant-workspace-mark" aria-hidden="true">✦</span>
+            <div className="assistant-workspace-heading">
+              <p className="eyebrow">InsightOS · Business intelligence</p>
+              {conversation && <h2>{conversation.title}</h2>}
+            </div>
           </div>
-          {providerStatus && (
-            <span className={`provider-status provider-${providerStatus.status}`}>
-              Model: {providerStatus.status.replaceAll('_', ' ')}
-            </span>
-          )}
-        </div>
-
-        <div className="agent-context-strip" aria-label="Current context">
-          <span className="ctx-chip"><b>Scope</b>{selectedProject ? (selectedDataset ? `${selectedProject.name} / ${selectedDataset.name}` : `${selectedProject.name} / all datasets`) : 'Not set, assistant will discover data'}</span>
-          <span className={`ctx-chip ctx-model provider-${providerStatus?.status ?? 'unknown'}`}><b>Model</b>{providerLabel}</span>
-          <span className="ctx-chip"><b>Tools</b>{analyticsCapabilities.length ? `${analyticsCapabilities.length} verified` : 'deterministic engines'}</span>
-        </div>
-        {providerStatus?.message && (
+          <div className="conversation-header-actions">
+            <button
+              className="conversation-history-button"
+              type="button"
+              onClick={() => setHistoryOpen(true)}
+            >
+              Conversation history
+            </button>
+            {(workspaceArtifacts.length > 0 || selectedTable) && workspaceMode === 'conversation' && (
+              <button
+                className="conversation-history-button"
+                type="button"
+                onClick={() => {
+                  setWorkspaceMode('visualization')
+                  setMobilePanel('canvas')
+                }}
+              >
+                Open workspace
+              </button>
+            )}
+            {providerStatus && (
+              <span className={`provider-status provider-${providerStatus.status}`}>
+                <span className="provider-dot" />
+                {providerLabel}
+              </span>
+            )}
+            <button className="new-conversation-button" type="button" onClick={startNewConversation}>
+              <span aria-hidden="true">＋</span> New conversation
+            </button>
+          </div>
+        </header>
+        {providerStatus?.message && !['healthy', 'configured'].includes(providerStatus.status) && (
           <p className="provider-notice" role="status">{providerStatus.message}</p>
         )}
         {error && <p className="conversation-error" role="alert">{error}</p>}
@@ -574,13 +761,13 @@ function ConversationWorkspace() {
             </button>
           )}
           {!conversation && (
-            <div className="conversation-empty assistant-welcome-inner">
+            <div className="assistant-welcome">
               <div className="assistant-hero">
                 <span className="assistant-hero-mark" aria-hidden="true">✦</span>
-                <h3>What would you like to understand about your data?</h3>
-                <p>
-                  Describe what you want to achieve. InsightOS coordinates verified analysis tools,
-                  executes deterministic workflows, and explains results honestly.
+                <p className="assistant-welcome-kicker">InsightOS · Business intelligence</p>
+                <h1>Your business has a story. Let&apos;s uncover it.</h1>
+                <p className="assistant-welcome-description">
+                  Ask questions about your business, explore your data, and discover insights that help you make better decisions.
                 </p>
               </div>
               <div className="assistant-example-goals" aria-label="Example goals">
@@ -589,34 +776,30 @@ function ConversationWorkspace() {
                     key={goal}
                     className="example-goal-chip"
                     type="button"
-                    onClick={() => setDraft(goal)}
+                    onClick={() => {
+                      setDraft(goal)
+                      composerInputRef.current?.focus()
+                    }}
                   >
                     {goal}
                   </button>
                 ))}
               </div>
-              <ol className="agent-how">
-                <li><b>You ask</b><span>In plain language, scoped to a project or dataset.</span></li>
-                <li><b>It runs verified tools</b><span>Allow-listed, typed and bounded. No arbitrary code or SQL.</span></li>
-                <li><b>You inspect evidence</b><span>Each step, source and method is shown with the result.</span></li>
-              </ol>
-              <button className="button button-primary" type="button" onClick={startConversation}>
-                Start a conversation
-              </button>
             </div>
           )}
           {conversation && messages.length === 0 && (
-            <div className="conversation-empty">
-              <p className="muted">
-                Ask a question about your existing projects, datasets, profiles, quality reports, EDA, or schema analyses.
-              </p>
-              <div className="assistant-example-goals" aria-label="Example goals" style={{ marginTop: '10px' }}>
+            <div className="conversation-empty conversation-empty-active">
+              <p>What would you like to understand about your business?</p>
+              <div className="assistant-example-goals" aria-label="Example goals">
                 {EXAMPLE_GOALS.map((goal) => (
                   <button
                     key={goal}
                     className="example-goal-chip"
                     type="button"
-                    onClick={() => setDraft(goal)}
+                    onClick={() => {
+                      setDraft(goal)
+                      composerInputRef.current?.focus()
+                    }}
                   >
                     {goal}
                   </button>
@@ -652,6 +835,7 @@ function ConversationWorkspace() {
                     key={`${result.tool}-${index}`}
                     result={result}
                     onSave={beginAnalyticsSave}
+                    showCharts={workspaceMode !== 'visualization'}
                   />
                 ))}
                 {message.metadata?.warnings?.map((warning, index) => (
@@ -715,32 +899,68 @@ function ConversationWorkspace() {
           </form>
         )}
 
-        <form className="conversation-composer" onSubmit={submitMessage}>
-          <label className="visually-hidden" htmlFor="conversation-message">Your message</label>
-          <textarea
-            id="conversation-message"
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            maxLength={8000}
-            placeholder={conversation ? 'Ask about your data…' : 'Describe what you want to explore or understand…'}
-            disabled={sending}
-            rows={3}
-          />
-          <button
-            className="button button-primary"
-            type="submit"
-            disabled={!draft.trim() || sending}
-          >
-            {sending ? 'Sending…' : 'Send'}
-          </button>
-        </form>
+        <ConversationComposer
+          draft={draft}
+          sending={sending}
+          onDraftChange={setDraft}
+          onSubmit={submitMessage}
+          inputRef={composerInputRef}
+          contextControls={(
+            <div className="composer-data-context" aria-label="Data context">
+              <label className="context-select">
+                <span>Project</span>
+                <select
+                  aria-label="Project context"
+                  value={projectId}
+                  onChange={(event) => {
+                    setProjectId(event.target.value)
+                    setDatasetId('')
+                    setSelectedTable(null)
+                  }}
+                  disabled={sending || Boolean(conversation)}
+                >
+                  <option value="">All available projects</option>
+                  {projects.map((project) => (
+                    <option key={project.id} value={project.id}>{project.name}</option>
+                  ))}
+                </select>
+              </label>
+              {projectId && (
+                <label className="context-select">
+                  <span>Dataset</span>
+                  <select
+                    aria-label="Dataset context"
+                    value={datasetId}
+                    onChange={(event) => {
+                      setDatasetId(event.target.value)
+                      setSelectedTable(null)
+                    }}
+                    disabled={sending || Boolean(conversation)}
+                  >
+                    <option value="">All datasets in project</option>
+                    {datasets.map((dataset) => (
+                      <option key={dataset.id} value={dataset.id}>{dataset.name}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {conversation && (
+                <span className="conversation-scope-locked" role="note">
+                  Scope fixed for this conversation; start a new one to change it.
+                </span>
+              )}
+            </div>
+          )}
+        />
         <p className="conversation-disclaimer">
           Analysis results are deterministic where supported. Model-generated interpretations may be incomplete; verify results against source data.
         </p>
 
-        {/* Advanced section for direct technical workflow execution */}
+        <details className="assistant-advanced">
+          <summary>Advanced options &amp; run details</summary>
+          <div className="assistant-advanced-content">
         <details className="advanced-analytics-panel">
-          <summary>Advanced: Structured analytics workflow</summary>
+          <summary>Advanced analytics</summary>
           <div className="advanced-analytics-body">
             <section className="structured-chat-result" aria-label="Unified analytics workflow" style={{ border: 'none', padding: 0 }}>
               <p className="muted">
@@ -866,13 +1086,13 @@ function ConversationWorkspace() {
                           <pre>{JSON.stringify(analyticsExecution.result.summary, null, 2)}</pre>
                         </details>
                       )}
-                      {analyticsExecution.result.charts?.map((chart) => (
+                      {workspaceMode !== 'visualization' && analyticsExecution.result.charts?.map((chart) => (
                         <ChartCard
                           chart={chart}
                           key={`${chart.title}-${chart.x_field}-${chart.y_field}`}
                         />
                       ))}
-                      {analyticsExecution.result.findings?.slice(0, 20).map((finding) => (
+                      {workspaceMode !== 'visualization' && analyticsExecution.result.findings?.slice(0, 20).map((finding) => (
                         <p key={finding.id}>{finding.statement}</p>
                       ))}
                       {analyticsExecution.warnings?.map((warning, index) => (
@@ -960,13 +1180,13 @@ function ConversationWorkspace() {
                               {' '}artifact {source.normalized_artifact_sha256}
                             </p>
                           ))}
-                          {operation.result.charts?.map((chart) => (
+                          {workspaceMode !== 'visualization' && operation.result.charts?.map((chart) => (
                             <ChartCard
                               chart={chart}
                               key={`${chart.title}-${chart.x_field}-${chart.y_field}`}
                             />
                           ))}
-                          {operation.result.findings?.slice(0, 20).map((finding) => (
+                          {workspaceMode !== 'visualization' && operation.result.findings?.slice(0, 20).map((finding) => (
                             <p key={finding.id}>{finding.statement}</p>
                           ))}
                           {operation.warnings.map((warning, index) => (
@@ -996,36 +1216,11 @@ function ConversationWorkspace() {
             </section>
           </div>
         </details>
-      </div>
-      <aside className="agent-rail" aria-label="Agent context and capabilities">
+      <details className="advanced-agent-details">
+        <summary>Assistant details</summary>
+        <aside className="agent-rail" aria-label="Advanced assistant details">
         <section className="rail-section">
-          <h3>Scope</h3>
-        <label className="conversation-context-field">
-            <span>Project context <span className="muted">(optional)</span></span>
-            <select
-              value={projectId}
-              onChange={(event) => {
-                setProjectId(event.target.value)
-                setDatasetId('')
-              }}
-            >
-              <option value="">Discover available data</option>
-              {projects.map((project) => (
-                <option key={project.id} value={project.id}>{project.name}</option>
-              ))}
-            </select>
-          </label>
-          {projectId && (
-            <label className="conversation-context-field">
-              <span>Dataset context <span className="muted">(optional)</span></span>
-              <select value={datasetId} onChange={(event) => setDatasetId(event.target.value)}>
-                <option value="">All datasets in project</option>
-                {datasets.map((dataset) => (
-                  <option key={dataset.id} value={dataset.id}>{dataset.name}</option>
-                ))}
-              </select>
-            </label>
-          )}
+          <h3>Data boundary</h3>
           <p className="rail-hint">The agent only reads data inside this scope.</p>
         </section>
 
@@ -1068,6 +1263,67 @@ function ConversationWorkspace() {
           <p className="rail-hint">Model tool selection is unverified. Data-workspace tools work without a model.</p>
         </section>
       </aside>
+      </details>
+          </div>
+        </details>
+      </div>
+      {workspaceMode === 'visualization' && (
+        <nav className="adaptive-mobile-panel-switcher" aria-label="Workspace panels">
+          {[
+            { id: 'data', label: 'Data' },
+            { id: 'canvas', label: 'Canvas' },
+            { id: 'assistant', label: 'Assistant' },
+          ].map((panel) => (
+            <button
+              type="button"
+              key={panel.id}
+              className={mobilePanel === panel.id ? 'is-active' : ''}
+              aria-pressed={mobilePanel === panel.id}
+              onClick={() => {
+                if (panel.id === 'data') setDataExplorerOpen(true)
+                setMobilePanel(panel.id)
+              }}
+            >
+              {panel.label}
+            </button>
+          ))}
+        </nav>
+      )}
+      {showHistory && (
+        <div className="adaptive-history-overlay">
+          <button
+            className="adaptive-history-scrim"
+            type="button"
+            aria-label="Close conversation history"
+            onClick={closeHistory}
+          />
+          <section
+            className="adaptive-history-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Conversation history"
+          >
+            <button
+              className="adaptive-history-close"
+              type="button"
+              onClick={closeHistory}
+              aria-label="Close conversation history"
+            >
+              ×
+            </button>
+            <HistoryPage
+              onSelectConversation={(id) => {
+                onSelectConversation?.(id)
+                if (!onSelectConversation) {
+                  requestedConversationId.current = String(id)
+                  openConversation(id)
+                }
+                closeHistory()
+              }}
+            />
+          </section>
+        </div>
+      )}
     </section>
   )
 }

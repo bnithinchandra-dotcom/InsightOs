@@ -3,9 +3,25 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#070d17" />
+    <meta name="theme-color" content="#080B14" />
     <meta name="description" content="InsightOS data intelligence workspace" />
     <title>InsightOS</title>
+    <script>
+      try {
+        const savedTheme = localStorage.getItem('insightos-theme')
+        const theme = savedTheme === 'light' || savedTheme === 'dark'
+          ? savedTheme
+          : (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+        document.documentElement.dataset.theme = theme
+        document.querySelector('meta[name="theme-color"]').content =
+          theme === 'dark' ? '#080B14' : '#F5F7FC'
+      } catch {
+        const theme = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+        document.documentElement.dataset.theme = theme
+        document.querySelector('meta[name="theme-color"]').content =
+          theme === 'dark' ? '#080B14' : '#F5F7FC'
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>
