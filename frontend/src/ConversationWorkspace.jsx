@@ -502,6 +502,14 @@ function ConversationWorkspace() {
     (item) => item.operation === analyticsOperation,
   )
 
+  const selectedProject = projects.find((item) => item.id === projectId)
+  const selectedDataset = datasets.find((item) => item.id === datasetId)
+  const lastAssistant = [...messages].reverse().find((item) => item.role === 'assistant')
+  const lastSteps = lastAssistant?.metadata?.tool_activities ?? []
+  const stepsSucceeded = lastSteps.filter((step) => step.status === 'succeeded').length
+  const stepsFailed = lastSteps.filter((step) => step.status === 'failed').length
+  const providerLabel = providerStatus ? providerStatus.status.replaceAll('_', ' ') : 'checking'
+
   return (
     <section className="conversation-workspace panel" aria-label="InsightOS assistant">
       <aside className="conversation-sidebar">
@@ -511,32 +519,6 @@ function ConversationWorkspace() {
             New chat
           </button>
         </div>
-        <label className="conversation-context-field">
-          <span>Project context <span className="muted">(optional)</span></span>
-          <select
-            value={projectId}
-            onChange={(event) => {
-              setProjectId(event.target.value)
-              setDatasetId('')
-            }}
-          >
-            <option value="">Discover available data</option>
-            {projects.map((project) => (
-              <option key={project.id} value={project.id}>{project.name}</option>
-            ))}
-          </select>
-        </label>
-        {projectId && (
-          <label className="conversation-context-field">
-            <span>Dataset context <span className="muted">(optional)</span></span>
-            <select value={datasetId} onChange={(event) => setDatasetId(event.target.value)}>
-              <option value="">All datasets in project</option>
-              {datasets.map((dataset) => (
-                <option key={dataset.id} value={dataset.id}>{dataset.name}</option>
-              ))}
-            </select>
-          </label>
-        )}
         <div className="conversation-list" aria-label="Saved conversations">
           {loading && <p className="muted">Loading conversations…</p>}
           {!loading && conversations.length === 0 && (
@@ -559,9 +541,6 @@ function ConversationWorkspace() {
             </button>
           )}
         </div>
-        <div className="sidebar-provider-status">
-          <ProviderBadge status={providerStatus} message={providerStatus?.message} />
-        </div>
       </aside>
 
       <div className="conversation-main">
@@ -577,6 +556,11 @@ function ConversationWorkspace() {
           )}
         </div>
 
+        <div className="agent-context-strip" aria-label="Current context">
+          <span className="ctx-chip"><b>Scope</b>{selectedProject ? (selectedDataset ? `${selectedProject.name} / ${selectedDataset.name}` : `${selectedProject.name} / all datasets`) : 'Not set, assistant will discover data'}</span>
+          <span className={`ctx-chip ctx-model provider-${providerStatus?.status ?? 'unknown'}`}><b>Model</b>{providerLabel}</span>
+          <span className="ctx-chip"><b>Tools</b>{analyticsCapabilities.length ? `${analyticsCapabilities.length} verified` : 'deterministic engines'}</span>
+        </div>
         {providerStatus?.message && (
           <p className="provider-notice" role="status">{providerStatus.message}</p>
         )}
@@ -611,9 +595,11 @@ function ConversationWorkspace() {
                   </button>
                 ))}
               </div>
-              <p className="muted" style={{ marginTop: '12px', fontSize: '11px' }}>
-                Start a saved conversation. The assistant uses only available InsightOS analysis tools and reports when a model provider is unavailable.
-              </p>
+              <ol className="agent-how">
+                <li><b>You ask</b><span>In plain language, scoped to a project or dataset.</span></li>
+                <li><b>It runs verified tools</b><span>Allow-listed, typed and bounded. No arbitrary code or SQL.</span></li>
+                <li><b>You inspect evidence</b><span>Each step, source and method is shown with the result.</span></li>
+              </ol>
               <button className="button button-primary" type="button" onClick={startConversation}>
                 Start a conversation
               </button>
@@ -653,7 +639,7 @@ function ConversationWorkspace() {
 
             return (
               <article className={`chat-message chat-${message.role}`} key={message.id}>
-                <p className="chat-role">{message.role === 'assistant' ? 'InsightOS' : 'You'}</p>
+                <p className="chat-role"><span className="chat-avatar" aria-hidden="true">{message.role === 'assistant' ? '✦' : 'Y'}</span>{message.role === 'assistant' ? 'InsightOS' : 'You'}</p>
                 <p
                   className={`chat-content ${isFailedAssistantMessage ? 'chat-error' : ''}`}
                   role={isFailedAssistantMessage ? 'alert' : undefined}
@@ -1011,6 +997,77 @@ function ConversationWorkspace() {
           </div>
         </details>
       </div>
+      <aside className="agent-rail" aria-label="Agent context and capabilities">
+        <section className="rail-section">
+          <h3>Scope</h3>
+        <label className="conversation-context-field">
+            <span>Project context <span className="muted">(optional)</span></span>
+            <select
+              value={projectId}
+              onChange={(event) => {
+                setProjectId(event.target.value)
+                setDatasetId('')
+              }}
+            >
+              <option value="">Discover available data</option>
+              {projects.map((project) => (
+                <option key={project.id} value={project.id}>{project.name}</option>
+              ))}
+            </select>
+          </label>
+          {projectId && (
+            <label className="conversation-context-field">
+              <span>Dataset context <span className="muted">(optional)</span></span>
+              <select value={datasetId} onChange={(event) => setDatasetId(event.target.value)}>
+                <option value="">All datasets in project</option>
+                {datasets.map((dataset) => (
+                  <option key={dataset.id} value={dataset.id}>{dataset.name}</option>
+                ))}
+              </select>
+            </label>
+          )}
+          <p className="rail-hint">The agent only reads data inside this scope.</p>
+        </section>
+
+        <section className="rail-section">
+          <h3>Current run</h3>
+          {sending ? (
+            <p className="rail-run is-active"><span className="sending-dot" /> Executing tools…</p>
+          ) : lastSteps.length ? (
+            <p className="rail-run">
+              {lastSteps.length} step{lastSteps.length === 1 ? '' : 's'}
+              {' · '}{stepsSucceeded} ok{stepsFailed ? ` · ${stepsFailed} failed` : ''}
+            </p>
+          ) : (
+            <p className="rail-hint">No tools have run in this conversation yet.</p>
+          )}
+        </section>
+
+        <section className="rail-section">
+          <h3>Verified tools</h3>
+          {capabilityError ? (
+            <p className="rail-hint">Live tool list unavailable until a workspace profile exists.</p>
+          ) : analyticsCapabilities.length === 0 ? (
+            <p className="rail-hint">Loading registered tools…</p>
+          ) : (
+            <ul className="rail-tools">
+              {analyticsCapabilities.slice(0, 8).map((capability) => (
+                <li key={capability.operation} title={capability.description}>
+                  <span className="rail-tool-dot" aria-hidden="true" />
+                  {capability.operation.replaceAll('_', ' ')}
+                </li>
+              ))}
+            </ul>
+          )}
+          <p className="rail-hint">Typed arguments, bounded results, no shell or filesystem access.</p>
+        </section>
+
+        <section className="rail-section">
+          <h3>Model</h3>
+          <ProviderBadge status={providerStatus} message={providerStatus?.message} />
+          <p className="rail-hint">Model tool selection is unverified. Data-workspace tools work without a model.</p>
+        </section>
+      </aside>
     </section>
   )
 }

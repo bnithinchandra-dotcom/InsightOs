@@ -4,21 +4,38 @@ import BrowserExecution from './BrowserExecution'
 import ConversationWorkspace from './ConversationWorkspace'
 import DataWorkspace from './DataWorkspace'
 import Dashboards from './Dashboards'
+import Overview from './Overview'
 import SchemaArchitect from './SchemaArchitect'
 import './App.css'
+import './redesign.css'
 
-const primaryNavigation = [
-  { id: 'chat', label: 'Assistant', icon: 'spark' },
-  { id: 'datasets', label: 'Data', icon: 'database' },
-  { id: 'dashboards', label: 'Dashboards', icon: 'chart' },
+const navigationGroups = [
+  {
+    label: null,
+    items: [{ id: 'overview', label: 'Overview', icon: 'grid' }],
+  },
+  {
+    label: 'Workflow',
+    items: [
+      { id: 'projects', label: 'Projects', icon: 'folder', step: '1', stage: 'Connect' },
+      { id: 'datasets', label: 'Data', icon: 'database', step: '1', stage: 'Connect' },
+      { id: 'analysis', label: 'Schema Architect', icon: 'activity', step: '2', stage: 'Understand' },
+      { id: 'chat', label: 'Assistant', icon: 'spark', step: '3', stage: 'Analyze' },
+      { id: 'dashboards', label: 'Dashboards', icon: 'chart', step: '4', stage: 'Insights' },
+    ],
+  },
+  {
+    label: 'System',
+    items: [
+      { id: 'system', label: 'System', icon: 'pulse' },
+      { id: 'settings', label: 'Settings', icon: 'settings' },
+    ],
+  },
 ]
 
-const secondaryNavigation = [
-  { id: 'projects', label: 'Projects', icon: 'folder' },
-  { id: 'analysis', label: 'Schema Architect', icon: 'activity' },
-  { id: 'system', label: 'System', icon: 'pulse' },
-  { id: 'settings', label: 'Settings', icon: 'settings' },
-]
+const stageByPage = Object.fromEntries(
+  navigationGroups.flatMap((group) => group.items).filter((item) => item.stage).map((item) => [item.id, item.stage]),
+)
 
 const services = [
   { key: 'backend', label: 'Backend' },
@@ -135,11 +152,11 @@ function StatusPill({ status }) {
   )
 }
 
-function PageHeader({ title, description, children }) {
+function PageHeader({ title, description, stage, children }) {
   return (
     <div className="page-header">
       <div>
-        <p className="eyebrow">Workspace</p>
+        <p className="eyebrow">{stage ? `Stage · ${stage}` : 'Workspace'}</p>
         <h1>{title}</h1>
         <p className="page-description">{description}</p>
       </div>
@@ -215,80 +232,6 @@ function SystemStatus({ health, systemInfo, loading, error, onRefresh, compact =
   )
 }
 
-function Overview({ health, systemInfo, loading, error, onRefresh, navigate }) {
-  return (
-    <>
-      <section className="welcome panel">
-        <div className="welcome-copy">
-          <p className="eyebrow">Your data intelligence workspace</p>
-          <h2>Turn your data into decisions.</h2>
-          <p>Describe the outcome. InsightOS will help bring data, analysis, and insights together.</p>
-        </div>
-        <div className="welcome-mark" aria-hidden="true"><Icon name="spark" size={37} /></div>
-      </section>
-
-      <section className="quick-actions" aria-label="Quick actions">
-        <div className="section-title">
-          <div><h2>Get started</h2><p>Set up your workspace to begin.</p></div>
-        </div>
-        <div className="action-grid">
-          <a className="action-card" href="#projects" onClick={() => navigate('projects')}>
-            <span className="action-icon"><Icon name="folder" /></span>
-            <span><strong>Create a project</strong><small>Organize your work in projects</small></span>
-            <span className="action-arrow"><Icon name="arrow" /></span>
-          </a>
-          <a className="action-card" href="#datasets" onClick={() => navigate('datasets')}>
-            <span className="action-icon"><Icon name="database" /></span>
-            <span><strong>Add a dataset</strong><small>Bring data into your workspace</small></span>
-            <span className="action-arrow"><Icon name="arrow" /></span>
-          </a>
-          <a className="action-card" href="#analysis" onClick={() => navigate('analysis')}>
-            <span className="action-icon"><Icon name="activity" /></span>
-            <span><strong>Open Schema Architect</strong><small>Review relationships across normalized tables</small></span>
-            <span className="action-arrow"><Icon name="arrow" /></span>
-          </a>
-          <a className="action-card" href="#chat" onClick={() => navigate('chat')}>
-            <span className="action-icon"><Icon name="spark" /></span>
-            <span><strong>Start a conversation</strong><small>Explore existing projects and analysis</small></span>
-            <span className="action-arrow"><Icon name="arrow" /></span>
-          </a>
-        </div>
-      </section>
-
-      <div className="overview-grid">
-        <section className="panel workspace-panel">
-          <div className="panel-heading">
-            <div><p className="eyebrow">Workspace</p><h2>Start with a project</h2></div>
-            <a className="text-link" href="#projects" onClick={() => navigate('projects')}>View projects <Icon name="arrow" size={14} /></a>
-          </div>
-          <div className="workspace-empty">
-            <span className="empty-icon small"><Icon name="folder" /></span>
-            <div><strong>Start with a project</strong><p>Create a project, then upload a supported file to begin analysis.</p></div>
-          </div>
-        </section>
-        <section className="panel activity-panel">
-          <div className="panel-heading">
-            <div><p className="eyebrow">Workspace history</p><h2>Recent activity</h2></div>
-          </div>
-          <div className="activity-empty">
-            <span className="activity-line" aria-hidden="true" />
-            <p>No activity yet. Your workspace activity will appear here as features become available.</p>
-          </div>
-        </section>
-      </div>
-
-      <SystemStatus
-        health={health}
-        systemInfo={systemInfo}
-        loading={loading}
-        error={error}
-        onRefresh={onRefresh}
-        compact
-      />
-    </>
-  )
-}
-
 function SystemPage({ health, systemInfo, loading, error, onRefresh }) {
   return (
     <div className="system-page">
@@ -355,7 +298,7 @@ function PageContent({ page, props }) {
 
 function App() {
   const currentHash = useSyncExternalStore(subscribeToHash, getCurrentHash, () => '')
-  const page = pageDetails[currentHash] ? currentHash : 'chat'
+  const page = pageDetails[currentHash] ? currentHash : 'overview'
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [health, setHealth] = useState('loading')
   const [systemInfo, setSystemInfo] = useState(null)
@@ -433,13 +376,17 @@ function App() {
           <span className="switcher-caret">⌄</span>
         </div>
         <nav className="navigation" aria-label="Main navigation">
-          <span className="nav-group-label">Workspace</span>
-          {primaryNavigation.map((item) => (
-            <a key={item.id} {...navProps(item)}><Icon name={item.icon} /><span>{item.label}</span></a>
-          ))}
-          <span className="nav-group-label nav-secondary-label">System</span>
-          {secondaryNavigation.map((item) => (
-            <a key={item.id} {...navProps(item)}><Icon name={item.icon} /><span>{item.label}</span></a>
+          {navigationGroups.map((group, index) => (
+            <div className="nav-group" key={group.label ?? index}>
+              {group.label && <span className="nav-group-label">{group.label}</span>}
+              {group.items.map((item) => (
+                <a key={item.id} {...navProps(item)}>
+                  <Icon name={item.icon} />
+                  <span>{item.label}</span>
+                  {item.step && <span className="nav-step" aria-hidden="true">{item.step}</span>}
+                </a>
+              ))}
+            </div>
           ))}
         </nav>
         <div className="sidebar-footer">
@@ -453,7 +400,10 @@ function App() {
           <button className="mobile-menu-button" type="button" onClick={() => setMobileNavOpen(true)} aria-label="Open navigation">
             <span /><span /><span />
           </button>
-          <div className="breadcrumb"><span>Workspace</span><span className="breadcrumb-divider">/</span><strong>{details.title}</strong></div>
+          <div className="breadcrumb">
+            {stageByPage[page] ? <span className="stage-chip">{stageByPage[page]}</span> : <span>Workspace</span>}
+            <span className="breadcrumb-divider">/</span><strong>{details.title}</strong>
+          </div>
           <div className="topbar-actions">
             <a className="topbar-system-link" href="#system" onClick={() => navigate('system')}>
               <StatusPill status={health} />
@@ -465,13 +415,15 @@ function App() {
         </header>
 
         <main className="main-content">
-          <PageHeader title={details.title} description={details.description}>
+          {page !== 'overview' && (
+          <PageHeader title={details.title} description={details.description} stage={stageByPage[page]}>
             {page === 'system' && (
               <button className="button button-secondary" type="button" onClick={pageProps.onRefresh}>
                 <Icon name="refresh" size={16} /> Refresh status
               </button>
             )}
           </PageHeader>
+          )}
           <PageContent page={page} props={{ ...pageProps, navigate }} />
         </main>
         <footer className="app-footer">

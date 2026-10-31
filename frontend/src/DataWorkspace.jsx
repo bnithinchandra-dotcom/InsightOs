@@ -24,6 +24,9 @@ import {
 import { ChartCard } from './Dashboards'
 
 const supportedFormats = '.csv, .tsv, .xlsx, .json, .parquet, .xml'
+import DataJourney, { FileTrack } from './DataJourney'
+import { deriveJourney } from './journeyState'
+
 const CREATE_FORECAST_DASHBOARD = '__create_forecast_dashboard__'
 const EDA_REPORT_OPERATION_ID = 'eda-evidence-report'
 
@@ -722,6 +725,14 @@ function DataWorkspace({ page }) {
     return <section className="panel data-workspace"><p role="status">Loading workspace data…</p></section>
   }
 
+  const journey = deriveJourney({
+    hasProject: projects.length > 0,
+    files,
+    mlSuitability,
+    analysis,
+    forecastRun,
+  })
+
   return (
     <div className="data-workspace">
       {error && <p className="data-alert data-alert-error" role="alert">{error}</p>}
@@ -778,24 +789,7 @@ function DataWorkspace({ page }) {
         </p>
       )}
 
-      {page === 'datasets' && profileConfigured && (
-        <section className="panel data-panel" aria-label="Guided analytics journey">
-          <p className="eyebrow">Guided analytics journey</p>
-          <h2>From source data to reusable evidence</h2>
-          <p className="muted">
-            Upload a file, normalize it, assess the available ML task types, then choose a
-            single-file analysis or a multi-source report. EDA evidence reports reference a stored EDA run; forecasts use their own
-            persisted workflow. These operations do not pass results between each other.
-          </p>
-          <ol className="data-journey-steps">
-            <li><strong>Ingest and prepare</strong><span>Upload files below and normalize each source before analysis.</span></li>
-            <li><strong>Analyze</strong><span>Assess task suitability, run EDA or an explicitly selected anomaly screen, or use the existing forecasting path.</span></li>
-            <li><strong>Report across sources</strong><span>Choose exact sources, join keys, and metrics in the dashboard builder.</span></li>
-            <li><strong>Save and revisit</strong><span>Save verified EDA evidence or a completed forecast to a dashboard, then reload its original result.</span></li>
-          </ol>
-          <a className="text-link" href="#dashboards">Open dashboard builder</a>
-        </section>
-      )}
+      {page === 'datasets' && profileConfigured && <DataJourney journey={journey} />}
 
       {page === 'projects' ? (
         <>
@@ -839,10 +833,10 @@ function DataWorkspace({ page }) {
         </>
       ) : (
         <>
-          <section className="panel data-panel">
+          <section className="panel data-panel" id="ws-upload">
             <div className="data-panel-heading">
               <div>
-                <p className="eyebrow">Data</p>
+                <p className="eyebrow">Step 1 · Data</p>
                 <h2>Upload a dataset</h2>
               </div>
               {projects.length === 0 && (
@@ -909,9 +903,9 @@ function DataWorkspace({ page }) {
           </section>
 
           {projects.length > 0 && (
-            <section className="panel data-panel">
+            <section className="panel data-panel" id="ws-files">
               <div className="data-panel-heading">
-                <div><p className="eyebrow">Stored data</p><h2>Datasets and files</h2></div>
+                <div><p className="eyebrow">Steps 2–5 · Stored data</p><h2>Datasets and files</h2></div>
               </div>
               {datasets.length === 0 ? (
                 <p className="muted">This project has no datasets yet.</p>
@@ -968,6 +962,7 @@ function DataWorkspace({ page }) {
                         <li key={file.id} className="data-file-row">
                           <div className="data-file-summary">
                             <strong>{file.filename}</strong>
+                            <FileTrack file={file} profiled={suitability} />
                             <span>
                               Ingestion: {statusLabel(file.status)} · Normalization: {statusLabel(file.normalization_status)}
                               {' '}· {file.detected_format?.toUpperCase() ?? 'format pending'}
@@ -1424,7 +1419,7 @@ function DataWorkspace({ page }) {
           )}
 
           {forecastRun?.result && (
-            <section className="panel data-panel" aria-live="polite">
+            <section className="panel data-panel" id="ws-forecast-result" aria-live="polite">
               <p className="eyebrow">Persisted forecast result</p>
               <h2>{forecastRun.result.target_column} · next {forecastRun.result.horizon} months</h2>
               <p className="muted">
@@ -1552,7 +1547,7 @@ function DataWorkspace({ page }) {
           )}
 
           {analysis?.result && (
-            <section className="panel data-panel" aria-live="polite">
+            <section className="panel data-panel" id="ws-eda-result" aria-live="polite">
               <p className="eyebrow">Verified analysis response</p>
               <h2>EDA result</h2>
               <p className="muted">
