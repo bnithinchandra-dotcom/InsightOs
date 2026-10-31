@@ -261,7 +261,11 @@ def build_specialist_handoff(
 def _invoke(
     router: AgentModelRouter,
     *,
-    role: AgentRole,
+    role: Literal[
+        "data_intelligence",
+        "analytics_modelling",
+        "insights_visualization",
+    ],
     instruction: str,
     context: dict[str, Any],
     model: type[_StrictContract],
@@ -350,8 +354,18 @@ def _invoke(
             ProviderMessage(role="user", content=encoded),
         ),
         tools=(),
-        max_output_tokens=router.max_output_tokens,
+        max_output_tokens={
+            "data_intelligence": 4096,
+            "analytics_modelling": 768,
+            "insights_visualization": 1024,
+        }[role],
         response_format="json",
+        task_category={
+            "data_intelligence": "analytical",
+            "analytics_modelling": "routing",
+            "insights_visualization": "presentation",
+        }[role],
+        workflow_id=validated_context.workflow_id,
     )
     try:
         completion = router.complete(role, request)
@@ -367,6 +381,11 @@ def _invoke(
             "provider_unavailable",
             "The local model provider could not complete the specialist request.",
         ) from None
+    if completion.response.finish_reason.lower() in {"length", "max_tokens"}:
+        raise SpecialistAgentError(
+            "agent_response_incomplete",
+            "The specialist response reached its output limit before completing.",
+        )
     content = completion.response.message.content.strip()
     if not content or len(content.encode("utf-8")) > 32 * 1024:
         raise SpecialistAgentError(

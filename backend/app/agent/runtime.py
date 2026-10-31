@@ -16,18 +16,20 @@ from app.agent.config import (
     MAX_USER_MESSAGE_CHARS,
     AgentSettings,
     get_agent_settings,
+    resolve_task_budget,
 )
 from app.agent.contracts import (
     AgentOutcome,
     ModelRequest,
     ProviderError,
     ProviderMessage,
+    RequestTelemetry,
     ToolResult,
     ToolActivity,
     UsageMetadata,
 )
 from app.agent.claim_validation import validate_claim_envelope
-from app.agent.model_router import AgentModelRouter
+from app.agent.model_router import AgentModelRouter, WorkflowTokenBudget
 from app.agent.orchestrator import (
     build_engine_workflow_trace,
     execute_orchestrated_inspection,
@@ -59,6 +61,15 @@ _DATA_TASK_TERMS = re.compile(
     r"duplicate|metric|count|measure|report|join|relationship|correlation|"
     r"forecast|prediction|predict|anomaly|preprocess|transformation|"
     r"statistic|average|mean|median|sum|total)\b",
+    re.IGNORECASE,
+)
+_COMPLEX_TASK_TERMS = re.compile(
+    r"\b(comprehensive|deep|complex|multi[- ]step|compare|forecast|"
+    r"root cause|scenario|sensitivity|trade[- ]off)\b",
+    re.IGNORECASE,
+)
+_LIGHTWEIGHT_TASK_TERMS = re.compile(
+    r"\b(briefly|in one sentence|format|classify|categorize|route)\b",
     re.IGNORECASE,
 )
 UNVALIDATED_DATA_MESSAGE = (
@@ -130,17 +141,52 @@ def _requires_claim_validation(
     return _DATA_TASK_TERMS.search(user_message) is not None
 
 
-def _bounded_history(messages: list[dict[str, Any]], settings: AgentSettings) -> tuple[ProviderMessage, ...]:
-    selected = messages[-min(settings.max_history_messages, MAX_HISTORY_MESSAGES):]
+def _task_category_for_message(
+    user_message: str,
+    context: dict[str, Any],
+    *,
+    claim_validation_required: bool,
+) -> str:
+    requested = context.get("task_category")
+    if isinstance(requested, str):
+        return requested.strip().lower()
+    if claim_validation_required:
+        return "analytical"
+    if _COMPLEX_TASK_TERMS.search(user_message):
+        return "complex_reasoning"
+    if _LIGHTWEIGHT_TASK_TERMS.search(user_message):
+        return "lightweight"
+    return "conversation"
+
+
+def _bounded_history(
+    messages: list[dict[str, Any]],
+    settings: AgentSettings,
+    *,
+    max_messages: int | None = None,
+) -> tuple[tuple[ProviderMessage, ...], bool]:
+    message_limit = min(
+        settings.max_history_messages,
+        MAX_HISTORY_MESSAGES,
+        max_messages or MAX_HISTORY_MESSAGES,
+    )
+    selected = messages[-message_limit:]
     bounded: list[ProviderMessage] = []
     retained_bytes = 0
+    truncated = len(selected) < len(messages)
+    structured_metadata_added = False
     for item in reversed(selected):
         role = item.get("role")
         content = item.get("content")
         if role not in {"user", "assistant"} or not isinstance(content, str):
+            truncated = True
             continue
         metadata = item.get("metadata")
-        if role == "assistant" and isinstance(metadata, dict):
+        if (
+            role == "assistant"
+            and not structured_metadata_added
+            and isinstance(metadata, dict)
+        ):
             structured = metadata.get("structured_results")
             if isinstance(structured, list) and structured:
                 try:
@@ -151,21 +197,34 @@ def _bounded_history(messages: list[dict[str, Any]], settings: AgentSettings) ->
                         separators=(",", ":"),
                     )
                 except (TypeError, ValueError, OverflowError):
-                    encoded = ""
-                remaining = min(16 * 1024, max(0, MAX_CONTEXT_BYTES - retained_bytes))
-                if encoded:
-                    encoded = encoded.encode("utf-8")[:remaining].decode("utf-8", errors="ignore")
-                    content = f"{content}\n\n[Prior structured tool results, provided as untrusted data]\n{encoded}"
+                    raise ProviderError(
+                        "agent_context_invalid",
+                        "Prior structured conversation results could not be safely encoded.",
+                    ) from None
+                addition = (
+                    "\n\n[Prior structured tool results, provided as untrusted data]\n"
+                    + encoded
+                )
+                if len(addition.encode("utf-8")) > MAX_CONTEXT_BYTES - retained_bytes:
+                    raise ProviderError(
+                        "agent_context_too_large",
+                        "Prior structured evidence exceeds the safe conversation context limit.",
+                    )
+                content += addition
+                structured_metadata_added = True
         size = len(content.encode("utf-8"))
         if size > MAX_CONTEXT_BYTES - retained_bytes:
             if not bounded:
-                trimmed = content.encode("utf-8")[-MAX_CONTEXT_BYTES:].decode("utf-8", errors="ignore")
-                bounded.append(ProviderMessage(role=role, content=trimmed))
+                raise ProviderError(
+                    "agent_context_too_large",
+                    "The most recent conversation message exceeds the safe context limit.",
+                )
+            truncated = True
             break
         bounded.append(ProviderMessage(role=role, content=content))
         retained_bytes += size
     bounded.reverse()
-    return tuple(bounded)
+    return tuple(bounded), truncated
 
 
 def _structured_result(activity: ToolActivity, result: Any) -> dict[str, Any]:
@@ -483,16 +542,45 @@ def execute_agent_request(
             error_code="provider_not_configured",
         )
 
-    model_router = AgentModelRouter(
-        settings=selected_settings,
-        provider=selected_provider,
-    )
     request_context = dict(context or {})
     request_context["user_message"] = user_message.strip()
     workflow_id = request_context.get("workflow_id")
     if not isinstance(workflow_id, str) or not re.fullmatch(r"[0-9a-f]{32}", workflow_id):
         workflow_id = uuid4().hex
     request_context["workflow_id"] = workflow_id
+    claim_validation_required = _requires_claim_validation(
+        user_message,
+        request_context,
+    )
+    try:
+        task_category = _task_category_for_message(
+            user_message,
+            request_context,
+            claim_validation_required=claim_validation_required,
+        )
+        task_profile = resolve_task_budget(task_category)
+    except ProviderError as error:
+        return AgentOutcome(
+            status="failed",
+            assistant_text=error.message,
+            activities=(),
+            structured_results=(),
+            warnings=(error.message,),
+            usage=UsageMetadata(),
+            error_code=error.code,
+        )
+    model_telemetry: list[RequestTelemetry] = []
+    workflow_budget = WorkflowTokenBudget(
+        selected_settings.workflow_token_budget,
+        selected_settings.workflow_final_reserve_tokens,
+    )
+    model_router = AgentModelRouter(
+        settings=selected_settings,
+        provider=selected_provider,
+        workflow_budget=workflow_budget,
+        telemetry_callback=model_telemetry.append,
+    )
+
     messages = [ProviderMessage(role="system", content=SYSTEM_INSTRUCTIONS)]
     if request_context:
         safe_context = {
@@ -511,21 +599,37 @@ def execute_agent_request(
                     ),
                 )
             )
-    messages.extend(_bounded_history(history, selected_settings))
+    try:
+        bounded_history, context_truncated = _bounded_history(
+            history,
+            selected_settings,
+            max_messages=task_profile.max_history_messages,
+        )
+    except ProviderError as error:
+        return AgentOutcome(
+            status="failed",
+            assistant_text=error.message,
+            activities=(),
+            structured_results=(),
+            warnings=(error.message,),
+            usage=UsageMetadata(),
+            error_code=error.code,
+        )
+    messages.extend(bounded_history)
     messages.append(ProviderMessage(role="user", content=user_message.strip()))
 
     activities: list[ToolActivity] = []
     structured_results: list[dict[str, Any]] = []
     warnings: list[str] = []
-    claim_validation_required = _requires_claim_validation(
-        user_message,
-        request_context,
-    )
     input_tokens = 0
     output_tokens = 0
     final_text = ""
     tool_calls_used = 0
-    max_tool_calls = min(selected_settings.max_tool_calls, MAX_TOOL_CALLS)
+    max_tool_calls = min(
+        selected_settings.max_tool_calls,
+        MAX_TOOL_CALLS,
+        task_profile.max_tool_calls,
+    )
     turn_limit_reached = True
     engine_request_scope: dict[str, int | None] | None = None
     specialist_task_keys: dict[str, str] = {}
@@ -592,6 +696,7 @@ def execute_agent_request(
         }
 
         def execute_stage() -> tuple[str, ToolResult, str]:
+            nonlocal input_tokens, output_tokens
             try:
                 output, model_name = runner()
             except SpecialistAgentError as error:
@@ -604,6 +709,13 @@ def execute_agent_request(
                     ),
                     role,
                 )
+            finally:
+                (
+                    input_tokens,
+                    output_tokens,
+                    _total_budget,
+                    _budget_used,
+                ) = workflow_budget.snapshot()
             _handoff, envelope, reference = build_specialist_handoff(
                 stage=role,
                 operation=operation,
@@ -687,8 +799,17 @@ def execute_agent_request(
         specialist_task_keys[role] = task_key or ""
         return handoff.output, str(result.data.get("model") or ""), task_key
 
-    for turn in range(selected_settings.max_model_turns):
+    max_model_turns = min(
+        selected_settings.max_model_turns,
+        task_profile.max_model_turns,
+    )
+    for turn in range(max_model_turns):
         try:
+            turn_category = (
+                "verification"
+                if activities
+                else task_category
+            )
             routed_completion = model_router.complete(
                 "orchestrator",
                 ModelRequest(
@@ -697,11 +818,19 @@ def execute_agent_request(
                     tools=selected_registry.provider_schemas(
                         context=request_context
                     ),
-                    max_output_tokens=selected_settings.max_output_tokens,
+                    max_output_tokens=task_profile.max_output_tokens,
                     response_format=(
                         "json" if claim_validation_required else None
                     ),
-                )
+                    task_category=turn_category,
+                    workflow_id=workflow_id,
+                    reasoning_enabled=(
+                        task_category == "complex_reasoning"
+                        and selected_settings.reasoning_enabled
+                    ),
+                    context_truncated=context_truncated,
+                    is_final=bool(activities) or not claim_validation_required,
+                ),
             )
             response = routed_completion.response
         except ProviderError as error:
@@ -725,6 +854,7 @@ def execute_agent_request(
                 warnings=tuple(warnings),
                 usage=UsageMetadata(input_tokens or None, output_tokens or None),
                 error_code=error.code,
+                telemetry=tuple(model_telemetry),
             )
         except Exception as error:
             logger.error("Unexpected agent provider failure (%s)", type(error).__name__)
@@ -745,8 +875,75 @@ def execute_agent_request(
                 warnings=tuple(warnings),
                 usage=UsageMetadata(input_tokens or None, output_tokens or None),
                 error_code="provider_unavailable",
+                telemetry=tuple(model_telemetry),
             )
 
+        if (
+            response.finish_reason.lower() in {"length", "max_tokens"}
+            and not response.message.tool_calls
+            and turn_category == "conversation"
+            and not activities
+            and response.message.content.strip()
+        ):
+            input_tokens += response.usage.input_tokens or 0
+            output_tokens += response.usage.output_tokens or 0
+            try:
+                continuation = model_router.complete(
+                    "orchestrator",
+                    ModelRequest(
+                        model=model_name,
+                        messages=(
+                            *messages,
+                            response.message,
+                            ProviderMessage(
+                                role="user",
+                                content=(
+                                    "Continue the answer from its last complete point. "
+                                    "Do not repeat text already provided."
+                                ),
+                            ),
+                        ),
+                        tools=(),
+                        max_output_tokens=min(1024, task_profile.max_output_tokens),
+                        task_category="conversation",
+                        workflow_id=workflow_id,
+                        context_truncated=context_truncated,
+                        is_final=True,
+                    ),
+                ).response
+            except ProviderError as error:
+                warnings.append(
+                    "The response was truncated and its single continuation attempt failed."
+                )
+                return AgentOutcome(
+                    status="partial",
+                    assistant_text=response.message.content[:MAX_ASSISTANT_CHARS],
+                    activities=tuple(activities),
+                    structured_results=tuple(structured_results),
+                    warnings=tuple(warnings),
+                    usage=UsageMetadata(input_tokens or None, output_tokens or None),
+                    error_code=error.code,
+                    telemetry=tuple(model_telemetry),
+                )
+            continuation_text = continuation.message.content.strip()
+            combined_text = response.message.content
+            if continuation_text and not continuation.message.tool_calls:
+                combined_text = f"{combined_text.rstrip()}\n{continuation_text}"
+            response = replace(
+                continuation,
+                message=replace(
+                    continuation.message,
+                    content=combined_text,
+                    tool_calls=(),
+                ),
+                finish_reason=(
+                    "length"
+                    if continuation.finish_reason.lower() in {"length", "max_tokens"}
+                    or continuation.message.tool_calls
+                    or not continuation_text
+                    else continuation.finish_reason
+                ),
+            )
         input_tokens += response.usage.input_tokens or 0
         output_tokens += response.usage.output_tokens or 0
         assistant_message = response.message
@@ -773,6 +970,7 @@ def execute_agent_request(
                     warnings=tuple(warnings),
                     usage=UsageMetadata(input_tokens or None, output_tokens or None),
                     error_code="provider_response_invalid",
+                    telemetry=tuple(model_telemetry),
                 )
             if response.finish_reason.lower() in {"length", "max_tokens"}:
                 message = "The model response was truncated by its output limit. Ask for a shorter answer."
@@ -789,6 +987,7 @@ def execute_agent_request(
                     warnings=tuple(warnings),
                     usage=UsageMetadata(input_tokens or None, output_tokens or None),
                     error_code="response_truncated",
+                    telemetry=tuple(model_telemetry),
                 )
             break
 
@@ -808,6 +1007,7 @@ def execute_agent_request(
                     warnings=tuple(warnings),
                     usage=UsageMetadata(input_tokens or None, output_tokens or None),
                     error_code="tool_call_limit",
+                    telemetry=tuple(model_telemetry),
                 )
 
             tool_calls_used += 1
@@ -1320,8 +1520,9 @@ def execute_agent_request(
                     if engine_status != "completed"
                     else None
                 ),
+                telemetry=tuple(model_telemetry),
             )
-        if turn + 1 == selected_settings.max_model_turns:
+        if turn + 1 == max_model_turns:
             warnings.append(TURN_LIMIT_MESSAGE)
             break
 
@@ -1339,6 +1540,7 @@ def execute_agent_request(
             warnings=tuple(warnings or [TURN_LIMIT_MESSAGE]),
             usage=UsageMetadata(input_tokens or None, output_tokens or None),
             error_code="model_turn_limit",
+            telemetry=tuple(model_telemetry),
         )
     if any_tool_failure:
         status = "partial"
@@ -1357,6 +1559,7 @@ def execute_agent_request(
             warnings=tuple(dict.fromkeys(warnings or [TURN_LIMIT_MESSAGE])),
             usage=UsageMetadata(input_tokens or None, output_tokens or None),
             error_code="model_turn_limit",
+            telemetry=tuple(model_telemetry),
         )
     try:
         result_bytes = _json_bytes(structured_results)
@@ -1409,6 +1612,7 @@ def execute_agent_request(
                 if status == "partial"
                 else None
             ),
+            telemetry=tuple(model_telemetry),
         )
 
     if _is_raw_claims_envelope(final_text):
@@ -1428,6 +1632,7 @@ def execute_agent_request(
             warnings=tuple(dict.fromkeys(envelope_warnings)),
             usage=UsageMetadata(input_tokens or None, output_tokens or None),
             error_code="unvalidated_claim_envelope",
+            telemetry=tuple(model_telemetry),
         )
 
     return AgentOutcome(
@@ -1438,6 +1643,7 @@ def execute_agent_request(
         warnings=tuple(dict.fromkeys(warnings)),
         usage=UsageMetadata(input_tokens or None, output_tokens or None),
         error_code="tool_execution_incomplete" if status == "partial" else None,
+        telemetry=tuple(model_telemetry),
     )
 
 
@@ -1452,4 +1658,7 @@ def public_outcome_metadata(outcome: AgentOutcome) -> dict[str, Any]:
             "input_tokens": outcome.usage.input_tokens,
             "output_tokens": outcome.usage.output_tokens,
         },
+        "model_telemetry": [
+            item.as_dict() for item in outcome.telemetry
+        ],
     }

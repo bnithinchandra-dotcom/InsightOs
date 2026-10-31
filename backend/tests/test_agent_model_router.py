@@ -9,8 +9,10 @@ from app.agent.contracts import (
     ModelResponse,
     ProviderError,
     ProviderMessage,
+    RequestTelemetry,
+    UsageMetadata,
 )
-from app.agent.model_router import AgentModelRouter
+from app.agent.model_router import AgentModelRouter, WorkflowTokenBudget
 
 
 def _settings():
@@ -103,6 +105,177 @@ class ModelRouterTests(unittest.TestCase):
                 ),
             )
         self.assertEqual(selected.model, "qwen3:4b")
+
+    def test_task_specific_output_budgets_and_global_hard_cap(self):
+        configured = replace(_settings(), max_output_tokens=65_535)
+        router = AgentModelRouter(settings=configured, provider=self.provider)
+        categories = {
+            "lightweight": 1024,
+            "routing": 768,
+            "conversation": 3072,
+            "analytical": 4096,
+            "complex_reasoning": 6144,
+            "verification": 2048,
+        }
+        for category, expected in categories.items():
+            with self.subTest(category=category):
+                router.complete(
+                    "orchestrator",
+                    ModelRequest(
+                        model="ignored",
+                        messages=(ProviderMessage(role="user", content="test"),),
+                        tools=(),
+                        max_output_tokens=65_535,
+                        task_category=category,
+                        is_final=True,
+                    ),
+                )
+                routed = self.provider.complete.call_args.args[0]
+                self.assertEqual(routed.max_output_tokens, expected)
+                self.assertLessEqual(routed.max_output_tokens, 16_384)
+
+    def test_router_applies_task_timeout_without_exceeding_global_timeout(self):
+        configured = replace(_settings(), timeout_seconds=90)
+        router = AgentModelRouter(settings=configured, provider=self.provider)
+        router.complete(
+            "orchestrator",
+            ModelRequest(
+                model="ignored",
+                messages=(ProviderMessage(role="user", content="route"),),
+                tools=(),
+                max_output_tokens=32,
+                task_category="routing",
+            ),
+        )
+        self.assertEqual(
+            self.provider.complete.call_args.args[0].timeout_seconds,
+            20.0,
+        )
+
+    def test_workflow_budget_aggregates_actual_usage_and_reserves_final_capacity(self):
+        settings = replace(
+            _settings(),
+            max_output_tokens=16_384,
+            workflow_token_budget=5_000,
+            workflow_final_reserve_tokens=1_000,
+        )
+        self.provider.complete.side_effect = [
+            ModelResponse(
+                ProviderMessage(role="assistant", content="routed"),
+                finish_reason="stop",
+                usage=UsageMetadata(input_tokens=200, output_tokens=300),
+            ),
+            ModelResponse(
+                ProviderMessage(role="assistant", content="inspected"),
+                finish_reason="stop",
+                usage=UsageMetadata(input_tokens=100, output_tokens=200),
+            ),
+            ModelResponse(
+                ProviderMessage(role="assistant", content="verified"),
+                finish_reason="stop",
+                usage=UsageMetadata(input_tokens=100, output_tokens=100),
+            ),
+        ]
+        telemetry = []
+        router = AgentModelRouter(
+            settings=settings,
+            provider=self.provider,
+            workflow_budget=WorkflowTokenBudget(5_000, 1_000),
+            telemetry_callback=telemetry.append,
+        )
+        for role in (
+            "orchestrator",
+            "data_intelligence",
+            "analytics_modelling",
+        ):
+            router.complete(
+                role,
+                ModelRequest(
+                    model="ignored",
+                    messages=(ProviderMessage(role="user", content="private"),),
+                    tools=(),
+                    max_output_tokens=16_384,
+                    task_category="analytical",
+                    workflow_id="a" * 32,
+                ),
+            )
+        self.assertEqual(telemetry[-1].cumulative_input_tokens, 400)
+        self.assertEqual(telemetry[-1].cumulative_output_tokens, 600)
+        self.assertEqual(telemetry[-1].workflow_budget_tokens, 5_000)
+        self.assertNotIn("private", str(telemetry[-1].as_dict()))
+        self.assertEqual(self.provider.complete.call_args_list[0].args[0].max_output_tokens, 4_000)
+
+    def test_workflow_budget_fails_closed_when_reserved_capacity_is_exhausted(self):
+        budget = WorkflowTokenBudget(1_000, 400)
+        self.assertEqual(budget.reserve_output(768, is_final=False), 600)
+        budget.record(600, UsageMetadata(input_tokens=350, output_tokens=250))
+        with self.assertRaises(ProviderError) as raised:
+            budget.reserve_output(768, is_final=False)
+        self.assertEqual(raised.exception.code, "workflow_token_budget_exhausted")
+
+    def test_router_marks_length_finish_reason_incomplete(self):
+        self.provider.complete.return_value = ModelResponse(
+            message=ProviderMessage(role="assistant", content="Partial"),
+            finish_reason="length",
+            usage=UsageMetadata(input_tokens=8, output_tokens=12),
+        )
+        telemetry = []
+        router = AgentModelRouter(
+            settings=replace(_settings(), max_output_tokens=16_384),
+            provider=self.provider,
+            telemetry_callback=telemetry.append,
+        )
+        result = router.complete(
+            "orchestrator",
+            ModelRequest(
+                model="ignored",
+                messages=(ProviderMessage(role="user", content="private"),),
+                tools=(),
+                max_output_tokens=3072,
+                task_category="conversation",
+                workflow_id="b" * 32,
+            ),
+        )
+        self.assertTrue(result.response.telemetry.incomplete)
+        self.assertEqual(telemetry[0].input_tokens, 8)
+        self.assertEqual(telemetry[0].output_tokens, 12)
+
+    def test_failed_generation_telemetry_is_sanitized_and_reports_failure(self):
+        self.provider.complete.side_effect = ProviderError(
+            "provider_timeout",
+            "Private provider detail must not be logged.",
+            retryable=True,
+        )
+        telemetry = []
+        router = AgentModelRouter(
+            settings=_settings(),
+            provider=self.provider,
+            telemetry_callback=telemetry.append,
+        )
+        with self.assertRaises(ProviderError):
+            router.complete(
+                "orchestrator",
+                ModelRequest(
+                    model="ignored",
+                    messages=(
+                        ProviderMessage(
+                            role="user",
+                            content="private dataset prompt",
+                        ),
+                    ),
+                    tools=(),
+                    max_output_tokens=32,
+                    task_category="conversation",
+                    workflow_id="c" * 32,
+                ),
+            )
+        self.assertEqual(len(telemetry), 1)
+        self.assertEqual(telemetry[0].failure_reason, "provider_timeout")
+        self.assertTrue(telemetry[0].incomplete)
+        self.assertEqual(telemetry[0].retries, 0)
+        self.assertIsNone(telemetry[0].input_tokens)
+        self.assertNotIn("private dataset prompt", str(telemetry[0].as_dict()))
+        self.assertNotIn("Private provider detail", str(telemetry[0].as_dict()))
 
     def test_waiting_for_inference_slot_times_out_without_calling_provider(self):
         lock = threading.BoundedSemaphore(1)
@@ -320,4 +493,3 @@ class RegistryGateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

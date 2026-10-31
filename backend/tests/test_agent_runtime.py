@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import httpx2
 
-from app.agent.config import AgentSettings, get_agent_settings
+from app.agent.config import AgentSettings, get_agent_settings, resolve_task_budget
 from app.agent.contracts import (
     ModelIdentity,
     ModelRequest,
@@ -22,7 +22,12 @@ from app.agent.contracts import (
 )
 from app.agent.model_router import AgentModelRouter
 from app.agent.providers import OpenAICompatibleProvider, OllamaProvider, create_provider
-from app.agent.runtime import SYSTEM_INSTRUCTIONS, execute_agent_request
+from app.agent.runtime import (
+    SYSTEM_INSTRUCTIONS,
+    _bounded_history,
+    execute_agent_request,
+    public_outcome_metadata,
+)
 from app.agent.tools import StrictArguments, ToolDefinition, ToolRegistry
 
 
@@ -92,6 +97,16 @@ class SequenceProvider:
 
 
 class AgentProviderTests(unittest.TestCase):
+    def test_invalid_reasoning_configuration_is_rejected(self):
+        with patch.dict(
+            os.environ,
+            {"INSIGHTOS_OLLAMA_THINK": "sometimes"},
+            clear=True,
+        ):
+            with self.assertRaises(ProviderError) as raised:
+                get_agent_settings()
+        self.assertEqual(raised.exception.code, "provider_configuration_invalid")
+
     def test_explicit_qwen_configuration_selects_ollama_without_an_api_key(self):
         with patch.dict(
             os.environ,
@@ -186,6 +201,108 @@ class AgentProviderTests(unittest.TestCase):
         self.assertEqual(response.usage, UsageMetadata(4, 2))
         self.assertEqual(client.request[1], "http://provider.invalid/api/chat")
         self.assertNotIn("think", client.request[2])
+
+    def test_ollama_records_request_telemetry(self):
+        client = FakeHttpClient(
+            FakeHttpResponse({
+                "message": {"role": "assistant", "content": "Ready."},
+                "done_reason": "stop",
+                "prompt_eval_count": 5,
+                "eval_count": 7,
+            })
+        )
+        with patch("app.agent.providers.httpx2.Client", return_value=client):
+            response = OllamaProvider(settings()).complete(
+                ModelRequest("fixture-model", (), (), 32)
+            )
+        self.assertIsNotNone(response.telemetry)
+        self.assertEqual(response.telemetry.provider, "ollama")
+        self.assertEqual(response.telemetry.model, "fixture-model")
+        self.assertEqual(response.telemetry.input_tokens, 5)
+        self.assertEqual(response.telemetry.output_tokens, 7)
+        self.assertEqual(response.telemetry.finish_reason, "stop")
+
+    def test_ollama_missing_provider_metrics_remain_unavailable(self):
+        client = FakeHttpClient(
+            FakeHttpResponse({
+                "message": {"role": "assistant", "content": "Ready."},
+                "done_reason": "stop",
+            })
+        )
+        with patch("app.agent.providers.httpx2.Client", return_value=client):
+            response = OllamaProvider(settings()).complete(
+                ModelRequest("fixture-model", (), (), 32)
+            )
+        self.assertEqual(response.usage, UsageMetadata())
+        self.assertIsNone(response.telemetry.input_tokens)
+        self.assertIsNone(response.telemetry.output_tokens)
+        self.assertIsNone(response.telemetry.tokens_per_second)
+
+    def test_task_budget_resolution_and_num_ctx_are_explicitly_configurable(self):
+        with patch.dict(
+            os.environ,
+            {
+                "INSIGHTOS_LLM_TASK_CATEGORY": "analytical",
+                "INSIGHTOS_OLLAMA_NUM_CTX": "4096",
+                "INSIGHTOS_LLM_LIVE_TEST_PROFILE": "true",
+            },
+            clear=True,
+        ):
+            profile = resolve_task_budget("analytical")
+            live_profile = resolve_task_budget("analytical", allow_live_test=True)
+            configured = get_agent_settings()
+        self.assertEqual(profile.max_output_tokens, 4096)
+        self.assertEqual(live_profile.name, "live_test")
+        self.assertEqual(live_profile.max_output_tokens, 4096)
+        self.assertEqual(configured.num_ctx, 4096)
+
+    def test_ollama_context_and_reasoning_are_profile_bounded(self):
+        client = FakeHttpClient(
+            FakeHttpResponse({
+                "message": {"role": "assistant", "content": "Reasoned."},
+                "done_reason": "stop",
+                "prompt_eval_count": 4,
+                "eval_count": 2,
+                "load_duration": 1_000_000,
+                "prompt_eval_duration": 2_000_000,
+                "eval_duration": 500_000_000,
+            })
+        )
+        configured = settings()
+        configured = replace(
+            configured,
+            max_output_tokens=16_384,
+            num_ctx=65_536,
+            reasoning_enabled=True,
+        )
+        router = AgentModelRouter(
+            settings=configured,
+            provider=OllamaProvider(configured),
+        )
+        with patch("app.agent.providers.httpx2.Client", return_value=client):
+            completion = router.complete(
+                "orchestrator",
+                ModelRequest(
+                    "ignored",
+                    (ProviderMessage(role="user", content="complex"),),
+                    (),
+                    16_384,
+                    task_category="complex_reasoning",
+                    reasoning_enabled=True,
+                    is_final=True,
+                ),
+            )
+        self.assertNotIn("think", client.request[2])
+        self.assertEqual(client.request[2]["options"]["num_ctx"], 49_152)
+        self.assertEqual(
+            completion.response.telemetry.model_load_duration_ms,
+            1.0,
+        )
+        self.assertEqual(
+            completion.response.telemetry.generation_duration_ms,
+            500.0,
+        )
+        self.assertEqual(completion.response.telemetry.tokens_per_second, 4.0)
 
     def test_ollama_uses_role_routed_model_for_generation(self):
         client = FakeHttpClient(
@@ -530,6 +647,54 @@ class AgentProviderTests(unittest.TestCase):
                 )
             )
         self.assertEqual(client.request[2]["format"], "json")
+
+    def test_ollama_generation_uses_task_timeout(self):
+        client = FakeHttpClient(
+            FakeHttpResponse({
+                "message": {"role": "assistant", "content": "Ready."},
+                "done_reason": "stop",
+            })
+        )
+        with patch(
+            "app.agent.providers.httpx2.Client",
+            return_value=client,
+        ) as client_factory:
+            OllamaProvider(settings()).complete(
+                ModelRequest(
+                    "fixture-model",
+                    (),
+                    (),
+                    32,
+                    timeout_seconds=7.0,
+                )
+            )
+        self.assertEqual(client_factory.call_args.kwargs["timeout"], 7.0)
+
+    def test_openai_generation_uses_task_timeout(self):
+        client = FakeHttpClient(
+            FakeHttpResponse({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "Ready."},
+                    "finish_reason": "stop",
+                }],
+            })
+        )
+        with patch(
+            "app.agent.providers.httpx2.Client",
+            return_value=client,
+        ) as client_factory:
+            OpenAICompatibleProvider(
+                settings("openai_compatible", api_key="fixture-secret")
+            ).complete(
+                ModelRequest(
+                    "fixture-model",
+                    (),
+                    (),
+                    32,
+                    timeout_seconds=7.0,
+                )
+            )
+        self.assertEqual(client_factory.call_args.kwargs["timeout"], 7.0)
 
     def test_ollama_health_requires_configured_model_in_runtime_model_list(self):
         available_client = FakeHttpClient(
@@ -1035,12 +1200,42 @@ class AgentProviderTests(unittest.TestCase):
         self.assertEqual(outcome.error_code, "provider_response_invalid")
         self.assertIn("returned an empty response", outcome.assistant_text)
 
-    def test_runtime_marks_truncated_output_as_partial(self):
+    def test_runtime_continues_truncated_conversation_once(self):
         provider = SequenceProvider([
             ModelResponse(
                 ProviderMessage(role="assistant", content="The answer is"),
                 finish_reason="length",
-            )
+                usage=UsageMetadata(input_tokens=3, output_tokens=5),
+            ),
+            ModelResponse(
+                ProviderMessage(role="assistant", content="complete."),
+                finish_reason="stop",
+                usage=UsageMetadata(input_tokens=7, output_tokens=2),
+            ),
+        ])
+        outcome = execute_agent_request(
+            user_message="Summarize the result",
+            history=[],
+            settings=settings(),
+            provider=provider,
+        )
+        self.assertEqual(outcome.status, "completed")
+        self.assertIsNone(outcome.error_code)
+        self.assertEqual(outcome.assistant_text, "The answer is\ncomplete.")
+        self.assertEqual(len(provider.requests), 2)
+        self.assertEqual(outcome.usage.input_tokens, 10)
+        self.assertEqual(outcome.usage.output_tokens, 7)
+
+    def test_runtime_reports_incomplete_after_one_failed_continuation(self):
+        provider = SequenceProvider([
+            ModelResponse(
+                ProviderMessage(role="assistant", content="Partial."),
+                finish_reason="length",
+            ),
+            ModelResponse(
+                ProviderMessage(role="assistant", content="Still unfinished."),
+                finish_reason="length",
+            ),
         ])
         outcome = execute_agent_request(
             user_message="Summarize the result",
@@ -1050,7 +1245,53 @@ class AgentProviderTests(unittest.TestCase):
         )
         self.assertEqual(outcome.status, "partial")
         self.assertEqual(outcome.error_code, "response_truncated")
-        self.assertEqual(outcome.assistant_text, "The answer is")
+        self.assertIn("Partial.", outcome.assistant_text)
+        self.assertIn("Still unfinished.", outcome.assistant_text)
+        self.assertEqual(len(provider.requests), 2)
+
+    def test_history_selection_is_bounded_and_reports_truncation(self):
+        selected, truncated = _bounded_history(
+            [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "middle"},
+                {"role": "user", "content": "latest"},
+            ],
+            settings(),
+            max_messages=2,
+        )
+        self.assertEqual([item.content for item in selected], ["middle", "latest"])
+        self.assertTrue(truncated)
+
+    def test_most_recent_history_is_never_silently_byte_truncated(self):
+        with self.assertRaises(ProviderError) as raised:
+            _bounded_history(
+                [{"role": "user", "content": "x" * (96 * 1024 + 1)}],
+                settings(),
+            )
+        self.assertEqual(raised.exception.code, "agent_context_too_large")
+
+    def test_context_truncation_is_in_request_telemetry_without_prompt_content(self):
+        provider = SequenceProvider([
+            ModelResponse(
+                ProviderMessage(role="assistant", content="Safe answer."),
+                finish_reason="stop",
+                usage=UsageMetadata(input_tokens=14, output_tokens=3),
+            )
+        ])
+        outcome = execute_agent_request(
+            user_message="What is this?",
+            history=[
+                {"role": "user", "content": f"private-{index}"}
+                for index in range(6)
+            ],
+            settings=settings(),
+            provider=provider,
+        )
+        self.assertTrue(outcome.telemetry[0].context_truncation)
+        metadata = public_outcome_metadata(outcome)
+        serialized = json.dumps(metadata)
+        self.assertIn('"input_tokens": 14', serialized)
+        self.assertNotIn("private-", serialized)
 
     def _run_list_projects_tool(
         self,

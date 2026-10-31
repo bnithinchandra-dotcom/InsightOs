@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
@@ -15,6 +16,7 @@ from app.agent.contracts import (
     ProviderHealth,
     ProviderError,
     ProviderMessage,
+    RequestTelemetry,
     ToolCall,
     UsageMetadata,
 )
@@ -88,11 +90,13 @@ def _parse_tool_calls(raw_calls: Any, *, openai_format: bool) -> tuple[ToolCall,
     return tuple(parsed)
 
 
-def _usage(raw_usage: Any, *, input_key: str, output_key: str) -> UsageMetadata:
+def _usage(raw_usage: Any, *, input_key: str, output_key: str, cached_key: str | None = None, reasoning_key: str | None = None) -> UsageMetadata:
     if not isinstance(raw_usage, dict):
         return UsageMetadata()
     input_tokens = raw_usage.get(input_key)
     output_tokens = raw_usage.get(output_key)
+    cached_tokens = raw_usage.get(cached_key) if cached_key else None
+    reasoning_tokens = raw_usage.get(reasoning_key) if reasoning_key else None
     return UsageMetadata(
         input_tokens=(
             input_tokens
@@ -102,6 +106,16 @@ def _usage(raw_usage: Any, *, input_key: str, output_key: str) -> UsageMetadata:
         output_tokens=(
             output_tokens
             if isinstance(output_tokens, int) and not isinstance(output_tokens, bool) and output_tokens >= 0
+            else None
+        ),
+        cached_tokens=(
+            cached_tokens
+            if isinstance(cached_tokens, int) and not isinstance(cached_tokens, bool) and cached_tokens >= 0
+            else None
+        ),
+        reasoning_tokens=(
+            reasoning_tokens
+            if isinstance(reasoning_tokens, int) and not isinstance(reasoning_tokens, bool) and reasoning_tokens >= 0
             else None
         ),
     )
@@ -224,10 +238,16 @@ class _HttpProvider:
         url: str,
         headers: dict[str, str],
         payload: dict[str, Any] | None = None,
+        *,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         try:
             with httpx2.Client(
-                timeout=self.settings.timeout_seconds,
+                timeout=(
+                    timeout_seconds
+                    if timeout_seconds is not None
+                    else self.settings.timeout_seconds
+                ),
                 transport=self.transport,
                 follow_redirects=False,
             ) as client:
@@ -313,8 +333,30 @@ class _HttpProvider:
         url: str,
         payload: dict[str, Any],
         headers: dict[str, str],
+        *,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
-        return self._request("POST", url, headers, payload)
+        return self._request(
+            "POST",
+            url,
+            headers,
+            payload,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def _post_for_request(
+        self,
+        request: ModelRequest,
+        url: str,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+    ) -> dict[str, Any]:
+        return self._post(
+            url,
+            payload,
+            headers,
+            timeout_seconds=request.timeout_seconds,
+        )
 
     def _get(self, url: str, headers: dict[str, str]) -> dict[str, Any]:
         return self._request("GET", url, headers)
@@ -377,11 +419,22 @@ class OllamaProvider(_HttpProvider):
                 "provider_not_configured",
                 "Configure a model before using the local model provider.",
             )
-        thinking_options = (
-            {"think": False}
-            if request.model.casefold().startswith("qwen3")
-            else {}
+        thinking_option = {}
+        if request.model.casefold().startswith("qwen3") and not request.reasoning_enabled:
+            thinking_option = {"think": False}
+        configured_num_ctx = getattr(self.settings, "num_ctx", None)
+        request_num_ctx = request.context_token_limit
+        num_ctx = (
+            min(configured_num_ctx, request_num_ctx)
+            if isinstance(configured_num_ctx, int)
+            and configured_num_ctx > 0
+            and isinstance(request_num_ctx, int)
+            and request_num_ctx > 0
+            else configured_num_ctx
         )
+        options = {"num_predict": request.max_output_tokens}
+        if isinstance(num_ctx, int) and num_ctx > 0:
+            options["num_ctx"] = num_ctx
         # Pass keep_alive when configured; omit the key entirely when None
         # so Ollama applies its own default TTL without our interference.
         keep_alive_seconds = getattr(self.settings, "ollama_keep_alive_seconds", None)
@@ -390,6 +443,7 @@ class OllamaProvider(_HttpProvider):
             if isinstance(keep_alive_seconds, int) and keep_alive_seconds >= 0
             else {}
         )
+        start = time.perf_counter()
         payload = self._post(
             f"{self.settings.base_url}/api/chat",
             {
@@ -399,31 +453,104 @@ class OllamaProvider(_HttpProvider):
                 ],
                 "tools": list(request.tools),
                 "stream": False,
-                "options": {"num_predict": request.max_output_tokens},
-                **thinking_options,
+                "options": options,
+                **thinking_option,
                 **keep_alive_option,
                 **({"format": "json"} if request.response_format == "json" else {}),
             },
             {},
+            timeout_seconds=request.timeout_seconds,
         )
+        request_duration_ms = (time.perf_counter() - start) * 1000.0
         if isinstance(payload.get("error"), str) and payload["error"]:
             raise ProviderError(
                 "provider_inference_failed",
                 "Ollama could not generate a response with the configured model.",
+                telemetry=RequestTelemetry(
+                    provider="ollama",
+                    model=request.model,
+                    request_duration_ms=request_duration_ms,
+                    finish_reason=str(payload.get("done_reason") or "error"),
+                    failure_reason="provider_inference_failed",
+                    incomplete=True,
+                ),
             )
         message = _provider_message(payload.get("message"), openai_format=False)
         if not message.tool_calls and not message.content.strip():
             raise ProviderError(
                 "provider_response_invalid",
                 "The configured model returned an empty response.",
+                telemetry=RequestTelemetry(
+                    provider="ollama",
+                    model=request.model,
+                    request_duration_ms=request_duration_ms,
+                    finish_reason=str(payload.get("done_reason") or "empty"),
+                    failure_reason="empty_response",
+                    incomplete=True,
+                ),
             )
+        usage = _usage(
+            payload,
+            input_key="prompt_eval_count",
+            output_key="eval_count",
+            cached_key="prompt_eval_cached",
+        )
+        thinking_tokens = (
+            payload.get("thinking_tokens")
+            if isinstance(payload.get("thinking_tokens"), int)
+            and not isinstance(payload.get("thinking_tokens"), bool)
+            else None
+        )
+        if thinking_tokens is not None and thinking_tokens < 0:
+            thinking_tokens = None
+        prompt_eval_duration_ms = payload.get("prompt_eval_duration")
+        generation_duration_ms = payload.get("eval_duration")
+        model_load_duration_ms = payload.get("load_duration")
+        prompt_eval_duration_ms = (
+            prompt_eval_duration_ms / 1_000_000
+            if isinstance(prompt_eval_duration_ms, (int, float))
+            and prompt_eval_duration_ms >= 0
+            else None
+        )
+        generation_duration_ms = (
+            generation_duration_ms / 1_000_000
+            if isinstance(generation_duration_ms, (int, float))
+            and generation_duration_ms >= 0
+            else None
+        )
+        model_load_duration_ms = (
+            model_load_duration_ms / 1_000_000
+            if isinstance(model_load_duration_ms, (int, float))
+            and model_load_duration_ms >= 0
+            else None
+        )
+        tokens_per_second = (
+            usage.output_tokens / (generation_duration_ms / 1000)
+            if usage.output_tokens is not None
+            and generation_duration_ms is not None
+            and generation_duration_ms > 0
+            else None
+        )
         return ModelResponse(
             message=message,
             finish_reason=str(payload.get("done_reason") or "stop"),
-            usage=_usage(
-                payload,
-                input_key="prompt_eval_count",
-                output_key="eval_count",
+            usage=usage,
+            telemetry=RequestTelemetry(
+                provider="ollama",
+                model=request.model,
+                input_tokens=usage.input_tokens,
+                cached_tokens=usage.cached_tokens,
+                output_tokens=usage.output_tokens,
+                thinking_tokens=thinking_tokens,
+                model_load_duration_ms=model_load_duration_ms,
+                prompt_eval_duration_ms=prompt_eval_duration_ms,
+                generation_duration_ms=generation_duration_ms,
+                request_duration_ms=request_duration_ms,
+                tokens_per_second=tokens_per_second,
+                tool_calls=len(message.tool_calls),
+                finish_reason=str(payload.get("done_reason") or "stop"),
+                incomplete=str(payload.get("done_reason") or "").lower()
+                in {"length", "max_tokens"},
             ),
         )
 
@@ -505,7 +632,9 @@ class OpenAICompatibleProvider(_HttpProvider):
                 "A model and API key are required for the OpenAI-compatible provider.",
             )
         endpoint = self._endpoint("chat/completions")
-        payload = self._post(
+        start = time.perf_counter()
+        payload = self._post_for_request(
+            request,
             endpoint,
             {
                 "model": request.model,
@@ -521,11 +650,20 @@ class OpenAICompatibleProvider(_HttpProvider):
             },
             {"Authorization": f"Bearer {self.settings.api_key}"},
         )
+        request_duration_ms = (time.perf_counter() - start) * 1000.0
         choices = payload.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             raise ProviderError(
                 "provider_response_invalid",
                 "The configured model returned an invalid response.",
+                telemetry=RequestTelemetry(
+                    provider="openai_compatible",
+                    model=request.model,
+                    request_duration_ms=request_duration_ms,
+                    finish_reason="invalid_response",
+                    failure_reason="invalid_response",
+                    incomplete=True,
+                ),
             )
         choice = choices[0]
         message = _provider_message(choice.get("message"), openai_format=True)
@@ -533,14 +671,68 @@ class OpenAICompatibleProvider(_HttpProvider):
             raise ProviderError(
                 "provider_response_invalid",
                 "The configured model returned an empty response.",
+                telemetry=RequestTelemetry(
+                    provider="openai_compatible",
+                    model=request.model,
+                    request_duration_ms=request_duration_ms,
+                    finish_reason=str(choice.get("finish_reason") or "empty"),
+                    failure_reason="empty_response",
+                    incomplete=True,
+                ),
             )
+        usage = _usage(
+            payload.get("usage"),
+            input_key="prompt_tokens",
+            output_key="completion_tokens",
+        )
+        if isinstance(payload.get("usage"), dict):
+            details = payload["usage"].get("prompt_tokens_details")
+            if isinstance(details, dict):
+                cached = details.get("cached_tokens")
+                if (
+                    isinstance(cached, int)
+                    and not isinstance(cached, bool)
+                    and cached >= 0
+                ):
+                    usage = UsageMetadata(
+                        input_tokens=usage.input_tokens,
+                        output_tokens=usage.output_tokens,
+                        cached_tokens=cached,
+                        reasoning_tokens=None,
+                    )
+            completion_details = payload["usage"].get("completion_tokens_details")
+            if isinstance(completion_details, dict):
+                reasoning_tokens = completion_details.get("reasoning_tokens")
+                if (
+                    isinstance(reasoning_tokens, int)
+                    and not isinstance(reasoning_tokens, bool)
+                    and reasoning_tokens >= 0
+                ):
+                    usage = UsageMetadata(
+                        input_tokens=usage.input_tokens,
+                        output_tokens=usage.output_tokens,
+                        cached_tokens=usage.cached_tokens,
+                        reasoning_tokens=reasoning_tokens,
+                    )
+        tokens_per_second = None
+        if usage.output_tokens is not None and request_duration_ms > 0:
+            tokens_per_second = usage.output_tokens / (request_duration_ms / 1000.0)
         return ModelResponse(
             message=message,
             finish_reason=str(choice.get("finish_reason") or "stop"),
-            usage=_usage(
-                payload.get("usage"),
-                input_key="prompt_tokens",
-                output_key="completion_tokens",
+            usage=usage,
+            telemetry=RequestTelemetry(
+                provider="openai_compatible",
+                model=request.model,
+                input_tokens=usage.input_tokens,
+                cached_tokens=usage.cached_tokens,
+                output_tokens=usage.output_tokens,
+                request_duration_ms=request_duration_ms,
+                tokens_per_second=tokens_per_second,
+                tool_calls=len(message.tool_calls),
+                finish_reason=str(choice.get("finish_reason") or "stop"),
+                incomplete=str(choice.get("finish_reason") or "").lower()
+                in {"length", "max_tokens"},
             ),
         )
 
