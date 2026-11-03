@@ -25,6 +25,7 @@ from app.agent.providers import OpenAICompatibleProvider, OllamaProvider, create
 from app.agent.runtime import (
     SYSTEM_INSTRUCTIONS,
     _bounded_history,
+    _orchestrator_system_instructions,
     execute_agent_request,
     public_outcome_metadata,
 )
@@ -139,6 +140,12 @@ class AgentProviderTests(unittest.TestCase):
         self.assertIn("customer count, churn count, and time period separately", SYSTEM_INSTRUCTIONS)
         self.assertIn("ask a concise clarification", SYSTEM_INSTRUCTIONS)
         self.assertIn("only when the corresponding tool result is present", SYSTEM_INSTRUCTIONS)
+
+    def test_orchestrator_uses_versioned_model_specific_bi_guidance(self):
+        instructions = _orchestrator_system_instructions("qwen3:8b")
+        self.assertIn("Prefer persisted verified outputs", instructions)
+        self.assertIn("Senior analyst: separate evidence", instructions)
+        self.assertIn("only the approved deterministic InsightOS tools", instructions)
 
     def test_default_registry_only_advertises_read_only_tools(self):
         registry = ToolRegistry()
@@ -292,7 +299,7 @@ class AgentProviderTests(unittest.TestCase):
                     is_final=True,
                 ),
             )
-        self.assertNotIn("think", client.request[2])
+        self.assertIs(client.request[2]["think"], True)
         self.assertEqual(client.request[2]["options"]["num_ctx"], 49_152)
         self.assertEqual(
             completion.response.telemetry.model_load_duration_ms,
@@ -303,6 +310,29 @@ class AgentProviderTests(unittest.TestCase):
             500.0,
         )
         self.assertEqual(completion.response.telemetry.tokens_per_second, 4.0)
+
+    def test_request_context_limit_is_forwarded_without_global_num_ctx(self):
+        client = FakeHttpClient(
+            FakeHttpResponse({
+                "message": {"role": "assistant", "content": "Ready."},
+                "done_reason": "stop",
+            })
+        )
+        configured = settings()
+        self.assertIsNone(configured.num_ctx)
+
+        with patch("app.agent.providers.httpx2.Client", return_value=client):
+            OllamaProvider(configured).complete(
+                ModelRequest(
+                    "qwen3:8b",
+                    (ProviderMessage(role="user", content="bounded"),),
+                    (),
+                    32,
+                    context_token_limit=16_384,
+                )
+            )
+
+        self.assertEqual(client.request[2]["options"]["num_ctx"], 16_384)
 
     def test_ollama_uses_role_routed_model_for_generation(self):
         client = FakeHttpClient(

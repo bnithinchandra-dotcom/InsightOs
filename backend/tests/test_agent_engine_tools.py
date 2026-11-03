@@ -1,4 +1,6 @@
 import json
+import os
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -111,6 +113,64 @@ class EngineRequestProvider:
         )
 
 
+class LifecycleEngineRequestProvider(EngineRequestProvider):
+    def __init__(self, tool_name, arguments):
+        super().__init__(tool_name, arguments)
+        self._resident_models = set()
+        self.lifecycle_events = []
+        self.maximum_resident_models = 0
+        self.generation_active = False
+        self.generation_started = threading.Event()
+        self.preparation_observed = threading.Event()
+
+    def load_model(self, model):
+        self.lifecycle_events.append(("load", model))
+        self._resident_models.add(model)
+        self.maximum_resident_models = max(
+            self.maximum_resident_models,
+            len(self._resident_models),
+        )
+        if self.maximum_resident_models > 1:
+            raise AssertionError("More than one managed model became resident.")
+
+    def unload_model(self, model):
+        if self.generation_active:
+            raise AssertionError("A model was unloaded during generation.")
+        self.lifecycle_events.append(("unload", model))
+        self._resident_models.discard(model)
+
+    def loaded_models(self):
+        return frozenset(self._resident_models)
+
+    def complete(self, request):
+        if request.model not in self.loaded_models():
+            raise AssertionError("Inference started before model activation.")
+        self.generation_active = True
+        try:
+            system = request.messages[0].content if request.messages else ""
+            if "Agent 1, Data Intelligence" in system:
+                self.generation_started.set()
+                self.preparation_observed.wait(timeout=1)
+            return super().complete(request)
+        finally:
+            self.generation_active = False
+
+
+class PreparationOverlapRegistry(ToolRegistry):
+    def __init__(self, provider):
+        super().__init__()
+        self.provider = provider
+        self.preparation_overlapped_generation = False
+
+    def execute(self, name, raw_arguments, *, context=None):
+        if name in {"list_files", "get_quality_report", "list_eda_results"}:
+            if self.provider.generation_started.wait(timeout=1):
+                if self.provider.generation_active:
+                    self.preparation_overlapped_generation = True
+                    self.provider.preparation_observed.set()
+        return super().execute(name, raw_arguments, context=context)
+
+
 class DatasetEngineToolTests(unittest.TestCase):
     def setUp(self):
         self.main = SimpleNamespace(
@@ -194,6 +254,143 @@ class DatasetEngineToolTests(unittest.TestCase):
         self.main_patch = patch("app.agent.tools._main", return_value=self.main)
         self.main_patch.start()
         self.addCleanup(self.main_patch.stop)
+
+    def test_end_to_end_lifecycle_preparation_and_persisted_handoffs(self):
+        self.main.list_dataset_files = Mock(
+            return_value=[self.main.get_dataset_file.return_value]
+        )
+        self.main.get_dataset_file_quality_analysis = Mock(
+            return_value={
+                "dataset_id": 42,
+                "file_id": 7,
+                "report_is_current": True,
+                "quality_report": {
+                    "findings": [{"finding_id": "missing-sales", "title": "Missing sales"}],
+                    "provenance": {"operation_id": "quality-run-1"},
+                },
+            }
+        )
+        self.main.list_dataset_file_eda_analyses = Mock(
+            return_value={
+                "items": [
+                    {
+                        "id": 91,
+                        "status": "Completed",
+                        "provenance": {"operation_id": "eda-run-1"},
+                    }
+                ],
+                "total": 1,
+            }
+        )
+        provider = LifecycleEngineRequestProvider(
+            "run_eda_analysis",
+            {
+                "dataset_id": 42,
+                "file_id": 7,
+                "analysis_type": "univariate",
+                "table_index": 0,
+                "selected_columns": ["sales"],
+            },
+        )
+        registry = PreparationOverlapRegistry(provider)
+        persisted = {}
+
+        def persist_and_execute(name, arguments, execute, **kwargs):
+            task_key = f"task-{len(persisted) + 1}"
+            dependencies = kwargs.get("depends_on") or []
+            if any(dependency not in persisted for dependency in dependencies):
+                raise AssertionError("A handoff dependency was not persisted.")
+            if name == "specialist_analytics_modelling":
+                self.assertEqual(arguments["preparation"]["llm_calls"], 0)
+            output, result, label = execute()
+            persisted[task_key] = {
+                "name": name,
+                "arguments": arguments,
+                "result": result,
+            }
+            return output, result, label, task_key
+
+        with patch.dict(
+            os.environ,
+            {
+                "INSIGHTOS_LLM_MODEL_DATA_INTELLIGENCE": "qwen3:4b",
+                "INSIGHTOS_LLM_MODEL_ANALYTICS": "qwen3:4b",
+                "INSIGHTOS_LLM_MODEL_PRESENTATION": "qwen3:0.6b",
+            },
+        ):
+            outcome = execute_agent_request(
+                user_message="Run EDA on the sales column.",
+                history=[],
+                context={"dataset_id": 42, "conversation_id": 301},
+                settings=_settings(),
+                provider=provider,
+                registry=registry,
+                workflow_scheduler=persist_and_execute,
+            )
+
+        self.assertEqual(outcome.status, "completed")
+        self.assertTrue(registry.preparation_overlapped_generation)
+        self.assertEqual(provider.maximum_resident_models, 1)
+        self.assertFalse(provider.generation_active)
+        self.assertEqual(provider._resident_models, set())
+        self.assertEqual(
+            [request.model for request in provider.requests],
+            ["qwen3:8b", "qwen3:4b", "qwen3:4b", "qwen3:0.6b"],
+        )
+        self.assertEqual(
+            len(
+                [
+                    event
+                    for event in provider.lifecycle_events
+                    if event[0] == "load"
+                ]
+            ),
+            4,
+        )
+        self.assertEqual(self.main.analyze_dataset_file_eda.call_count, 1)
+        analytics_context = json.loads(
+            provider.requests[2].messages[-1].content
+        )["context"]
+        preparation = analytics_context["specialist_preparation"]
+        self.assertEqual(preparation["llm_calls"], 0)
+        self.assertEqual(preparation["quality_results"]["status"], "available")
+        self.assertEqual(preparation["eda_results"]["status"], "available")
+        self.assertEqual(preparation["dataset_inventory"]["status"], "available")
+        self.assertEqual(
+            preparation["handoff_context"]["previous_stage"]["recommended_operation"],
+            "run_eda_analysis",
+        )
+        specialist_results = [
+            item["result"]
+            for item in persisted.values()
+            if isinstance(item["result"].data, dict)
+            and "handoff" in item["result"].data
+        ]
+        analytics_task = next(
+            item
+            for item in persisted.values()
+            if item["name"] == "specialist_analytics_modelling"
+        )
+        self.assertEqual(
+            analytics_task["arguments"]["preparation"]["source_fingerprint"],
+            "source-checksum",
+        )
+        self.assertTrue(
+            all(
+                item["result"].data["handoff"]["verified"]
+                for item in persisted.values()
+                if isinstance(item["result"].data, dict)
+                and "handoff" in item["result"].data
+            )
+        )
+        self.assertEqual(len(specialist_results), 3)
+        trace = next(
+            result["data"]
+            for result in outcome.structured_results
+            if result["tool"] == "orchestration_trace"
+        )
+        self.assertEqual(trace["outcome"], "completed")
+        self.assertEqual(len(trace["stages"]), 5)
 
     def test_engine_tools_are_offered_only_for_explicit_selected_dataset_intent(self):
         registry = ToolRegistry()
@@ -431,7 +628,7 @@ class DatasetEngineToolTests(unittest.TestCase):
             result["data"]["provenance"]["source_sha256"],
             "abc",
         )
-        self.assertEqual(self.main.get_dataset_file.call_count, 2)
+        self.assertEqual(self.main.get_dataset_file.call_count, 3)
         trace = next(
             item
             for item in outcome.structured_results

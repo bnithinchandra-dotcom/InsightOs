@@ -153,6 +153,8 @@ from app.multi_dataset_analytics import (
 from app.ml_forecasting import (
     MAX_HORIZON,
     ForecastError,
+    decode_model_artifact,
+    encode_model_artifact,
     load_model_artifact,
     train_monthly_forecast,
 )
@@ -2376,13 +2378,18 @@ def _monthly_forecast_public_result(result: Any) -> dict[str, Any]:
     expected_result_sha256 = result.get("result_sha256")
     try:
         actual_result_sha256 = _monthly_forecast_result_sha256(result)
-        artifact_bytes = json.dumps(
-            result.get("model_artifact"),
-            ensure_ascii=False,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
+        if result.get("model_artifact_encoding") == "zlib+base64":
+            artifact_bytes = decode_model_artifact(
+                result.get("model_artifact_compressed")
+            )
+        else:
+            artifact_bytes = json.dumps(
+                result.get("model_artifact"),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
         artifact = load_model_artifact(
             artifact_bytes,
             result.get("model_artifact_sha256"),
@@ -2532,6 +2539,7 @@ def _monthly_forecast_public_result(result: Any) -> dict[str, Any]:
         "suitability": suitability,
         "uncertainty": uncertainty,
         "model_artifact_sha256": result["model_artifact_sha256"],
+        "experiment_record": result.get("experiment_record"),
         "model_artifact_reference": {
             "type": "forecast_model_artifact",
             "sha256": result["model_artifact_sha256"],
@@ -3985,8 +3993,12 @@ def create_monthly_forecast(request: MonthlyForecastRequest):
             "horizon": request.horizon,
             "source_fingerprint": source_fingerprint,
             "normalized_artifact_sha256": source_artifact_sha256,
-            "model_artifact": result["artifact"],
+            "model_artifact_encoding": "zlib+base64",
+            "model_artifact_compressed": encode_model_artifact(
+                result["artifact_bytes"]
+            ),
             "model_artifact_sha256": result["artifact_sha256"],
+            "experiment_record": result["forecast"]["experiment_record"],
             "historical": result["forecast"]["historical"],
             "forecast": result["forecast"]["forecast"],
             "warnings": result["forecast"]["warnings"],

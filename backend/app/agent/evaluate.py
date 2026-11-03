@@ -6,6 +6,7 @@ from argparse import ArgumentParser
 from pathlib import Path
 
 from app.agent.evaluation import run_evaluation
+from app.experiment_tracking import persist_experiment_record
 
 
 def main() -> int:
@@ -17,10 +18,12 @@ def main() -> int:
     )
     arguments = parser.parse_args()
     report = run_evaluation()
+    experiment_path = persist_experiment_record(report.experiment_record)
     serialized = json.dumps(report.to_dict(), indent=2, sort_keys=True)
     if arguments.output:
         arguments.output.parent.mkdir(parents=True, exist_ok=True)
         arguments.output.write_text(serialized + "\n", encoding="utf-8")
+    print(f"Experiment metadata saved to {experiment_path}", file=sys.stderr)
     print(serialized)
     return 1 if report.fail_count or report.skipped_count else 0
 

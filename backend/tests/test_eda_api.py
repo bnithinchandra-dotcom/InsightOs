@@ -249,6 +249,11 @@ class EDAApiTests(unittest.TestCase):
             body["result"]["evaluation"]["split_strategy"]["type"],
             "random_holdout",
         )
+        self.assertEqual(body["result"]["experiment_record"]["kind"], "supervised")
+        self.assertEqual(
+            body["result"]["experiment_record"]["dataset"]["fingerprint"],
+            body["result"]["source_fingerprint"],
+        )
         self.assertEqual(len(body["result"]["result_sha256"]), 64)
         self.assertNotIn("model", body["result"])
 
@@ -269,6 +274,10 @@ class EDAApiTests(unittest.TestCase):
         self.assertEqual(
             loaded.json()["result"]["result_sha256"],
             body["result"]["result_sha256"],
+        )
+        self.assertEqual(
+            loaded.json()["result"]["experiment_record"]["experiment_id"],
+            body["result"]["experiment_record"]["experiment_id"],
         )
         latest = self.client.get(
             "/api/v1/analytics/ml/supervised",
@@ -311,6 +320,8 @@ class EDAApiTests(unittest.TestCase):
         metrics = body["result"]["evaluation"]["test_result"]["model"]
         self.assertEqual(len(metrics["confusion_matrix"]), 4)
         self.assertIn("balanced_accuracy", metrics)
+        self.assertIn("f1_macro", metrics)
+        self.assertIn("per_class", metrics)
 
     def test_univariate_eda_success_and_persistence(self):
         file_id = self._setup_normalized_file()

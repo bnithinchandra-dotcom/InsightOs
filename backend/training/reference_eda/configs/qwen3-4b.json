@@ -1,0 +1,48 @@
+{
+  "config_version": "insightos-reference-eda-qwen3-4b-lora-v1",
+  "model_id": "Qwen/Qwen3-4B",
+  "revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+  "dataset_version": "insightos-reference-eda-v1",
+  "dataset_directory": "backend/training/reference_eda/dataset_v1",
+  "output_directory": "backend/artifacts/reference-eda-qwen3-4b",
+  "python": ">=3.10,<3.13",
+  "platform": "linux-x86_64-cuda",
+  "minimum_cuda_vram_gb": 24,
+  "max_sequence_length": 2048,
+  "quantization": {
+    "load_in_4bit": true,
+    "backend": "bitsandbytes",
+    "quant_type": "nf4",
+    "double_quant": true,
+    "compute_dtype": "auto"
+  },
+  "lora": {
+    "rank": 8,
+    "alpha": 16,
+    "dropout": 0.05,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ]
+  },
+  "training": {
+    "per_device_train_batch_size": 1,
+    "per_device_eval_batch_size": 1,
+    "gradient_accumulation_steps": 8,
+    "learning_rate": 0.00002,
+    "num_train_epochs": 1,
+    "warmup_ratio": 0.03,
+    "weight_decay": 0.01,
+    "logging_steps": 10,
+    "gradient_checkpointing": true,
+    "seed": 20260616,
+    "require_human_approved_examples": true,
+    "assistant_completion_only_loss": true,
+    "external_reporting": false
+  }
+}

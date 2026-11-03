@@ -1,0 +1,158 @@
+{
+  "approved_examples": 0,
+  "artifact_validation": {
+    "all_examples_remain_drafts": true,
+    "approved_examples": 0,
+    "draft_examples": 250,
+    "evaluation_cases": 20,
+    "evaluation_review_ready": false,
+    "examples": 250,
+    "leaking_groups": [],
+    "review_manifest_validated": true,
+    "scenario_counts": {
+      "ecommerce": 50,
+      "fraud": 50,
+      "healthcare": 50,
+      "maintenance": 50,
+      "marketing": 50
+    },
+    "scenario_coverage_by_split": {
+      "test": [
+        "ecommerce",
+        "fraud",
+        "healthcare",
+        "maintenance",
+        "marketing"
+      ],
+      "train": [
+        "ecommerce",
+        "fraud",
+        "healthcare",
+        "maintenance",
+        "marketing"
+      ],
+      "validation": [
+        "ecommerce",
+        "fraud",
+        "healthcare",
+        "maintenance",
+        "marketing"
+      ]
+    },
+    "scenario_groups": 50,
+    "schema_validation": {
+      "dataset_version": "insightos-agent-sft-v1",
+      "examples": 250,
+      "human_approved_training_examples": 0,
+      "scenario_groups": 50,
+      "split_counts": {
+        "test": 25,
+        "train": 200,
+        "validation": 25
+      },
+      "training_ready": false
+    },
+    "split_counts": {
+      "test": 25,
+      "train": 200,
+      "validation": 25
+    },
+    "tool_calls_by_name": {
+      "get_inspection_handoff": 10,
+      "get_profile": 10,
+      "get_quality_report": 10,
+      "run_eda_analysis": 10,
+      "run_quality_analysis": 10
+    },
+    "validated_sql_python_dax_examples": 50
+  },
+  "dataset_version": "insightos-reference-eda-v2",
+  "draft_examples": 250,
+  "evaluation_cases": 20,
+  "examples": 250,
+  "file_sha256": {
+    "held_out.jsonl": "a797a12448bf04de139f7bd136056f877165b6866d02b9ff65e4f7ce30f72631",
+    "human_review_suite.json": "2dd0c7edf2cbbf125424a2021b0fb07df6799166ccf7d571db9242c6a166231c",
+    "synthetic_fixtures.json": "3e84fecd4b8fed507ba6d366a8c8f08dd37f27ae23cb55fbd0a9633b3d4c665e",
+    "train.jsonl": "b4698077200c7c4dd9e142f492b8f88cf5c54416fe747aaabeac278065f63816",
+    "validation.jsonl": "fccff47a49f8040fcab782a605ba087027414248fca76f1f20679a77532c70b3"
+  },
+  "generated_by": "training/reference_eda/build_dataset.py",
+  "human_review": {
+    "approved_record_count": 0,
+    "claim_validation": "fail-closed policy retained; advanced coverage incomplete",
+    "evaluation_suite": "scaffold expanded with case-level rubrics; individual review pending",
+    "fine_tuning_authorized": false,
+    "split_structure": "approved; content review pending",
+    "synthetic_calculations": "verified with stated conditions",
+    "training_examples": "remediation implemented; individual review pending"
+  },
+  "leaking_groups": [],
+  "review_manifest_sha256": "6276ef28975dfa47ca061b5ba3f49896b1909130053859ddcbc9f23fd16e09d7",
+  "scenario_counts": {
+    "ecommerce": 50,
+    "fraud": 50,
+    "healthcare": 50,
+    "maintenance": 50,
+    "marketing": 50
+  },
+  "scenario_coverage_by_split": {
+    "test": [
+      "ecommerce",
+      "fraud",
+      "healthcare",
+      "maintenance",
+      "marketing"
+    ],
+    "train": [
+      "ecommerce",
+      "fraud",
+      "healthcare",
+      "maintenance",
+      "marketing"
+    ],
+    "validation": [
+      "ecommerce",
+      "fraud",
+      "healthcare",
+      "maintenance",
+      "marketing"
+    ]
+  },
+  "scenario_groups": 50,
+  "scenario_keys": [
+    "marketing",
+    "maintenance",
+    "ecommerce",
+    "fraud",
+    "healthcare"
+  ],
+  "schema_validation": {
+    "dataset_version": "insightos-agent-sft-v1",
+    "examples": 250,
+    "human_approved_training_examples": 0,
+    "scenario_groups": 50,
+    "split_counts": {
+      "test": 25,
+      "train": 200,
+      "validation": 25
+    },
+    "training_ready": false
+  },
+  "source_note": "Original synthetic examples only. The referenced EDA PDF and source archive were unavailable; the user-supplied reference_eda_reviewed.zip was inspected as a review input.",
+  "split_counts": {
+    "test": 25,
+    "train": 200,
+    "validation": 25
+  },
+  "tool_call_counts": {
+    "get_inspection_handoff": 10,
+    "get_profile": 10,
+    "get_quality_report": 10,
+    "run_eda_analysis": 10,
+    "run_quality_analysis": 10
+  },
+  "training_readiness_reason": "Training examples remain draft-only until explicitly approved by a qualified human.",
+  "training_ready": false,
+  "validated_code_examples": 50
+}

@@ -23,6 +23,7 @@ from app.agent.contracts import (
     UsageMetadata,
 )
 from app.agent.model_registry import REGISTRY
+from app.agent.model_lifecycle import ModelLifecycleManager
 from app.agent.providers import ModelProvider
 
 logger = logging.getLogger(__name__)
@@ -112,6 +113,8 @@ class AgentModelRouter:
         model_overrides: dict[AgentRole, str] | None = None,
         workflow_budget: WorkflowTokenBudget | None = None,
         telemetry_callback: Callable[[RequestTelemetry], None] | None = None,
+        model_lifecycle: ModelLifecycleManager | None = None,
+        manage_model_lifecycle: bool = False,
     ) -> None:
         self._settings = settings
         self._provider = provider
@@ -121,6 +124,25 @@ class AgentModelRouter:
             settings.workflow_final_reserve_tokens,
         )
         self._telemetry_callback = telemetry_callback
+        self._model_lifecycle = model_lifecycle
+        if (
+            self._model_lifecycle is None
+            and manage_model_lifecycle
+            and settings.provider == "ollama"
+            and all(
+                callable(getattr(type(provider), operation, None))
+                for operation in ("load_model", "unload_model", "loaded_models")
+            )
+        ):
+            self._model_lifecycle = ModelLifecycleManager(provider)
+
+    def release_active_model(self) -> None:
+        if self._model_lifecycle is not None:
+            self._model_lifecycle.release()
+
+    @property
+    def model_lifecycle(self) -> ModelLifecycleManager | None:
+        return self._model_lifecycle
 
     def model_for(self, role: AgentRole) -> str:
         override = self._model_overrides.get(role)
@@ -230,7 +252,11 @@ class AgentModelRouter:
             )
         started = time.perf_counter()
         try:
-            response = self._provider.complete(bounded_request)
+            if self._model_lifecycle is None:
+                response = self._provider.complete(bounded_request)
+            else:
+                with self._model_lifecycle.generation_lease(model):
+                    response = self._provider.complete(bounded_request)
         except ProviderError as error:
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             self._workflow_budget.record(output_limit, UsageMetadata())

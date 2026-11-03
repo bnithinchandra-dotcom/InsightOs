@@ -1,0 +1,164 @@
+{
+  "credentials_changed": false,
+  "dataset_version": "insightos-reference-eda-v2",
+  "decisions": [
+    {
+      "approved_count": 0,
+      "findings": [
+        "The original ZIP lacked predictive maintenance, fraud, and healthcare readmission scenarios.",
+        "The blueprint now includes five stakeholder-led synthetic scenarios and multi-turn conversations.",
+        "Tool identifiers are included in preceding context and arguments are validated against the registered tool schemas.",
+        "Serialized tool results include the complete ToolResult shape; handoff and engine-inspection payloads are schema-validated.",
+        "SQL and Python KPI examples execute against synthetic fixtures; DAX examples are checked for required measures and fields.",
+        "Zero-spend marketing and fully-refunded e-commerce groups exercise undefined-denominator behavior.",
+        "Maintenance outcome labels are prediction-observation grain and must not be interpreted as unique failure-event counts."
+      ],
+      "item": 1,
+      "name": "training_examples",
+      "record_status": "draft",
+      "status": "remediation_implemented_record_review_pending"
+    },
+    {
+      "group_leakage": 0,
+      "item": 2,
+      "name": "validation_and_held_out_splits",
+      "record_status": "draft",
+      "scenario_groups": 50,
+      "scenario_coverage_by_split": {
+        "held_out": [
+          "ecommerce",
+          "fraud",
+          "healthcare",
+          "maintenance",
+          "marketing"
+        ],
+        "train": [
+          "ecommerce",
+          "fraud",
+          "healthcare",
+          "maintenance",
+          "marketing"
+        ],
+        "validation": [
+          "ecommerce",
+          "fraud",
+          "healthcare",
+          "maintenance",
+          "marketing"
+        ]
+      },
+      "split_counts": {
+        "held_out": 25,
+        "train": 200,
+        "validation": 25
+      },
+      "status": "structure_approved_content_pending",
+      "unique_ids": true
+    },
+    {
+      "case_count": 20,
+      "findings": [
+        "The suite contains scenario-specific profiles, mandatory facts, incorrect behaviors, acceptance/rejection criteria, and case-specific 100-point rubrics.",
+        "Five required stakeholder prompts are included.",
+        "Individual evaluation records remain draft, and tool execution requires a workflow-aware runner.",
+        "The text suite remains a smoke-test scaffold, not an approved final model-comparison benchmark."
+      ],
+      "item": 3,
+      "name": "human_evaluation_suite",
+      "record_status": "draft",
+      "rubric_total": 100,
+      "status": "scaffold_expanded_record_review_pending",
+      "tool_call_cases_in_text_suite": 0
+    },
+    {
+      "checked_calculations": {
+        "ecommerce": {
+          "gross_margin_percent": 50.79,
+          "gross_profit": 640.0,
+          "net_revenue": 1260.0
+        },
+        "fraud": {
+          "precision_percent": 66.67,
+          "recall_percent": 66.67
+        },
+        "healthcare": {
+          "eligible_complete_discharge_episodes": 4,
+          "readmission_rate_percent": 50.0,
+          "unplanned_readmissions_within_30d": 2
+        },
+        "maintenance": {
+          "incomplete_sensor_observations": 1,
+          "prediction_horizon_days": 30
+        },
+        "marketing": {
+          "facebook_qualified_leads": 20,
+          "facebook_roas": 1.8,
+          "google_qualified_cpa": 16.67,
+          "google_qualified_leads": 36,
+          "google_roas": 3.0
+        }
+      },
+      "conditions": [
+        "All figures are synthetic descriptive calculations and must not be presented as production evidence.",
+        "Marketing ROAS is attribution-based, not causal; last-click and a 30-day window are declared assumptions that cannot be independently audited from aggregate rows. Impressions are absent, so CTR is unavailable.",
+        "E-commerce net line sales use line grain and explicit discounts, refunds, cancellations, and COGS; tax and shipping are absent, and a fully-refunded group exercises undefined margin.",
+        "Maintenance risk is not a confirmed failure; rolling features must end at prediction time, and repeated positive observation rows are not unique failure-event counts.",
+        "Fraud labels require completed review; flagged transactions remain suspicious, not confirmed fraud.",
+        "Healthcare rates use eligible discharges with complete follow-up; predictions require discharge-time features and human clinical review."
+      ],
+      "item": 4,
+      "name": "synthetic_fixtures_and_business_assumptions",
+      "status": "verified_with_conditions"
+    },
+    {
+      "currently_resolved_claims": [
+        "column_exists",
+        "schema_type",
+        "count",
+        "quality",
+        "relationship",
+        "recommendation"
+      ],
+      "currently_unsupported_claims": [
+        "causal",
+        "forecast",
+        "prediction",
+        "anomaly",
+        "statistical",
+        "preprocessing",
+        "comparative",
+        "metric"
+      ],
+      "item": 5,
+      "name": "claim_validation_policy",
+      "policy": "Retain fail-closed behavior until production resolvers use current, verified, in-scope persisted evidence for each advanced claim type.",
+      "status": "fail_closed_policy_accepted_product_coverage_incomplete"
+    }
+  ],
+  "fine_tuning_run_authorized": false,
+  "human_record_approval_count": 0,
+  "overall_disposition": "changes_required_not_approved_for_fine_tuning_record_level_review_required",
+  "production_files_changed": false,
+  "review_date": "2026-11-03",
+  "review_source": {
+    "filename": "reference_eda_reviewed.zip",
+    "sha256": "2df41c018bb9daeb0afe6ccf615f9795fd6c6c92becf787978f440d860080ebd"
+  },
+  "review_version": 3,
+  "subsequent_review": {
+    "disposition": "CHANGES_REQUIRED — NOT APPROVED FOR FINE-TUNING",
+    "review_date": "2026-11-03",
+    "scope_note": "The subsequent report describes an earlier v1 corpus; only findings applicable to the current v2 corpus were carried forward."
+  },
+  "reviewer_type": "AI-assisted technical review; no qualified domain-expert sign-off or individual record approvals claimed",
+  "review_workflow": {
+    "artifact": "review_history.jsonl",
+    "append_only": true,
+    "training_records": 250,
+    "evaluation_records": 20,
+    "source_records_modified": false,
+    "approved_only_output": "dataset_v1/approved_only",
+    "fine_tuning_requires_complete_explicit_approval": true
+  },
+  "training_ready": false
+}

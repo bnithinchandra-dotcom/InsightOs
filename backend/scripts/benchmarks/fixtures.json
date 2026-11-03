@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "workloads": [
+    {
+      "id": "task_classification",
+      "title": "Task classification and routing",
+      "category": "routing",
+      "role": "data_intelligence",
+      "prompt": "Classify each request below. Return exactly one JSON object with a `routes` array. Every item must contain exactly `request_type`, `task_category`, `required_agent_stages` (array), `required_capabilities` (array), `dataset_context_required` (boolean), and `clarification_required` (boolean). Preserve the listed order. Do not add prose or infer a dataset. Requests: 1) Explain what gross margin means. 2) Explore a dataset's columns and row counts. 3) Check the selected file for missing values and duplicate rows. 4) Analyze the relationship between price and units sold in the selected dataset. 5) Forecast monthly sales for the next quarter from the selected dataset. 6) Create a dashboard chart from verified analysis results. 7) For the selected dataset, inspect quality, analyze monthly margin trends, and present evidence-backed recommendations. Expected route labels, in order: general_business, dataset_exploration, data_quality, analytics, forecasting, visualization, complex_multi_step. Required stage names are orchestrator, data_intelligence, analytics_modelling, insights_visualization. Do not claim any stage or tool was executed.",
+      "expected_routes": [
+        {
+          "request_type": "general_business",
+          "task_category": "conversation",
+          "required_agent_stages": [],
+          "required_capabilities": ["business_answer"],
+          "dataset_context_required": false,
+          "clarification_required": false
+        },
+        {
+          "request_type": "dataset_exploration",
+          "task_category": "analytical",
+          "required_agent_stages": ["data_intelligence"],
+          "required_capabilities": ["inspect_dataset"],
+          "dataset_context_required": true,
+          "clarification_required": true
+        },
+        {
+          "request_type": "data_quality",
+          "task_category": "analytical",
+          "required_agent_stages": ["data_intelligence", "analytics_modelling"],
+          "required_capabilities": ["inspect_dataset", "run_quality_analysis"],
+          "dataset_context_required": true,
+          "clarification_required": false
+        },
+        {
+          "request_type": "analytics",
+          "task_category": "analytical",
+          "required_agent_stages": ["data_intelligence", "analytics_modelling"],
+          "required_capabilities": ["inspect_dataset", "run_eda_analysis"],
+          "dataset_context_required": true,
+          "clarification_required": false
+        },
+        {
+          "request_type": "forecasting",
+          "task_category": "analytical",
+          "required_agent_stages": ["data_intelligence", "analytics_modelling"],
+          "required_capabilities": ["inspect_dataset", "run_monthly_forecast"],
+          "dataset_context_required": true,
+          "clarification_required": false
+        },
+        {
+          "request_type": "visualization",
+          "task_category": "presentation",
+          "required_agent_stages": ["insights_visualization"],
+          "required_capabilities": ["present_verified_results"],
+          "dataset_context_required": true,
+          "clarification_required": true
+        },
+        {
+          "request_type": "complex_multi_step",
+          "task_category": "complex_reasoning",
+          "required_agent_stages": ["data_intelligence", "analytics_modelling", "insights_visualization"],
+          "required_capabilities": ["inspect_dataset", "run_eda_analysis", "present_verified_results"],
+          "dataset_context_required": true,
+          "clarification_required": false
+        }
+      ],
+      "allowed_numbers": []
+    },
+    {
+      "id": "business_summary",
+      "title": "Lightweight business summarization",
+      "category": "lightweight",
+      "role": "insights_visualization",
+      "prompt": "Summarize this synthetic business snapshot in concise executive language. Return exactly one JSON object with exactly these fields: `executive_summary` (string), `trends` (array of strings), `exceptions` (array of strings), and `limitations` (string). Use only supplied facts. Do not calculate totals, percentages, or other numbers. Data: January revenue $10,000, 100 orders, 2 returns; February revenue $12,000, 110 orders, 2 returns; March revenue $9,000, 75 orders, 6 returns. Explain the visible trend and exception, and state that this three-month snapshot alone does not establish a cause.",
+      "required_numbers": [10000, 12000, 9000, 100, 110, 75, 2, 6],
+      "allowed_numbers": [10000, 12000, 9000, 100, 110, 75, 2, 6],
+      "required_terms": ["march", "returns", "cause"]
+    },
+    {
+      "id": "structured_presentation",
+      "title": "Structured presentation output",
+      "category": "presentation",
+      "role": "insights_visualization",
+      "prompt": "Format these verified facts for a dashboard. Return exactly one JSON object with exactly these fields: `title` (string), `summary` (string), `highlights` (array of objects containing exactly `label` and `value`, both strings), and `warnings` (array of strings). Include the supplied revenue, expense, profit, and margin facts; preserve every supplied value and add no numerical claims. Facts: Q1 revenue $100,000, expenses $70,000, profit $30,000, margin 30%. Q2 revenue $120,000, expenses $90,000, profit $30,000, margin 25%. Margin declined; no causal explanation was verified.",
+      "required_numbers": [100000, 70000, 30000, 30, 120000, 90000, 25],
+      "allowed_numbers": [100000, 70000, 30000, 30, 120000, 90000, 25],
+      "required_terms": ["revenue", "expenses", "profit", "margin"]
+    },
+    {
+      "id": "analytics_planning",
+      "title": "Analytics planning",
+      "category": "analytical",
+      "role": "analytics_modelling",
+      "prompt": "Propose a bounded workflow; do not claim analysis was performed. Return exactly one JSON object with exactly these fields: `relevant_columns` (array of strings), `data_quality_concerns` (array of strings), `analysis_methods` (array of strings), `deterministic_engines` (array of strings), `validation_steps` (array of strings), and `expected_outputs` (array of strings). Dataset: 1,200 monthly records spanning 36 months. Columns: month (date, no missing values), revenue (float, no missing values), expenses (float, 12 missing values), region (string, 1 missing value), units (integer, no missing values). Objective: describe monthly profit-margin trends and assess whether a three-month forecast is supportable. Never invent dataset measurements. Flag missing values, date validation, the positive-revenue denominator for margin, and the need to validate forecast history and holdout performance. Name only available deterministic InsightOS tools: run_quality_analysis, run_eda_analysis, run_monthly_forecast.",
+      "allowed_numbers": [1200, 36, 12, 1, 3],
+      "required_terms": ["month", "revenue", "expenses", "margin", "missing", "run_quality_analysis", "run_eda_analysis", "run_monthly_forecast", "holdout"]
+    },
+    {
+      "id": "complex_business_reasoning",
+      "title": "Complex business reasoning",
+      "category": "complex_reasoning",
+      "role": "analytics_modelling",
+      "prompt": "Analyze this controlled scenario. Return exactly one JSON object with exactly these fields: `verified_facts` (array of strings), `business_implications` (array of strings), `conflicts_or_gaps` (array of strings), `assumptions` (array of strings), and `next_actions` (array of strings). Facts: Q1 revenue was $100,000 and expenses were $70,000, so reported profit was $30,000 and margin was 30%. Q2 revenue was $120,000 and expenses were $90,000, so reported profit was $30,000 and margin was 25%. The periods were intended to be comparable. A finance note says return-processing costs were included in expenses only in Q2. An operations note says the return rate was 4% in Q1 and 3% in Q2; its denominator and calculation method are undocumented. Connect the facts, distinguish what is verified from assumptions, explain why expense comparability is uncertain, and recommend evidence-based next steps. You may report only the supplied numbers and the directly derived 20% revenue growth, $20,000 expense increase, unchanged reported profit, and 5 percentage-point margin decline. Do not infer causation.",
+      "required_numbers": [100000, 70000, 30000, 30, 120000, 90000, 25, 4, 3, 20, 20000, 5],
+      "allowed_numbers": [100000, 70000, 30000, 30, 120000, 90000, 25, 4, 3, 20, 20000, 5],
+      "required_terms": ["return-processing", "denominator", "assumption"]
+    },
+    {
+      "id": "specialist_handoff",
+      "title": "Sequential specialist handoff",
+      "category": "analytical",
+      "role": "data_intelligence",
+      "prompt": "Use the existing typed specialist contracts in sequence: data_intelligence, analytics_modelling, insights_visualization. Inputs are synthetic and no deterministic engine will be called. Follow only the explicit requested operation and supplied handoff evidence. Stage output and handoff schema validation are performed by the benchmark.",
+      "allowed_numbers": [1, 501, 601]
+    }
+  ]
+}

@@ -8,6 +8,7 @@ import pyarrow as pa
 from app.ml_supervised import (
     MAX_SUPERVISED_ROWS,
     SupervisedEvaluationError,
+    _regression_metrics,
     evaluate_supervised,
     validate_supervised_request,
 )
@@ -127,8 +128,21 @@ class SupervisedEvaluationTests(unittest.TestCase):
         self.assertEqual(result["evaluation"]["split_strategy"]["type"], "random_holdout")
         self.assertGreater(metrics["test_sample_count"] if "test_sample_count" in metrics else result["evaluation"]["test_sample_count"], 0)
         self.assertTrue(np.isfinite(metrics["model"]["mae"]))
+        self.assertTrue(np.isfinite(metrics["model"]["mse"]))
+        self.assertIsNotNone(metrics["model"]["mape"])
         self.assertTrue(np.isfinite(metrics["baseline"]["rmse"]))
         self.assertEqual(set(result["candidate_models"]), {"ridge", "random_forest"})
+        forest_trials = result["tuning_trials"]["random_forest"]
+        self.assertEqual(len(forest_trials), 4)
+        self.assertIn(
+            result["selected_hyperparameters"]["random_forest"]["max_depth"],
+            {4, 8},
+        )
+        self.assertEqual(result["experiment_record"]["kind"], "supervised")
+        self.assertEqual(
+            result["experiment_record"]["promotion"]["automatic_promotion"],
+            False,
+        )
         self.assertEqual(len(result["result_sha256"]), 64)
         json.dumps(result, allow_nan=False)
 
@@ -168,7 +182,21 @@ class SupervisedEvaluationTests(unittest.TestCase):
         self.assertEqual(result["evaluation"]["split_strategy"]["type"], "stratified_random_holdout")
         self.assertEqual(len(report["model"]["confusion_matrix"]), 2)
         self.assertIsNotNone(report["model"]["roc_auc"])
+        self.assertIsNotNone(report["model"]["precision_recall_auc"])
+        self.assertIsNotNone(report["model"]["calibration_brier"])
+        self.assertEqual(set(report["model"]["per_class"]), {"no", "yes"})
+        self.assertIn("f1_macro", report["model"])
         self.assertGreaterEqual(report["model"]["balanced_accuracy"], 0)
+
+    def test_mape_is_explicitly_unavailable_when_all_test_targets_are_zero(self):
+        metrics = _regression_metrics(
+            np.asarray([0.0, 0.0]),
+            np.asarray([1.0, 2.0]),
+        )
+
+        self.assertIsNone(metrics["mape"])
+        self.assertEqual(metrics["mape_sample_count"], 0)
+        self.assertTrue(metrics["mape_reason"])
 
     def test_chronological_split_keeps_later_periods_for_testing(self):
         size = 100

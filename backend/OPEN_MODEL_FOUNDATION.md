@@ -171,6 +171,60 @@ used the provider explicitly set to `none`: 7 cases skipped with
 samples. Its exit code was 1, as expected when there is no provider; this is
 not a model-evaluation pass.
 
+## Evaluation records and model selection
+
+The supervised evaluator records dataset fingerprints and schema, split
+boundaries and counts, fixed seeds, preprocessing policy, bounded validation
+tuning trials, library/runtime revision, metrics, and artifact references in
+the durable workflow result. Random-forest depth and leaf-size configurations
+are selected using only the training-side validation partition; the held-out
+test partition remains reserved for final reporting. Regression reports
+MAE/MSE/RMSE/R² and guarded MAPE. Classification reports macro and weighted
+metrics, per-class results, and binary ROC-AUC, precision-recall AUC, and
+Brier calibration when probabilities are available.
+
+Forecast workflow results include the same reproducibility metadata and a
+baseline-relative review recommendation. Their model artifacts are compressed
+within the existing task-result size limit and are integrity-checked on
+retrieval; older uncompressed results remain readable. The agent LLM fixture
+evaluator writes an experiment metadata record beneath
+`artifacts/evaluation-results/experiments/`. Use `--output <path>` to also
+write its full JSON report, including synthetic prompts and model responses.
+Promotion recommendations are advisory only: these paths never automatically
+promote or replace a model.
+
+## Business-intelligence specialization
+
+The agent now uses versioned, role-specific business-intelligence prompts for
+the orchestrator, Data Intelligence, Data Analysis Associate, and Reporting
+Specialist. Qwen3 prompt guidance is scoped to the selected model and agent
+role; it does not change model routing, registry eligibility, or validation
+status. Reasoning remains task-policy controlled, and Qwen3 requests now send
+the resulting `think` value explicitly.
+
+`app/agent/business_intelligence.py` provides a typed metric catalogue with
+required inputs, aggregation, dimensions, units, validation rules, provenance,
+and references to existing deterministic tools. Metrics that depend on a
+company-specific definition (for example churn or net revenue) remain marked
+as requiring that definition; the catalogue does not calculate metrics or
+replace existing engines.
+
+The opt-in live benchmark compares the pre-specialization and optimized
+prompts against the same controlled fixtures and a single selected model.
+From `backend`, run a small baseline or optimized screen with:
+
+```powershell
+python scripts\benchmarks\qwen3_live_benchmark.py --model qwen3:8b --prompt-variant baseline --screen
+python scripts\benchmarks\qwen3_live_benchmark.py --model qwen3:8b --prompt-variant optimized --screen
+```
+
+Only one model may be resident during a run; the tool stops rather than
+evicting or coexisting with another loaded model. Candidate models are
+evaluated only for roles allowed by the existing registry. Check available
+memory before loading a model; do not treat an advisory memory estimate as
+evidence that a run is safe. The non-streaming provider cannot measure true
+time-to-first-token.
+
 ## Approval-required local setup
 
 For a machine without the local runtime and model, the following commands are

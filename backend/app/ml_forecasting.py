@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
 import re
+import zlib
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
 import numpy as np
 from sklearn.linear_model import LinearRegression
+
+from app.experiment_tracking import assess_baseline_promotion, create_experiment_record
 
 
 MAX_FORECAST_ROWS = 100_000
@@ -43,6 +47,46 @@ class ForecastError(ValueError):
         ]
 
 
+def encode_model_artifact(artifact_bytes: bytes) -> str:
+    if not isinstance(artifact_bytes, bytes) or len(artifact_bytes) > MAX_MODEL_ARTIFACT_BYTES:
+        raise ForecastError(
+            "model_artifact_too_large",
+            "The model artifact exceeds its storage size limit.",
+        )
+    return base64.b64encode(zlib.compress(artifact_bytes, level=9)).decode("ascii")
+
+
+def decode_model_artifact(encoded: str) -> bytes:
+    if not isinstance(encoded, str) or len(encoded) > MAX_MODEL_ARTIFACT_BYTES * 2:
+        raise ForecastError(
+            "model_artifact_invalid",
+            "The compressed model artifact is invalid.",
+        )
+    try:
+        compressed = base64.b64decode(encoded, validate=True)
+        decompressor = zlib.decompressobj()
+        decoded = decompressor.decompress(
+            compressed,
+            MAX_MODEL_ARTIFACT_BYTES + 1,
+        )
+    except (ValueError, zlib.error):
+        raise ForecastError(
+            "model_artifact_invalid",
+            "The compressed model artifact is invalid.",
+        ) from None
+    if (
+        len(decoded) > MAX_MODEL_ARTIFACT_BYTES
+        or decompressor.unconsumed_tail
+        or decompressor.unused_data
+        or not decompressor.eof
+    ):
+        raise ForecastError(
+            "model_artifact_invalid",
+            "The compressed model artifact is invalid or exceeds its size limit.",
+        )
+    return decoded
+
+
 def _finite(value: Any) -> bool:
     if not isinstance(value, (int, float, np.number)) or isinstance(
         value, (bool, np.bool_)
@@ -74,7 +118,9 @@ def _metrics(actual: np.ndarray, predicted: np.ndarray) -> dict[str, Any]:
     wape_available = denominator > WAPE_NEAR_ZERO_TOLERANCE
     metrics = {
         "mae": float(np.mean(absolute_errors)),
+        "mse": float(np.mean(np.square(errors))),
         "rmse": float(np.sqrt(np.mean(np.square(errors)))),
+        "mean_error": float(np.mean(errors)),
         "wape": (
             float(np.sum(absolute_errors) / denominator * 100)
             if wape_available
@@ -89,7 +135,7 @@ def _metrics(actual: np.ndarray, predicted: np.ndarray) -> dict[str, Any]:
     }
     if any(
         not math.isfinite(metrics[name])
-        for name in ("mae", "rmse")
+        for name in ("mae", "mse", "rmse", "mean_error")
     ) or (
         metrics["wape"] is not None
         and not math.isfinite(metrics["wape"])
@@ -719,6 +765,62 @@ def train_monthly_forecast(
         *uncertainty["limitations"],
         "Monthly values are sums of the selected target; no missing periods are imputed.",
     ]
+    experiment_record = create_experiment_record(
+        kind="forecasting",
+        model={
+            "algorithm": "sklearn_linear_trend_seasonal",
+            "model_id": artifact_id,
+            "model_version": final_artifact["model_version"],
+        },
+        dataset={
+            "dataset_id": dataset_id,
+            "file_id": file_id,
+            "fingerprint": source_fingerprint,
+            "date_column": date_column,
+            "target_column": target_column,
+            "frequency": "month",
+            "aggregation": "sum",
+        },
+        split={
+            "type": "chronological_holdout",
+            "training_period_start": evaluation["training_periods"][0],
+            "training_period_end": evaluation["training_periods"][-1],
+            "training_sample_count": train_count,
+            "test_period_start": evaluation["period_start"],
+            "test_period_end": evaluation["period_end"],
+            "test_sample_count": validation_count,
+            "backtest_fold_count": backtesting["fold_count"],
+        },
+        seed=0,
+        configuration=final_artifact["parameters"],
+        metrics={
+            "candidate": {
+                name: candidate_metrics[name] for name in ("mae", "rmse", "wape")
+            },
+            "baseline": {
+                name: baselines[baseline_name][name]
+                for name in ("mae", "rmse", "wape")
+            },
+            "baseline_name": baseline_name,
+            "comparison": comparison,
+        },
+        artifact_references=[
+            {
+                "type": "forecast_model",
+                "sha256": artifact_sha256,
+                "storage": "model_artifact",
+            }
+        ],
+    )
+    experiment_record["promotion"] = assess_baseline_promotion(
+        candidate_metrics=candidate_metrics,
+        baseline_metrics=baselines[baseline_name],
+        metric="mae",
+        direction="minimize",
+        minimum_sample_count=12,
+        sample_count=validation_count,
+    )
+    forecast["experiment_record"] = experiment_record
     return {
         "artifact": final_artifact,
         "artifact_bytes": artifact_bytes,

@@ -10,6 +10,8 @@ import app.ml_forecasting as forecasting
 from app.ml_forecasting import (
     MAX_BACKTEST_FOLDS,
     ForecastError,
+    decode_model_artifact,
+    encode_model_artifact,
     load_model_artifact,
     predict_monthly_forecast,
     train_monthly_forecast,
@@ -77,6 +79,13 @@ class MonthlyForecastingTests(unittest.TestCase):
         self.assertTrue(all(math.isfinite(item["predicted"]) for item in forecast["forecast"]))
         self.assertEqual(forecast["source"]["fingerprint"], "a" * 64)
         self.assertEqual(len(result["artifact_sha256"]), 64)
+        self.assertEqual(
+            forecast["experiment_record"]["kind"],
+            "forecasting",
+        )
+        self.assertFalse(
+            forecast["experiment_record"]["promotion"]["automatic_promotion"]
+        )
         self.assertEqual(
             bool(forecast["warnings"]),
             evaluation["comparison"]["outcome"] != "beats_baseline",
@@ -214,6 +223,18 @@ class MonthlyForecastingTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "model_artifact_invalid")
 
+    def test_compressed_artifact_round_trips_and_rejects_corruption(self):
+        result = train_monthly_forecast(**self.kwargs)
+        encoded = encode_model_artifact(result["artifact_bytes"])
+
+        self.assertEqual(
+            decode_model_artifact(encoded),
+            result["artifact_bytes"],
+        )
+        with self.assertRaises(ForecastError) as raised:
+            decode_model_artifact("not-base64")
+        self.assertEqual(raised.exception.code, "model_artifact_invalid")
+
     @staticmethod
     def _metrics(actual, predicted):
         actual = np.asarray(actual, dtype=float)
@@ -223,7 +244,9 @@ class MonthlyForecastingTests(unittest.TestCase):
         denominator = np.sum(np.abs(actual))
         return {
             "mae": float(np.mean(absolute_errors)),
+            "mse": float(np.mean(np.square(errors))),
             "rmse": float(np.sqrt(np.mean(np.square(errors)))),
+            "mean_error": float(np.mean(errors)),
             "wape": (
                 float(np.sum(absolute_errors) / denominator * 100)
                 if denominator > forecasting.WAPE_NEAR_ZERO_TOLERANCE

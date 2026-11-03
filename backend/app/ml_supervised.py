@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 import numpy as np
 import sklearn
+from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.dummy import DummyClassifier, DummyRegressor
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
@@ -17,6 +18,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     balanced_accuracy_score,
     confusion_matrix,
     f1_score,
@@ -31,6 +33,8 @@ from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from threadpoolctl import threadpool_limits
+
+from app.experiment_tracking import assess_baseline_promotion, create_experiment_record
 
 
 MAX_SUPERVISED_ROWS = 20_000
@@ -315,6 +319,38 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _regression_metrics(actual, predicted) -> dict[str, Any]:
+    actual_values = np.asarray(actual, dtype=np.float64)
+    predicted_values = np.asarray(predicted, dtype=np.float64)
+    errors = predicted_values - actual_values
+    nonzero = actual_values != 0
+    mape = (
+        _finite_metric(
+            float(np.mean(np.abs(errors[nonzero] / actual_values[nonzero])) * 100)
+        )
+        if np.any(nonzero)
+        else None
+    )
+    return {
+        "mae": _finite_metric(mean_absolute_error(actual_values, predicted_values)),
+        "mse": _finite_metric(mean_squared_error(actual_values, predicted_values)),
+        "rmse": _finite_metric(
+            math.sqrt(mean_squared_error(actual_values, predicted_values))
+        ),
+        "mape": mape,
+        "mape_sample_count": int(nonzero.sum()),
+        "mape_reason": (
+            "MAPE is undefined because every held-out target is zero."
+            if not np.any(nonzero)
+            else "MAPE exceeded finite numeric limits."
+            if mape is None
+            else None
+        ),
+        "r2": None,
+        "r2_reason": None,
+    }
+
+
 def _row_token(value: Any) -> tuple[str, str]:
     if value is None or (
         isinstance(value, (float, np.floating)) and not math.isfinite(float(value))
@@ -324,6 +360,30 @@ def _row_token(value: Any) -> tuple[str, str]:
 
 
 def _classification_metrics(y_true, prediction, labels, probabilities=None) -> dict[str, Any]:
+    per_class: dict[str, dict[str, Any]] = {}
+    for index, label in enumerate(labels):
+        actual = np.asarray(y_true) == label
+        predicted = np.asarray(prediction) == label
+        class_metrics: dict[str, Any] = {
+            "precision": _finite_metric(
+                precision_score(actual, predicted, zero_division=0)
+            ),
+            "recall": _finite_metric(
+                recall_score(actual, predicted, zero_division=0)
+            ),
+            "f1": _finite_metric(f1_score(actual, predicted, zero_division=0)),
+            "support": int(actual.sum()),
+            "average_precision": None,
+        }
+        if (
+            probabilities is not None
+            and len(np.unique(actual)) == 2
+            and index < probabilities.shape[1]
+        ):
+            class_metrics["average_precision"] = _finite_metric(
+                average_precision_score(actual, probabilities[:, index])
+            )
+        per_class[str(label)] = class_metrics
     metrics: dict[str, Any] = {
         "accuracy": _finite_metric(accuracy_score(y_true, prediction)),
         "balanced_accuracy": _finite_metric(balanced_accuracy_score(y_true, prediction)),
@@ -336,13 +396,44 @@ def _classification_metrics(y_true, prediction, labels, probabilities=None) -> d
         "f1_weighted": _finite_metric(
             f1_score(y_true, prediction, average="weighted", zero_division=0)
         ),
+        "precision_macro": _finite_metric(
+            precision_score(y_true, prediction, average="macro", zero_division=0)
+        ),
+        "recall_macro": _finite_metric(
+            recall_score(y_true, prediction, average="macro", zero_division=0)
+        ),
+        "f1_macro": _finite_metric(
+            f1_score(y_true, prediction, average="macro", zero_division=0)
+        ),
+        "per_class": per_class,
         "confusion_matrix": confusion_matrix(
             y_true, prediction, labels=labels
         ).astype(int).tolist(),
         "labels": [str(label) for label in labels],
         "roc_auc": None,
         "roc_auc_reason": None,
+        "precision_recall_auc": None,
+        "precision_recall_auc_reason": None,
+        "calibration_brier": None,
+        "calibration_brier_reason": None,
     }
+    if probabilities is not None and probabilities.shape[1] == len(labels):
+        one_hot = np.column_stack(
+            [np.asarray(y_true) == label for label in labels]
+        ).astype(float)
+        metrics["calibration_brier"] = _finite_metric(
+            float(
+                np.mean(
+                    (probabilities[:, 1] - one_hot[:, 1]) ** 2
+                    if len(labels) == 2
+                    else np.sum((probabilities - one_hot) ** 2, axis=1)
+                )
+            )
+        )
+    else:
+        metrics["calibration_brier_reason"] = (
+            "The selected estimator did not provide probabilities for every class."
+        )
     if len(labels) == 2 and probabilities is not None and len(set(y_true)) == 2:
         try:
             metrics["roc_auc"] = _finite_metric(
@@ -350,9 +441,23 @@ def _classification_metrics(y_true, prediction, labels, probabilities=None) -> d
             )
         except ValueError:
             metrics["roc_auc_reason"] = "ROC-AUC could not be calculated for the test split."
+        try:
+            metrics["precision_recall_auc"] = _finite_metric(
+                average_precision_score(
+                    np.asarray(y_true) == labels[1],
+                    probabilities[:, 1],
+                )
+            )
+        except ValueError:
+            metrics["precision_recall_auc_reason"] = (
+                "Precision-recall AUC could not be calculated for the test split."
+            )
     else:
         metrics["roc_auc_reason"] = (
             "ROC-AUC is reported only for binary classification with both classes in the test split."
+        )
+        metrics["precision_recall_auc_reason"] = (
+            "Precision-recall AUC is reported only for binary classification with both classes in the test split."
         )
     return metrics
 
@@ -749,6 +854,8 @@ def evaluate_supervised(
 
     validation_scores: dict[str, float] = {}
     candidate_errors: dict[str, str] = {}
+    tuning_trials: dict[str, list[dict[str, Any]]] = {}
+    selected_hyperparameters: dict[str, Any] = {}
 
     def primary_score(actual, predicted) -> float:
         if task_type == "regression":
@@ -763,17 +870,65 @@ def evaluate_supervised(
         baseline_validation = baseline_pipeline.predict(matrix[validation_indices])
         baseline_score = primary_score(y[validation_indices], baseline_validation)
         for name, estimator in candidates.items():
-            model = _pipeline(estimator, numeric_indices, categorical_indices)
-            try:
-                model.fit(matrix[fit_indices], y[fit_indices])
-                prediction = model.predict(matrix[validation_indices])
-                score = primary_score(y[validation_indices], prediction)
-                if math.isfinite(score):
-                    validation_scores[name] = score
+            configurations = (
+                [
+                    {"max_depth": depth, "min_samples_leaf": leaf}
+                    for depth in (4, 8)
+                    for leaf in (2, 5)
+                ]
+                if name == "random_forest"
+                else [{}]
+            )
+            trials: list[dict[str, Any]] = []
+            best_estimator = None
+            best_score = None
+            for parameters in configurations:
+                configured_estimator = clone(estimator).set_params(**parameters)
+                model = _pipeline(
+                    configured_estimator, numeric_indices, categorical_indices
+                )
+                trial = {"parameters": parameters, "score": None}
+                try:
+                    model.fit(matrix[fit_indices], y[fit_indices])
+                    prediction = model.predict(matrix[validation_indices])
+                    score = primary_score(y[validation_indices], prediction)
+                    if math.isfinite(score):
+                        trial["score"] = score
+                        better = best_score is None
+                        if best_score is not None:
+                            better = (
+                                score < best_score
+                                if task_type == "regression"
+                                else score > best_score
+                            )
+                        if better:
+                            best_score = score
+                            best_estimator = configured_estimator
+                    else:
+                        candidate_errors[
+                            f"{name}:{parameters}"
+                        ] = "Validation metric was non-finite."
+                except (ValueError, FloatingPointError, MemoryError) as error:
+                    candidate_errors[f"{name}:{parameters}"] = (
+                        f"Candidate could not be evaluated ({type(error).__name__})."
+                    )
+                trials.append(trial)
+            tuning_trials[name] = trials
+            if best_score is not None and best_estimator is not None:
+                validation_scores[name] = best_score
+                selected_params = best_estimator.get_params(deep=False)
+                if name == "random_forest":
+                    keys = ("max_depth", "min_samples_leaf", "n_estimators")
+                elif name == "regularized_logistic":
+                    keys = ("C", "max_iter")
                 else:
-                    candidate_errors[name] = "Validation metric was non-finite."
-            except (ValueError, FloatingPointError, MemoryError) as error:
-                candidate_errors[name] = f"Candidate could not be evaluated ({type(error).__name__})."
+                    keys = ("alpha",)
+                selected_hyperparameters[name] = {
+                    key: selected_params[key] for key in keys
+                }
+                candidates[name] = best_estimator
+            else:
+                candidate_errors[name] = "No tuning configuration completed validation."
         if not validation_scores:
             raise SupervisedEvaluationError(
                 "candidate_models_failed", "No supervised candidate completed training-only validation."
@@ -811,14 +966,7 @@ def evaluate_supervised(
         if probabilities is not None and probabilities.shape[1] != len(labels):
             probabilities = None
         if task_type == "regression":
-            model_metrics = {
-                "mae": _finite_metric(mean_absolute_error(y[test_indices], final_prediction)),
-                "rmse": _finite_metric(
-                    math.sqrt(mean_squared_error(y[test_indices], final_prediction))
-                ),
-                "r2": None,
-                "r2_reason": None,
-            }
+            model_metrics = _regression_metrics(y[test_indices], final_prediction)
             if len(test_indices) > 1 and np.var(y[test_indices]) > 0:
                 model_metrics["r2"] = _finite_metric(
                     r2_score(y[test_indices], final_prediction)
@@ -827,13 +975,9 @@ def evaluate_supervised(
                     model_metrics["r2_reason"] = "R² exceeded finite numeric limits."
             else:
                 model_metrics["r2_reason"] = "R² is undefined for a constant or one-row test target."
-            baseline_metrics = {
-                "mae": _finite_metric(mean_absolute_error(y[test_indices], baseline_prediction)),
-                "rmse": _finite_metric(
-                    math.sqrt(mean_squared_error(y[test_indices], baseline_prediction))
-                ),
-                "r2": None,
-            }
+            baseline_metrics = _regression_metrics(
+                y[test_indices], baseline_prediction
+            )
             if len(test_indices) > 1 and np.var(y[test_indices]) > 0:
                 baseline_metrics["r2"] = _finite_metric(
                     r2_score(y[test_indices], baseline_prediction)
@@ -879,6 +1023,10 @@ def evaluate_supervised(
         warnings.append("No candidate beat the baseline on the training-only validation metric.")
     if not test_beats_baseline:
         warnings.append("The selected model did not beat the baseline on the held-out test metric.")
+    forest_parameters = selected_hyperparameters.get(
+        "random_forest",
+        {"n_estimators": 50, "max_depth": 8, "min_samples_leaf": 5},
+    )
     if task_type == "classification":
         _, class_counts = np.unique(y[train_indices], return_counts=True)
         if class_counts.min() / len(train_indices) < 0.05:
@@ -887,7 +1035,10 @@ def evaluate_supervised(
             "regularized_logistic": "sklearn.linear_model.LogisticRegression(C=1.0,max_iter=500)",
             "random_forest": (
                 "sklearn.ensemble.RandomForestClassifier("
-                "n_estimators=50,max_depth=8,min_samples_leaf=5,n_jobs=1)"
+                f"n_estimators={forest_parameters['n_estimators']},"
+                f"max_depth={forest_parameters['max_depth']},"
+                f"min_samples_leaf={forest_parameters['min_samples_leaf']},"
+                "n_jobs=1)"
             ),
             "dummy_baseline": "sklearn.dummy.DummyClassifier(strategy='most_frequent')",
         }
@@ -896,7 +1047,10 @@ def evaluate_supervised(
             "ridge": "sklearn.linear_model.Ridge(alpha=1.0)",
             "random_forest": (
                 "sklearn.ensemble.RandomForestRegressor("
-                "n_estimators=50,max_depth=8,min_samples_leaf=5,n_jobs=1)"
+                f"n_estimators={forest_parameters['n_estimators']},"
+                f"max_depth={forest_parameters['max_depth']},"
+                f"min_samples_leaf={forest_parameters['min_samples_leaf']},"
+                "n_jobs=1)"
             ),
             "dummy_baseline": "sklearn.dummy.DummyRegressor(strategy='mean')",
         }
@@ -933,6 +1087,8 @@ def evaluate_supervised(
         },
         "candidate_models": sorted(candidates),
         "candidate_model_identifiers": candidate_model_identifiers,
+        "tuning_trials": tuning_trials,
+        "selected_hyperparameters": selected_hyperparameters,
         "candidate_errors": candidate_errors,
         "warnings": warnings,
         "limitations": [
@@ -943,6 +1099,65 @@ def evaluate_supervised(
         "library_versions": {"scikit_learn": sklearn.__version__, "numpy": np.__version__},
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+    primary_metric = "mae" if task_type == "regression" else "accuracy"
+    result["experiment_record"] = create_experiment_record(
+        kind="supervised",
+        model={
+            "candidate": selected_name,
+            "identifier": candidate_model_identifiers[selected_name],
+            "configuration": selected_hyperparameters[selected_name],
+        },
+        dataset={
+            "dataset_id": dataset_id,
+            "file_id": file_id,
+            "table_index": table_index,
+            "fingerprint": source_fingerprint,
+            "normalized_artifact_sha256": artifact_sha256,
+            "target_column": target_column,
+            "feature_columns": feature_columns,
+            "feature_schema": [
+                {"name": name, "type": str(table.schema.field(name).type)}
+                for name in feature_columns
+            ],
+        },
+        split={
+            **split_strategy,
+            "fit_sample_count": int(len(fit_indices)),
+            "validation_sample_count": int(len(validation_indices)),
+            "training_sample_count": int(len(train_indices)),
+            "test_sample_count": int(len(test_indices)),
+        },
+        seed=RANDOM_SEED,
+        configuration={
+            "candidate_models": candidate_model_identifiers,
+            "selection_metric": primary_metric,
+            "preprocessing": (
+                "Numeric imputation/scaling and categorical imputation/one-hot encoding "
+                "are fit only on the training partition."
+            ),
+            "tuning_trials": tuning_trials,
+        },
+        metrics={
+            "candidate": model_metrics,
+            "baseline": baseline_metrics,
+            "validation_scores": validation_scores,
+        },
+        artifact_references=[
+            {
+                "type": "normalized_dataset",
+                "sha256": artifact_sha256,
+                "storage": "dataset_artifact",
+            }
+        ],
+    )
+    result["experiment_record"]["promotion"] = assess_baseline_promotion(
+        candidate_metrics=model_metrics,
+        baseline_metrics=baseline_metrics,
+        metric=primary_metric,
+        direction="minimize" if task_type == "regression" else "maximize",
+        minimum_sample_count=10,
+        sample_count=len(test_indices),
+    )
     encoded = json.dumps(
         result,
         ensure_ascii=False,

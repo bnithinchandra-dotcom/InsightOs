@@ -30,6 +30,7 @@ from app.agent.contracts import (
 )
 from app.agent.providers import create_provider
 from app.agent.model_router import AgentModelRouter
+from app.agent.preparation import SpecialistPreparationArtifact
 from app.agent.specialist_agents import (
     SpecialistAgentError,
     SpecialistHandoff,
@@ -1087,7 +1088,11 @@ def _specialist_recovery_handlers(
         settings = get_agent_settings()
         if settings.provider == "none":
             return {}
-        router = AgentModelRouter(settings=settings, provider=create_provider(settings))
+        router = AgentModelRouter(
+            settings=settings,
+            provider=create_provider(settings),
+            manage_model_lifecycle=True,
+        )
     except ProviderError:
         return {}
     workflow_id = workflow.id
@@ -1284,12 +1289,34 @@ def _specialist_recovery_handlers(
                     "The Data Intelligence handoff belongs to a different source version.",
                 )
             data_output = data_handoff.output
+            try:
+                preparation = SpecialistPreparationArtifact.model_validate(
+                    task_arguments.get("preparation")
+                )
+            except (TypeError, ValueError, ValidationError):
+                raise WorkflowTaskExecutionError(
+                    "specialist_preparation_invalid",
+                    "The persisted specialist preparation artifact failed validation.",
+                ) from None
+            if (
+                preparation.workflow_id != workflow_id
+                or preparation.dataset_id != requested_arguments.get("dataset_id")
+                or preparation.file_id != requested_arguments.get("file_id")
+                or preparation.source_fingerprint != source_fingerprint
+                or preparation.handoff_context.operation != operation
+                or preparation.handoff_context.previous_stage != data_output
+            ):
+                raise WorkflowTaskExecutionError(
+                    "specialist_preparation_stale",
+                    "The specialist preparation artifact does not match the current handoff.",
+                )
             material = {
                 "objective": objective,
                 "operation": operation,
                 "arguments": requested_arguments,
                 "inspection": inspection,
                 "data_intelligence": data_output,
+                "preparation": preparation.model_dump(mode="json"),
             }
             if _fingerprint_json(material) != task_arguments.get(
                 "stage_input_fingerprint"
@@ -1309,6 +1336,7 @@ def _specialist_recovery_handlers(
                     data_intelligence=data_output,
                     tool_name=operation,
                     arguments=requested_arguments,
+                    preparation=preparation,
                 )
             except SpecialistAgentError as error:
                 raise WorkflowTaskExecutionError(error.code, error.message) from None

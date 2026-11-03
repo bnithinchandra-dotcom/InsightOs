@@ -60,6 +60,18 @@ class SpecialistCompletenessTests(unittest.TestCase):
             self._invoke(router)
         self.assertEqual(raised.exception.code, "agent_response_invalid")
 
+    def test_optimized_specialist_uses_compact_role_prompt_and_output_budget(self):
+        router = self._invoke_with_output(
+            '{"contract_version":1,"status":"completed","summary":"Inspected.",'
+            '"observed_fields":[],"recommended_operation":"run_quality_analysis",'
+            '"evidence_references":[]}',
+            "stop",
+        )
+        self._invoke(router)
+        request = router.complete.call_args[0][1]
+        self.assertEqual(request.max_output_tokens, 4096)
+        self.assertIn("Inspect only supplied verified metadata.", request.messages[0].content)
+
 
 if __name__ == "__main__":
     unittest.main()

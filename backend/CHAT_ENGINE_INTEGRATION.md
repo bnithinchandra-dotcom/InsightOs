@@ -123,6 +123,25 @@ This is bounded waiting, not a durable model-call queue or automatic
 resumption. A claimed specialist waiting on the slot remains visible as a
 running workflow task.
 
+The executable chat and recovery paths also use the Ollama lifecycle manager.
+It reconciles residency through `/api/ps`, activates the selected role model,
+and holds a generation lease until inference completes. It releases that model
+with Ollama's zero `keep_alive` setting and verifies the unload before another
+model can be activated. Activation and release durations and failures are
+available in its lifecycle snapshot. Cancellation and provider failures release the
+lease without unloading a model during an in-flight generation. The router
+forwards each task's context limit as `num_ctx`, bounded by the global setting
+when configured.
+
+While Data Intelligence is reasoning, a bounded deterministic preparation task
+reads the selected dataset inventory, current schema/profile metadata,
+persisted inspection handoff, stored quality report and EDA results, existing
+workflow analytics outputs, provenance references, and registered analytics
+capabilities. It does not invoke a model or recompute profile, quality, EDA, or
+analytics results. Its typed, size-bounded artifact is included in the
+Analytics task input fingerprint and persisted task arguments, then identity-
+checked during recovery before the specialist can use it.
+
 ## Current limits
 
 - These tools require the selected dataset context. They do not discover or

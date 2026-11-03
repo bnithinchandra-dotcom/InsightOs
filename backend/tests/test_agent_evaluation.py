@@ -115,6 +115,18 @@ class AgentEvaluationTests(unittest.TestCase):
         self.assertEqual(report.pass_count, len(EVALUATION_CASES))
         self.assertEqual(report.fail_count, 0)
         self.assertEqual(report.skipped_count, 0)
+        self.assertEqual(report.experiment_record["kind"], "llm")
+        self.assertEqual(
+            report.experiment_record["promotion"]["status"],
+            "eligible_for_human_review",
+        )
+        self.assertFalse(
+            report.experiment_record["promotion"]["automatic_promotion"]
+        )
+        self.assertEqual(
+            len(report.experiment_record["configuration"]["system_prompt_sha256"]),
+            64,
+        )
         self.assertEqual(
             len(provider.requests),
             sum(case.repetitions for case in EVALUATION_CASES),
@@ -159,6 +171,10 @@ class AgentEvaluationTests(unittest.TestCase):
 
         self.assertEqual(report.executed_count, 0)
         self.assertEqual(report.skipped_count, len(EVALUATION_CASES))
+        self.assertEqual(
+            report.experiment_record["promotion"]["status"],
+            "not_recommended",
+        )
         self.assertEqual(
             report.failure_categories,
             {"provider_unavailable": len(EVALUATION_CASES)},

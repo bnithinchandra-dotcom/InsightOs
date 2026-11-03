@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import platform
 import re
@@ -12,6 +13,7 @@ from typing import Any, Literal
 from pydantic import ValidationError
 
 from app.agent.config import AgentSettings, get_agent_settings
+from app.experiment_tracking import create_experiment_record
 from app.agent.contracts import (
     ModelRequest,
     ModelResponse,
@@ -77,6 +79,7 @@ class EvaluationReport:
     failure_categories: dict[str, int]
     unverified_capabilities: dict[str, str]
     cases: tuple[EvaluationCaseResult, ...]
+    experiment_record: dict[str, Any]
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -512,6 +515,66 @@ def _report(
         for response in result.raw_responses
         if isinstance(response["usage"]["output_tokens"], int)
     ]
+    generation_settings = {
+        "max_output_tokens": max_output_tokens,
+        "provider_sampling": "provider/model defaults; not overridden",
+        "tool_execution": "disabled; model tool calls are scored only",
+    }
+    metrics = {
+        "test_count": len(results),
+        "executed_count": pass_count + fail_count,
+        "pass_count": pass_count,
+        "fail_count": fail_count,
+        "skipped_count": skipped_count,
+        "average_latency_ms": round(mean(latencies), 2) if latencies else None,
+        "total_input_tokens": sum(input_tokens) if input_tokens else None,
+        "total_output_tokens": sum(output_tokens) if output_tokens else None,
+        "category_results": category_results,
+        "failure_categories": failure_categories,
+    }
+    experiment_record = create_experiment_record(
+        kind="llm",
+        model={
+            "provider": provider_name,
+            "model": model,
+            "runtime_version": runtime_version,
+        },
+        dataset=None,
+        split={
+            "type": "deterministic_fixture_suite",
+            "case_count": len(results),
+            "executed_count": pass_count + fail_count,
+            "skipped_count": skipped_count,
+        },
+        seed=None,
+        configuration={
+            **generation_settings,
+            "prompt_version": EVALUATION_PROMPT_VERSION,
+            "system_prompt_sha256": hashlib.sha256(
+                SYSTEM_INSTRUCTIONS.encode("utf-8")
+            ).hexdigest(),
+            "fixture_cases": [
+                {"name": case.name, "category": case.category, "repetitions": case.repetitions}
+                for case in EVALUATION_CASES
+            ],
+        },
+        metrics=metrics,
+    )
+    experiment_record["promotion"] = {
+        "status": (
+            "eligible_for_human_review"
+            if pass_count == len(results) and bool(results)
+            else "not_recommended"
+        ),
+        "automatic_promotion": False,
+        "reason": (
+            "All deterministic fixture cases passed."
+            if pass_count == len(results) and bool(results)
+            else "Every fixture must execute and pass before review."
+        ),
+    }
+    if pass_count + fail_count == 0:
+        experiment_record["status"] = "skipped"
     return EvaluationReport(
         provider=provider_name,
         model=model,
@@ -520,11 +583,7 @@ def _report(
         platform=f"{platform.system()} {platform.release()}",
         prompt_version=EVALUATION_PROMPT_VERSION,
         system_prompt=SYSTEM_INSTRUCTIONS,
-        generation_settings={
-            "max_output_tokens": max_output_tokens,
-            "provider_sampling": "provider/model defaults; not overridden",
-            "tool_execution": "disabled; model tool calls are scored only",
-        },
+        generation_settings=generation_settings,
         test_count=len(results),
         executed_count=pass_count + fail_count,
         pass_count=pass_count,
@@ -537,6 +596,7 @@ def _report(
         failure_categories=failure_categories,
         unverified_capabilities=unverified_capabilities,
         cases=results,
+        experiment_record=experiment_record,
     )
 
 

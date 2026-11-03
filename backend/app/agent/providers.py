@@ -412,6 +412,70 @@ class OllamaProvider(_HttpProvider):
             capabilities=self.capabilities,
         )
 
+    def loaded_models(self) -> frozenset[str]:
+        payload = self._get(f"{self.settings.base_url}/api/ps", {})
+        models = payload.get("models")
+        if not isinstance(models, list):
+            raise ProviderError(
+                "provider_response_invalid",
+                "Ollama returned an invalid resident-model list.",
+            )
+        names = {
+            name
+            for item in models
+            if isinstance(item, dict)
+            for name in (item.get("name"), item.get("model"))
+            if isinstance(name, str) and name
+        }
+        return frozenset(names)
+
+    def load_model(self, model: str) -> None:
+        if not isinstance(model, str) or not model.strip():
+            raise ProviderError(
+                "provider_configuration_invalid",
+                "A non-empty model identifier is required for activation.",
+            )
+        payload = self._post(
+            f"{self.settings.base_url}/api/generate",
+            {
+                "model": model,
+                "prompt": "",
+                "stream": False,
+                "keep_alive": -1,
+            },
+            {},
+            timeout_seconds=self.settings.timeout_seconds,
+        )
+        self._raise_lifecycle_error(payload, "activation")
+
+    def unload_model(self, model: str) -> None:
+        if not isinstance(model, str) or not model.strip():
+            raise ProviderError(
+                "provider_configuration_invalid",
+                "A non-empty model identifier is required for release.",
+            )
+        payload = self._post(
+            f"{self.settings.base_url}/api/generate",
+            {
+                "model": model,
+                "prompt": "",
+                "stream": False,
+                "keep_alive": 0,
+            },
+            {},
+            timeout_seconds=self.settings.timeout_seconds,
+        )
+        self._raise_lifecycle_error(payload, "release")
+
+    @staticmethod
+    def _raise_lifecycle_error(payload: dict[str, Any], action: str) -> None:
+        error = payload.get("error")
+        if isinstance(error, str) and error:
+            raise ProviderError(
+                "provider_model_lifecycle_failed",
+                f"Ollama could not complete model {action}.",
+            )
+
     def complete(self, request: ModelRequest) -> ModelResponse:
         self._validate_request_capabilities(request)
         if not isinstance(request.model, str) or not request.model.strip():
@@ -419,9 +483,11 @@ class OllamaProvider(_HttpProvider):
                 "provider_not_configured",
                 "Configure a model before using the local model provider.",
             )
-        thinking_option = {}
-        if request.model.casefold().startswith("qwen3") and not request.reasoning_enabled:
-            thinking_option = {"think": False}
+        thinking_option = (
+            {"think": request.reasoning_enabled}
+            if request.model.casefold().startswith("qwen3")
+            else {}
+        )
         configured_num_ctx = getattr(self.settings, "num_ctx", None)
         request_num_ctx = request.context_token_limit
         num_ctx = (
@@ -429,6 +495,9 @@ class OllamaProvider(_HttpProvider):
             if isinstance(configured_num_ctx, int)
             and configured_num_ctx > 0
             and isinstance(request_num_ctx, int)
+            and request_num_ctx > 0
+            else request_num_ctx
+            if isinstance(request_num_ctx, int)
             and request_num_ctx > 0
             else configured_num_ctx
         )

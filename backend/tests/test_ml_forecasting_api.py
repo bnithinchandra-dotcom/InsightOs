@@ -200,6 +200,14 @@ class MonthlyForecastApiTests(unittest.TestCase):
         self.assertEqual(len(body["result"]["forecast"]), 3)
         self.assertEqual(body["result"]["result_schema_version"], 2)
         self.assertEqual(
+            body["result"]["experiment_record"]["kind"],
+            "forecasting",
+        )
+        self.assertEqual(
+            body["result"]["experiment_record"]["dataset"]["fingerprint"],
+            body["result"]["source_fingerprint"],
+        )
+        self.assertEqual(
             body["result"]["evaluation"]["method"],
             "chronological_holdout",
         )
@@ -464,10 +472,7 @@ class MonthlyForecastApiTests(unittest.TestCase):
             task = session.get(WorkflowTask, created.json()["task_id"])
             task.result_summary = {
                 **task.result_summary,
-                "model_artifact": {
-                    **task.result_summary["model_artifact"],
-                    "algorithm": "tampered",
-                },
+                "model_artifact_compressed": "not-base64",
             }
             session.commit()
 
@@ -493,7 +498,10 @@ class MonthlyForecastApiTests(unittest.TestCase):
             legacy = dict(task.result_summary)
             legacy.pop("result_schema_version", None)
             legacy.pop("result_sha256", None)
-            artifact = dict(legacy["model_artifact"])
+            artifact = json.loads(
+                main.decode_model_artifact(legacy.pop("model_artifact_compressed"))
+            )
+            legacy.pop("model_artifact_encoding", None)
             artifact.pop("result_schema_version", None)
             artifact["artifact_version"] = 1
             artifact["model_version"] = 1
@@ -634,7 +642,15 @@ class MonthlyForecastApiTests(unittest.TestCase):
         with self.session_factory() as session:
             task = session.get(WorkflowTask, response.json()["task_id"])
             self.assertEqual(task.status, "completed")
-            self.assertTrue(task.result_summary["model_artifact"])
+            self.assertTrue(task.result_summary["model_artifact_compressed"])
+            self.assertEqual(
+                json.loads(
+                    main.decode_model_artifact(
+                        task.result_summary["model_artifact_compressed"]
+                    )
+                )["algorithm"],
+                "sklearn_linear_trend_seasonal",
+            )
 
     def test_api_reads_and_verifies_a_real_normalized_parquet_artifact(self):
         self.source_patch.stop()
