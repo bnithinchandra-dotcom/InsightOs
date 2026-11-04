@@ -3,7 +3,8 @@
 This page is a short entry point, not an independent source of implementation
 claims. The [canonical system design](system-design.md) records current
 architecture, contracts, deployment boundaries, and verified capability
-status.
+status. The [agent orchestration decision](agent-orchestration-decision.md)
+records the accepted LangGraph direction and primary/supporting Qwen model roles.
 
 ## Current runtime
 
