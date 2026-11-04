@@ -1,0 +1,27 @@
+services:
+  qwen-training:
+    build:
+      context: ../../..
+      dockerfile: backend/training/reference_eda/Dockerfile
+    environment:
+      HF_HOME: /workspace/cache/huggingface
+      TRANSFORMERS_CACHE: /workspace/cache/huggingface
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - insightos_hf_cache:/workspace/cache/huggingface
+      - insightos_training_artifacts:/workspace/artifacts
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    shm_size: 16gb
+    ipc: host
+    restart: "no"
+    command: ["environment-check"]
+
+volumes:
+  insightos_hf_cache:
+  insightos_training_artifacts:

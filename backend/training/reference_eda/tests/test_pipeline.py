@@ -480,3 +480,47 @@ def test_model_configs_pin_all_requested_checkpoints() -> None:
         assert config["training"]["assistant_completion_only_loss"] is True
         assert config["training"]["external_reporting"] is False
         assert config["training"]["require_human_approved_examples"] is True
+
+
+def test_environment_report_handles_missing_torch_and_cpu_mode() -> None:
+    from training.reference_eda.environment import (
+        classify_environment,
+        inspect_environment,
+    )
+
+    report = inspect_environment()
+    classification = classify_environment(report)
+
+    assert set(report["cuda"]) >= {
+        "available",
+        "runtime_version",
+        "devices",
+        "bf16_supported",
+        "fp16_supported",
+        "allocated_gib",
+        "reserved_gib",
+    }
+    assert classification in {
+        "unsupported-python",
+        "cpu-only-development",
+        "cuda-compatible",
+        "gpu-unavailable",
+        "gpu-cuda-unavailable",
+    }
+
+
+def test_adapter_inspection_rejects_incomplete_artifacts(tmp_path: Path) -> None:
+    from training.reference_eda.cli import inspect_adapter
+
+    report = inspect_adapter(tmp_path / "missing")
+    assert report["exists"] is False
+    assert report["compatible"] is False
+
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
+    (adapter_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+    report = inspect_adapter(adapter_dir)
+    assert report["compatible"] is True

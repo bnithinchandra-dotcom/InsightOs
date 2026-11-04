@@ -1,7 +1,10 @@
 # Install the CUDA-matched PyTorch wheel from the official PyTorch index first.
 accelerate==1.6.0
 bitsandbytes==0.45.5
+datasets==3.5.0
 peft==0.15.2
 safetensors==0.5.3
+tensorboard==2.19.0
 torch==2.6.0
 transformers==4.51.3
+trl==0.16.1

@@ -138,6 +138,43 @@ prediction, anomaly, causal, and preprocessing claims are not enabled merely by
 this training corpus; they require current, verified, evidence-specific
 provenance resolvers in the production claim-validation path.
 
+## Isolated training CLI and container
+
+This training path is separate from production dependencies. From `backend/`:
+
+```text
+python -m training.reference_eda.cli environment-check
+python -m training.reference_eda.cli model-preflight --model qwen3-0.6b
+python -m training.reference_eda.cli dataset-preflight
+python -m training.reference_eda.cli dry-run --model qwen3-0.6b
+python -m training.reference_eda.cli inspect-adapter <adapter-directory>
+```
+
+The dry-run validates configuration and synthetic fixtures without loading a base
+model or using draft records for training. `train` is separate and requires the
+explicit `--model` selection plus a ready review-gated preflight:
+
+```text
+python -m training.reference_eda.cli train --model qwen3-0.6b
+```
+
+From the repository root, build and start only the Linux GPU training container
+(it defaults to environment-check and does not train):
+
+```text
+docker compose -f backend/training/reference_eda/docker-compose.gpu.yml build
+docker compose -f backend/training/reference_eda/docker-compose.gpu.yml run --rm qwen-training environment-check
+docker compose -f backend/training/reference_eda/docker-compose.gpu.yml run --rm qwen-training dry-run --model qwen3-0.6b
+docker compose -f backend/training/reference_eda/docker-compose.gpu.yml run --rm qwen-training model-preflight --model qwen3-0.6b
+```
+
+Run real fine-tuning only after explicit approval and an override-free successful
+preflight:
+
+```text
+docker compose -f backend/training/reference_eda/docker-compose.gpu.yml run --rm qwen-training train --model qwen3-0.6b
+```
+
 ## Reproducible LoRA/QLoRA runs
 
 The three model configs pin immutable Hugging Face revisions. Training is opt-in:
