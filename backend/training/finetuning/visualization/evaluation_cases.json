@@ -1,0 +1,14 @@
+[
+{"id":"eval-ranking","business_question":"Rank regions","available_fields":["region","revenue"],"expected":"ranked_bar"},
+{"id":"eval-trend","business_question":"Monthly trend","available_fields":["month","revenue"],"expected":"line_chart"},
+{"id":"eval-mix","business_question":"Sales mix","available_fields":["category","sales"],"expected":"donut_chart"},
+{"id":"eval-histogram","business_question":"Distribution","available_fields":["revenue"],"expected":"histogram"},
+{"id":"eval-scatter","business_question":"Relationship","available_fields":["price","profit"],"expected":"scatter_plot"},
+{"id":"eval-map","business_question":"By country","available_fields":["country","sales"],"expected":"map_symbol"},
+{"id":"eval-funnel","business_question":"Stage conversion","available_fields":["stage","count"],"expected":"funnel"},
+{"id":"eval-table","business_question":"List records","available_fields":["region","revenue"],"expected":"table"},
+{"id":"eval-pivot","business_question":"Region by quarter","available_fields":["region","quarter","revenue"],"expected":"matrix_pivot"},
+{"id":"eval-heatmap","business_question":"Quarter and region intensity","available_fields":["region","quarter","revenue"],"expected":"heatmap"},
+{"id":"eval-flow","business_question":"Customer flow","available_fields":["source","target","count"],"expected":"sankey"},
+{"id":"eval-hierarchy","business_question":"Category hierarchy","available_fields":["category","revenue"],"expected":"treemap"}
+]

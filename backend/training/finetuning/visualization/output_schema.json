@@ -1,0 +1,24 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$id":"https://insightos.local/schemas/visualization-spec-v1.json",
+  "type":"object",
+  "additionalProperties":false,
+  "required":["schema_version","visualization_id","purpose","data_mappings","aggregation","formatting","legend","tooltip","layout","accessibility","rationale"],
+  "properties":{
+    "schema_version":{"const":1},
+    "visualization_id":{"type":"string","minLength":1},
+    "purpose":{"type":"string","minLength":1,"maxLength":200},
+    "data_mappings":{"type":"object","minProperties":0,"additionalProperties":{"oneOf":[{"type":"string","minLength":1},{"type":"array","minItems":1,"items":{"type":"string"}},{"type":"object","required":["fields"],"properties":{"fields":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}]},"aggregation":{"type":"string","enum":["count","sum","avg","min","max","distinct_count","none"]}},"additionalProperties":false}]}},
+    "axis":{"type":"object","properties":{"x":{"type":"string"},"y":{"type":"string"},"x_title":{"type":"string"},"y_title":{"type":"string"}},"additionalProperties":false},
+    "series":{"type":"object","properties":{"field":{"type":"string"},"stacked":{"type":"boolean"},"normalized":{"type":"boolean"}},"additionalProperties":false},
+    "configuration":{"type":"object","additionalProperties":{"oneOf":[{"type":["string","number","integer","boolean"]},{"type":"null"}]}},
+    "aggregation":{"type":"object","required":["references"],"properties":{"references":{"type":"array","items":{"type":"object","required":["field","operation"],"properties":{"field":{"type":"string"},"operation":{"type":"string","enum":["count","sum","avg","min","max","distinct_count","none"]}},"additionalProperties":false}}},"additionalProperties":false},
+    "formatting":{"type":"object","properties":{"number_format":{"type":["string","null"]},"date_format":{"type":["string","null"]},"decimal_places":{"type":"integer","minimum":0},"currency":{"type":["string","null"]},"prefix":{"type":["string","null"]},"suffix":{"type":["string","null"]}},"additionalProperties":false},
+    "legend":{"type":"object","required":["visible"],"properties":{"visible":{"type":"boolean"},"position":{"type":"string","enum":["top","bottom","left","right","none"]}},"additionalProperties":false},
+    "tooltip":{"type":"object","required":["enabled","fields"],"properties":{"enabled":{"type":"boolean"},"fields":{"type":"array","items":{"type":"string"}},"show_aggregation":{"type":"boolean"}},"additionalProperties":false},
+    "layout":{"type":"object","required":["width","height"],"properties":{"width":{"type":["integer","string"],"minimum":1},"height":{"type":["integer","string"],"minimum":1},"title":{"type":["string","null"]},"subtitle":{"type":["string","null"]}},"additionalProperties":false},
+    "accessibility":{"type":"object","required":["text_alternative","color_mode","keyboard_interaction"],"properties":{"text_alternative":{"type":"string","minLength":1},"color_mode":{"type":"string","enum":["color_only","color_with_pattern","color_with_labels"]},"keyboard_interaction":{"type":"boolean"}},"additionalProperties":false},
+    "rationale":{"type":"string","minLength":10,"maxLength":1000},
+    "fallback":{"type":"boolean","default":false}
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "rules": [
+    {"when":{"objective":["current_value","kpi"]},"preferred":"kpi_scorecard","fallback":"table","rationale":"A single current measure is represented by a KPI scorecard."},
+    {"when":{"objective":["target_attainment"],"has_target_field":true},"preferred":"kpi_scorecard","fallback":"table","rationale":"Current value and target belong in a KPI card; bullet charts are not registered yet."},
+    {"when":{"objective":["trend","time_series"],"has_time_field":true,"volume_emphasis":false},"preferred":"line_chart","fallback":"table","rationale":"Ordered time and a numeric measure support a precise trend line."},
+    {"when":{"objective":["trend","time_series"],"has_time_field":true,"volume_emphasis":true},"preferred":"area_chart","fallback":"line_chart","rationale":"Area emphasizes volume; line is preferred when precision matters."},
+    {"when":{"objective":["ranking","comparison"],"category_count":{"max":30},"series_count":{"max":1}},"preferred":"ranked_bar","fallback":"table","rationale":"Bars support readable ordered category comparison."},
+    {"when":{"objective":["series_comparison","comparison"],"series_count":{"min":2,"max":8},"category_count":{"max":20},"composition":false},"preferred":"grouped_bar","fallback":"table","rationale":"Independent series are compared with side-by-side grouped bars."},
+    {"when":{"objective":["comparison","composition"],"series_count":{"min":2},"composition":true},"preferred":"stacked_bar","fallback":"table","rationale":"Stacked bars represent additive composition across categories."},
+    {"when":{"objective":["part_to_whole"],"category_count":{"min":2,"max":6}},"preferred":"donut_chart","fallback":"table","rationale":"A small proportion set is readable in a donut."},
+    {"when":{"objective":["part_to_whole","composition"],"category_count":{"min":7}},"preferred":"stacked_bar","fallback":"treemap","rationale":"Many parts are less misleading in stacked bars or, for hierarchy, a treemap."},
+    {"when":{"objective":["composition"],"has_hierarchy":true},"preferred":"treemap","fallback":"stacked_bar","rationale":"Use a treemap only when parent-child hierarchy paths are valid."},
+    {"when":{"objective":["distribution"],"category_count":{"max":1}},"preferred":"histogram","fallback":"box_plot","rationale":"One numeric distribution is shown with a histogram."},
+    {"when":{"objective":["distribution","comparison"],"category_count":{"min":2}},"preferred":"box_plot","fallback":"table","rationale":"Box plots compare grouped distributions; histograms reveal a single shape."},
+    {"when":{"objective":["correlation","relationship"],"numeric_measure_count":{"min":2},"bubble_size_field":false},"preferred":"scatter_plot","fallback":"table","rationale":"Two numeric measures support a relationship plot."},
+    {"when":{"objective":["correlation","relationship"],"bubble_size_field":true},"preferred":"scatter_plot","fallback":"table","rationale":"Scatter remains appropriate; point size optionally encodes a third numeric measure."},
+    {"when":{"objective":["geography","geospatial"],"has_geographic_field":true},"preferred":"map_symbol","fallback":"table","rationale":"Valid geography and a numeric measure support a symbol map."},
+    {"when":{"objective":["hierarchy"],"has_hierarchy_field":true},"preferred":"treemap","fallback":"table","rationale":"Nested category paths support a treemap."},
+    {"when":{"objective":["process","conversion"],"ordered_stage_count":{"min":2}},"preferred":"funnel","fallback":"table","rationale":"Ordered conversion stages support a funnel."},
+    {"when":{"objective":["flow"],"has_source_target_fields":true},"preferred":"sankey","fallback":"table","rationale":"Source, target, and measure fields support a flow diagram."},
+    {"when":{"objective":["detail"],"single_record_detail":true},"preferred":"table","fallback":"table","rationale":"Record detail is presented reliably in a table."},
+    {"when":{"objective":["cross_tab","pivot"],"has_row_field":true,"has_column_field":true},"preferred":"matrix_pivot","fallback":"table","rationale":"Rows, columns, and a measure support a matrix pivot."},
+    {"when":{"objective":["two_dimensional_intensity"],"has_x_field":true,"has_y_field":true},"preferred":"heatmap","fallback":"table","rationale":"Two dimensions and a numeric intensity support a heatmap."}
+  ],
+  "negative_examples": [
+    {"id":"neg-pie-many","question":"Compare 40 product margins","visualization":"donut_chart","reason":"Many slices obscure precise comparison; use ranked bars or a table."},
+    {"id":"neg-line-category","question":"Compare department budgets","visualization":"line_chart","reason":"Lines imply continuity between unordered categories."},
+    {"id":"neg-scatter-category","question":"Compare states by revenue","visualization":"scatter_plot","reason":"A category and one measure do not provide two numeric axes."},
+    {"id":"neg-area-overlap","question":"Precisely compare five overlapping series","visualization":"area_chart","reason":"Overlapping areas obscure values; use a line or grouped chart."},
+    {"id":"neg-grouped-stacked","question":"Show product family share of each region","visualization":"grouped_bar","reason":"Use stacked composition only if additive segment totals are meaningful."},
+    {"id":"neg-histogram-small-category","question":"Compare carrier delivery medians","visualization":"histogram","reason":"Grouped distributions need box plots or a complete distribution table."},
+    {"id":"neg-funnel-missing-stages","question":"Summarize annual retention","visualization":"funnel","reason":"Retention is not an ordered conversion funnel."},
+    {"id":"neg-pivot-single-kpi","question":"Show current revenue","visualization":"matrix_pivot","reason":"A single scalar KPI needs a scorecard."},
+    {"id":"neg-heatmap-no-two-dimensions","question":"Show quarterly revenue trend","visualization":"heatmap","reason":"Chronological trend needs a line chart rather than an intensity matrix."},
+    {"id":"neg-treemap-flat-ranking","question":"Rank 20 stores by revenue","visualization":"treemap","reason":"A hierarchy is required; a ranked bar is clearer."},
+    {"id":"neg-sankey-unordered-events","question":"Compare daily revenue categories","visualization":"sankey","reason":"Source-target flow is required."}
+  ],
+  "fallback_behavior":{"preferred":"table","conditions":["No usable fields","Unsupported chart","Required type unavailable","Ambiguous profile","Misleading interpretation"],"message_required":true}
+}

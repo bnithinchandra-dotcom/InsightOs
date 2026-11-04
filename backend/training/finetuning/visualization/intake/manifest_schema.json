@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://insightos.local/schemas/visualization-intake-report-v1.json",
+  "title": "InsightOS visualization intake report",
+  "type": "object",
+  "required": [
+    "manifest_version",
+    "intake_module_version",
+    "source_identifier",
+    "source_checksum",
+    "status",
+    "source_integrity_status",
+    "profiling_status",
+    "candidate_status",
+    "human_annotation_status",
+    "governance_approval_status",
+    "training_export_status",
+    "coverage",
+    "file_checksums",
+    "limitations"
+  ],
+  "properties": {
+    "manifest_version": {"const": 1},
+    "intake_module_version": {"type": "string"},
+    "source_identifier": {"type": "string"},
+    "source_checksum": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "status": {"const": "review_ready"},
+    "source_integrity_status": {"const": "verified"},
+    "profiling_status": {"const": "completed"},
+    "candidate_status": {"const": "pending_review"},
+    "human_annotation_status": {"const": "pending"},
+    "governance_approval_status": {"const": "not_requested"},
+    "training_export_status": {"const": "not_permitted"},
+    "coverage": {"type": "object"},
+    "file_checksums": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["filename", "sha256", "size_bytes"],
+        "properties": {
+          "filename": {"type": "string"},
+          "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "size_bytes": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+      }
+    },
+    "failure_recovery": {"type": "object"},
+    "limitations": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": false
+}

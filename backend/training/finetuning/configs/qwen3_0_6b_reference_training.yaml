@@ -1,0 +1,31 @@
+experiment:
+  stage: "human_review_and_training_readiness"
+  execution_status: "blocked"
+  execute_training: false
+  base_model: "unsloth/Qwen3-0.6B-unsloth-bnb-4bit"
+  base_model_revision: "must_be_recorded_from_model_hub_before_training"
+  method: "qlora_nf4"
+
+dataset:
+  approved_training_only: true
+  approved_evaluation_only: true
+  evaluation_set_never_used_for_training: true
+  minimum_approved_training_records: 1
+  minimum_approved_evaluation_records: 1
+  minimum_unique_projects: 1
+  minimum_unique_visual_families: 1
+  minimum_complete_configurations: 1
+  split_by: ["scenario_group", "template_group", "source_project"]
+  duplicate_and_leakage_check_required: true
+
+training:
+  fp16: true
+  pilot_only: true
+  two_gpu_execution: false
+  deterministic_seeds_required: true
+  evaluation_set_forbidden_from_optimization: true
+
+audit:
+  human_approval_required: true
+  automatic_approval: false
+  agent_self_approval_allowed: false

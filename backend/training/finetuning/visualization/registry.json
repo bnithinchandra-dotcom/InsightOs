@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "visualizations": [
+    {
+      "id":"kpi_scorecard","display_name":"KPI Scorecard","category":"kpi","analytical_purposes":["current_value","target_attainment"],
+      "encodings":{"required":["measure"],"optional":["target"]},
+      "accepted_types":{"measure":["integer","number"],"target":["integer","number"]},
+      "cardinality":{"measure":{"min":1,"max":1},"target":{"min":0,"max":1}},
+      "configuration_options":{"format":{"type":"enum","allowed_values":["number","currency","percent"]},"trend":{"type":"enum","allowed_values":["increase","decrease","none"]}},
+      "limitations":["No categorical detail or historical trend"],"inappropriate_uses":["Showing a ranking or distribution"],"fallback":"table",
+      "accessibility":"State the current value, units, target, and direction in text."
+    },
+    {
+      "id":"ranked_bar","display_name":"Ranked Bar","category":"comparison","analytical_purposes":["ranking","comparison"],
+      "encodings":{"required":["category","measure"],"optional":["color"]},
+      "accepted_types":{"category":["string","category"],"measure":["integer","number"],"color":["string","category"]},
+      "cardinality":{"category":{"min":2,"max":30},"measure":{"min":1,"max":1}},
+      "configuration_options":{"sort":{"type":"enum","allowed_values":["ascending","descending"]},"orientation":{"type":"enum","allowed_values":["horizontal","vertical"]},"display_values":{"type":"boolean","allowed_values":[true,false]}},
+      "limitations":["Not suitable for very large category counts"],"inappropriate_uses":["Unordered categories with no ranking objective","Time-series data"],"fallback":"table",
+      "accessibility":"Use direct labels, patterns where needed, and a textual ranking."
+    },
+    {
+      "id":"grouped_bar","display_name":"Grouped Bar","category":"comparison","analytical_purposes":["comparison","series_comparison"],
+      "encodings":{"required":["category","measure","series"],"optional":["color"]},
+      "accepted_types":{"category":["string","category"],"measure":["integer","number"],"series":["string","category"],"color":["string","category"]},
+      "cardinality":{"category":{"min":2,"max":20},"series":{"min":2,"max":8},"measure":{"min":1,"max":1}},
+      "configuration_options":{"legend":{"type":"enum","allowed_values":["top","bottom","left","right","none"]},"orientation":{"type":"enum","allowed_values":["horizontal","vertical"]}},
+      "limitations":["Many series or categories reduce readability"],"inappropriate_uses":["Part-to-whole totals where stacked segments are intended"],"fallback":"table",
+      "accessibility":"Provide legend text, direct labels, and keyboard-readable values."
+    },
+    {
+      "id":"line_chart","display_name":"Line Chart","category":"time_series","analytical_purposes":["trend","time_series"],
+      "encodings":{"required":["time","measure"],"optional":["series"]},
+      "accepted_types":{"time":["date","datetime"],"measure":["integer","number"],"series":["string","category"]},
+      "cardinality":{"time":{"min":3,"max":3650},"measure":{"min":1,"max":1},"series":{"min":1,"max":8}},
+      "configuration_options":{"granularity":{"type":"enum","allowed_values":["hour","day","week","month","quarter","year"]},"markers":{"type":"boolean","allowed_values":[true,false]}},
+      "limitations":["Do not imply continuity for unordered categories"],"inappropriate_uses":["Cross-sectional comparison without time"],"fallback":"table",
+      "accessibility":"Summarize direction and extrema in text; provide data values."
+    },
+    {
+      "id":"area_chart","display_name":"Area Chart","category":"time_series","analytical_purposes":["trend","volume","time_series"],
+      "encodings":{"required":["time","measure"],"optional":["series"]},
+      "accepted_types":{"time":["date","datetime"],"measure":["integer","number"],"series":["string","category"]},
+      "cardinality":{"time":{"min":3,"max":3650},"measure":{"min":1,"max":1},"series":{"min":1,"max":5}},
+      "configuration_options":{"stacked":{"type":"enum","allowed_values":["none","absolute","normalized"]},"granularity":{"type":"enum","allowed_values":["hour","day","week","month","quarter","year"]}},
+      "limitations":["Stacking and overlap obscure precision"],"inappropriate_uses":["Precise comparison between overlapping series"],"fallback":"line_chart",
+      "accessibility":"Use direct labels or a text table and describe trends."
+    },
+    {
+      "id":"donut_chart","display_name":"Donut Chart","category":"composition","analytical_purposes":["part_to_whole"],
+      "encodings":{"required":["category","measure"],"optional":[]},
+      "accepted_types":{"category":["string","category"],"measure":["integer","number"]},
+      "cardinality":{"category":{"min":2,"max":6},"measure":{"min":1,"max":1}},
+      "configuration_options":{"labels":{"type":"enum","allowed_values":["none","value","percent"]},"total":{"type":"boolean","allowed_values":[true,false]}},
+      "limitations":["Unsuitable for precise comparison and many parts"],"inappropriate_uses":["More than six meaningful parts","Negative values","Ranking"],"fallback":"table",
+      "accessibility":"Include percentages and values in text; do not rely on color alone."
+    },
+    {
+      "id":"stacked_bar","display_name":"Stacked Bar","category":"composition","analytical_purposes":["composition","part_to_whole"],
+      "encodings":{"required":["category","measure","series"],"optional":[]},
+      "accepted_types":{"category":["string","category"],"measure":["integer","number"],"series":["string","category"]},
+      "cardinality":{"category":{"min":2,"max":30},"series":{"min":2,"max":12},"measure":{"min":1,"max":1}},
+      "configuration_options":{"normalize":{"type":"boolean","allowed_values":[true,false]},"orientation":{"type":"enum","allowed_values":["horizontal","vertical"]}},
+      "limitations":["Precise within-segment comparison is difficult"],"inappropriate_uses":["Independent measures that are not additive"],"fallback":"table",
+      "accessibility":"Use direct labels and patterns; provide series totals."
+    },
+    {
+      "id":"histogram","display_name":"Histogram","category":"distribution","analytical_purposes":["distribution"],
+      "encodings":{"required":["measure"],"optional":["bins"]},
+      "accepted_types":{"measure":["integer","number"],"bins":["integer"]},
+      "cardinality":{"measure":{"min":1,"max":1},"bins":{"min":3,"max":100}},
+      "configuration_options":{"bin_count":{"type":"integer","allowed_values":[5,10,20,30,50]}},
+      "limitations":["Bin choice changes visual shape"],"inappropriate_uses":["Categorical values or tiny samples without disclosure"],"fallback":"box_plot",
+      "accessibility":"Describe sample size, shape, range, and mode in text."
+    },
+    {
+      "id":"box_plot","display_name":"Box Plot","category":"distribution","analytical_purposes":["distribution","outliers"],
+      "encodings":{"required":["measure"],"optional":["category"]},
+      "accepted_types":{"measure":["integer","number"],"category":["string","category"]},
+      "cardinality":{"measure":{"min":1,"max":1},"category":{"min":0,"max":20}},
+      "configuration_options":{"outliers":{"type":"boolean","allowed_values":[true,false]},"show_points":{"type":"boolean","allowed_values":[true,false]}},
+      "limitations":["Can hide modality and sample size"],"inappropriate_uses":["Nominal categorical comparison with no numeric distribution"],"fallback":"table",
+      "accessibility":"Report median, quartiles, range, sample size, and outliers."
+    },
+    {
+      "id":"scatter_plot","display_name":"Scatter Plot","category":"relationship","analytical_purposes":["correlation","relationship"],
+      "encodings":{"required":["x_measure","y_measure"],"optional":["color","size"]},
+      "accepted_types":{"x_measure":["integer","number"],"y_measure":["integer","number"],"color":["string","category"],"size":["integer","number"]},
+      "cardinality":{"x_measure":{"min":1,"max":1},"y_measure":{"min":1,"max":1},"size":{"min":0,"max":1}},
+      "configuration_options":{"trend_line":{"type":"boolean","allowed_values":[true,false]},"point_size":{"type":"integer","allowed_values":[4,6,8,10,12]}},
+      "limitations":["Overplotting reduces meaning at large scales"],"inappropriate_uses":["One numeric field and one category without a second numeric measure"],"fallback":"table",
+      "accessibility":"Provide axes, sample count, and a textual relationship summary."
+    },
+    {
+      "id":"map_symbol","display_name":"Symbol Map","category":"geospatial","analytical_purposes":["geography","geospatial_comparison"],
+      "encodings":{"required":["geography","measure"],"optional":["color"]},
+      "accepted_types":{"geography":["geography","string","category"],"measure":["integer","number"],"color":["integer","number","string","category"]},
+      "cardinality":{"geography":{"min":2,"max":500},"measure":{"min":1,"max":1}},
+      "configuration_options":{"map_projection":{"type":"enum","allowed_values":["mercator","equal_earth"]},"symbol_size":{"type":"enum","allowed_values":["fixed","measure"]}},
+      "limitations":["Invalid geography and inappropriate area encoding mislead"],"inappropriate_uses":["Unresolved region names","Ranking without geographic meaning"],"fallback":"table",
+      "accessibility":"Provide a geographic text table and unambiguous value labels."
+    },
+    {
+      "id":"treemap","display_name":"Treemap","category":"hierarchical","analytical_purposes":["hierarchy","composition"],
+      "encodings":{"required":["hierarchy","measure"],"optional":["color"]},
+      "accepted_types":{"hierarchy":["string","category"],"measure":["integer","number"],"color":["integer","number","string","category"]},
+      "cardinality":{"hierarchy":{"min":2,"max":100},"measure":{"min":1,"max":1}},
+      "configuration_options":{"levels":{"type":"integer","allowed_values":[1,2,3]},"labels":{"type":"enum","allowed_values":["none","name","value","name_and_value"]}},
+      "limitations":["Deep hierarchies and precise comparison are difficult"],"inappropriate_uses":["Flat rankings where bars are clearer","Cycles or unknown parent-child relationships"],"fallback":"table",
+      "accessibility":"Provide hierarchy paths, values, and text alternatives."
+    },
+    {
+      "id":"funnel","display_name":"Funnel","category":"funnel","analytical_purposes":["conversion","process"],
+      "encodings":{"required":["stage","measure"],"optional":[]},
+      "accepted_types":{"stage":["string","category"],"measure":["integer","number"]},
+      "cardinality":{"stage":{"min":2,"max":12},"measure":{"min":1,"max":1}},
+      "configuration_options":{"stage_order":{"type":"enum","allowed_values":["ascending","descending","data_ordered"]},"labels":{"type":"enum","allowed_values":["name","count","rate","name_count_rate"]}},
+      "limitations":["Requires ordered stages and non-increasing conversion values"],"inappropriate_uses":["Unordered categories or annual trend retention"],"fallback":"table",
+      "accessibility":"List stages, counts, and transition rates in order."
+    },
+    {
+      "id":"table","display_name":"Table","category":"table","analytical_purposes":["detail","fallback"],
+      "encodings":{"required":["field"],"optional":["measure"]},
+      "accepted_types":{"field":["string","category","date","datetime","geography","integer","number","boolean"],"measure":["integer","number"]},
+      "cardinality":{"field":{"min":1,"max":50},"measure":{"min":0,"max":50}},
+      "configuration_options":{"pagination":{"type":"boolean","allowed_values":[true,false]},"sorting":{"type":"boolean","allowed_values":[true,false]},"density":{"type":"enum","allowed_values":["compact","comfortable"]}},
+      "limitations":["Not ideal for broad trends or visual comparison"],"inappropriate_uses":["Replacing a necessary distribution or relationship view with raw rows"],"fallback":"table",
+      "accessibility":"Use semantic headers, row labels, units, and keyboard navigation."
+    },
+    {
+      "id":"matrix_pivot","display_name":"Matrix Pivot","category":"table","analytical_purposes":["cross_tab","pivot"],
+      "encodings":{"required":["rows","columns","measure"],"optional":[]},
+      "accepted_types":{"rows":["string","category","date","datetime"],"columns":["string","category","date","datetime"],"measure":["integer","number"]},
+      "cardinality":{"rows":{"min":1,"max":100},"columns":{"min":1,"max":100},"measure":{"min":1,"max":10}},
+      "configuration_options":{"subtotals":{"type":"boolean","allowed_values":[true,false]},"transpose":{"type":"boolean","allowed_values":[true,false]}},
+      "limitations":["Large matrices become dense"],"inappropriate_uses":["A single scalar KPI or unstructured narrative"],"fallback":"table",
+      "accessibility":"Expose row and column headers and provide text equivalents."
+    },
+    {
+      "id":"heatmap","display_name":"Heatmap","category":"relationship","analytical_purposes":["two_dimensional_intensity","correlation_matrix"],
+      "encodings":{"required":["x","y","measure"],"optional":[]},
+      "accepted_types":{"x":["string","category","date","datetime"],"y":["string","category","date","datetime"],"measure":["integer","number"]},
+      "cardinality":{"x":{"min":2,"max":50},"y":{"min":2,"max":50},"measure":{"min":1,"max":1}},
+      "configuration_options":{"color_scale":{"type":"enum","allowed_values":["sequential","diverging"]},"value_labels":{"type":"boolean","allowed_values":[true,false]}},
+      "limitations":["Color alone hides precise differences"],"inappropriate_uses":["Sequential trend without a two-dimensional matrix"],"fallback":"table",
+      "accessibility":"Use labels, text legend, and a tabular text alternative."
+    },
+    {
+      "id":"sankey","display_name":"Sankey Diagram","category":"flow","analytical_purposes":["flow","process"],
+      "encodings":{"required":["source","target","measure"],"optional":["color"]},
+      "accepted_types":{"source":["string","category"],"target":["string","category"],"measure":["integer","number"],"color":["string","category"]},
+      "cardinality":{"source":{"min":1,"max":30},"target":{"min":1,"max":30},"measure":{"min":1,"max":1}},
+      "configuration_options":{"node_order":{"type":"enum","allowed_values":["data","source","alphabetical"]},"orientation":{"type":"enum","allowed_values":["horizontal","vertical"]}},
+      "limitations":["Complex flows obscure values and cycles"],"inappropriate_uses":["A one-dimensional timeline or simple ranking"],"fallback":"table",
+      "accessibility":"Provide source-target measures and ordered node totals as text."
+    }
+  ]
+}
