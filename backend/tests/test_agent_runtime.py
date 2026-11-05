@@ -3,7 +3,7 @@ import os
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpx2
 
@@ -28,6 +28,7 @@ from app.agent.runtime import (
     _orchestrator_system_instructions,
     execute_agent_request,
     public_outcome_metadata,
+    resume_interrupted_specialist_graph,
 )
 from app.agent.tools import StrictArguments, ToolDefinition, ToolRegistry
 
@@ -1458,6 +1459,254 @@ class AgentProviderTests(unittest.TestCase):
         )
         self.assertEqual(outcome.status, "provider_unavailable")
         self.assertEqual(outcome.error_code, "provider_not_configured")
+
+
+def test_engine_request_runs_through_specialist_graph_once():
+    workflow_id = "a" * 32
+    dataset_id = 17
+    file_id = 23
+    checkpointer = object()
+    provider = SequenceProvider(
+        [
+            ModelResponse(
+                ProviderMessage(
+                    role="assistant",
+                    content="",
+                    tool_calls=(
+                        ToolCall(
+                            "engine-call",
+                            "run_eda_analysis",
+                            {"dataset_id": dataset_id, "file_id": file_id},
+                        ),
+                    ),
+                ),
+                finish_reason="tool_calls",
+            )
+        ]
+    )
+
+    class EngineRegistry:
+        def provider_schemas(self, *, context=None):
+            return ({"function": {"name": "run_eda_analysis"}},)
+
+        def is_engine_operation(self, name):
+            return name == "run_eda_analysis"
+
+    graph_state = {
+        "workflow_id": workflow_id,
+        "execution_status": "completed",
+        "source_inspection": {
+            "dataset_id": dataset_id,
+            "file_id": file_id,
+            "source_fingerprint": "source-v1",
+        },
+        "data_intelligence_result": {"summary": "Selected-file evidence verified."},
+        "data_intelligence_model": "data-model",
+        "analytics_decision": {"summary": "The requested operation was approved."},
+        "analytics_model": "analytics-model",
+        "engine_task_reference": "engine:task",
+        "engine_result": {
+            "status": "succeeded",
+            "summary": "EDA completed.",
+            "data": {
+                "status": "Completed",
+                "result": {
+                    "analysis_type": "univariate",
+                    "rows_analyzed": 4,
+                    "source": {
+                        "dataset_id": dataset_id,
+                        "file_id": file_id,
+                    },
+                    "analyzed_columns": ["amount"],
+                },
+            },
+            "warnings": [],
+            "references": [],
+            "limitations": [],
+            "error_code": None,
+        },
+        "presentation_result": {
+            "status": "completed",
+            "summary": "The analysis is ready to review.",
+            "evidence_references": [],
+        },
+        "presentation_model": "presentation-model",
+    }
+
+    class Graph:
+        def __init__(self):
+            self.invocations = []
+
+        def invoke(self, state, config):
+            self.invocations.append((state, config))
+            return graph_state
+
+    graph = Graph()
+    trace = {
+        "tool": "orchestration_trace",
+        "status": "completed",
+        "summary": "The verified analytics workflow completed.",
+        "data": {
+            "source_identity": {
+                "dataset_id": dataset_id,
+                "file_id": file_id,
+                "source_fingerprint": "source-v1",
+            },
+            "models": {},
+            "stages": [],
+            "execution_plan": [],
+            "outcome": "completed",
+        },
+    }
+
+    with patch(
+        "app.agent.runtime.build_specialist_graph",
+        return_value=graph,
+    ) as build_graph, patch(
+        "app.agent.runtime.build_engine_workflow_trace",
+        return_value=(trace, True),
+    ):
+        outcome = execute_agent_request(
+            user_message="Run EDA on the selected file.",
+            history=[],
+            context={
+                "workflow_id": workflow_id,
+                "owner_user_id": 5,
+                "dataset_id": dataset_id,
+            },
+            settings=settings(),
+            provider=provider,
+            registry=EngineRegistry(),
+            workflow_scheduler=lambda *_args, **_kwargs: None,
+            checkpointer=checkpointer,
+        )
+
+    build_graph.assert_called_once()
+    assert build_graph.call_args.kwargs["checkpointer"] is checkpointer
+    assert len(graph.invocations) == 1
+    graph_input, graph_config = graph.invocations[0]
+    assert graph_input["workflow_id"] == workflow_id
+    assert graph_input["owner_id"] == 5
+    assert graph_input["source_scope"] == {
+        "dataset_id": dataset_id,
+        "file_id": file_id,
+    }
+    assert graph_config["configurable"]["thread_id"] == workflow_id
+    assert outcome.status == "completed"
+    assert outcome.assistant_text.endswith("The analysis is ready to review.")
+    assert sum(
+        result["tool"] == "agent3_insights_visualization"
+        for result in outcome.structured_results
+    ) == 1
+
+
+def test_interrupted_specialist_graph_resumes_only_matching_owned_checkpoint():
+    workflow_id = "b" * 32
+    owner_user_id = 5
+    dataset_id = 17
+    checkpointer = object()
+    snapshot = SimpleNamespace(
+        values={
+            "workflow_id": workflow_id,
+            "owner_id": owner_user_id,
+            "dataset_id": dataset_id,
+            "source_scope": {"dataset_id": dataset_id, "file_id": 23},
+            "arguments": {"dataset_id": dataset_id, "file_id": 23},
+            "engine_task_reference": "engine:task",
+            "engine_result_reference": "engine:task",
+            "engine_result": {"status": "succeeded"},
+        },
+        next=("presentation_specialist",),
+        tasks=(SimpleNamespace(interrupts=("presentation",)),),
+    )
+
+    class Graph:
+        def __init__(self):
+            self.invoke_calls = []
+
+        def get_state(self, config):
+            assert config["configurable"]["thread_id"] == workflow_id
+            return snapshot
+
+        def invoke(self, command, config):
+            self.invoke_calls.append((command, config))
+            return {"execution_status": "completed"}
+
+    graph = Graph()
+    with patch(
+        "app.agent.runtime.get_agent_settings",
+        return_value=settings(),
+    ), patch(
+        "app.agent.runtime.create_provider",
+        return_value=object(),
+    ), patch(
+        "app.agent.runtime.AgentModelRouter",
+        return_value=object(),
+    ), patch(
+        "app.agent.runtime.build_specialist_graph",
+        return_value=graph,
+    ):
+        resumed = resume_interrupted_specialist_graph(
+            workflow_id=workflow_id,
+            owner_user_id=owner_user_id,
+            dataset_id=dataset_id,
+            context={},
+            workflow_scheduler=lambda *_args, **_kwargs: None,
+            checkpointer=checkpointer,
+            completed_engine_task_references={"engine:task"},
+        )
+
+    assert resumed == {"execution_status": "completed"}
+    assert len(graph.invoke_calls) == 1
+    command, config = graph.invoke_calls[0]
+    assert command.resume == "continue"
+    assert config["configurable"]["thread_id"] == workflow_id
+
+
+def test_interrupted_specialist_graph_rejects_checkpoint_owner_mismatch():
+    workflow_id = "c" * 32
+    snapshot = SimpleNamespace(
+        values={
+            "workflow_id": workflow_id,
+            "owner_id": 6,
+            "dataset_id": 17,
+            "source_scope": {"dataset_id": 17, "file_id": 23},
+            "arguments": {"dataset_id": 17, "file_id": 23},
+            "engine_task_reference": "engine:task",
+            "engine_result_reference": "engine:task",
+            "engine_result": {"status": "succeeded"},
+        },
+        next=("presentation_specialist",),
+        tasks=(SimpleNamespace(interrupts=("presentation",)),),
+    )
+    graph = SimpleNamespace(
+        get_state=lambda _config: snapshot,
+        invoke=Mock(),
+    )
+    with patch(
+        "app.agent.runtime.get_agent_settings",
+        return_value=settings(),
+    ), patch(
+        "app.agent.runtime.create_provider",
+        return_value=object(),
+    ), patch(
+        "app.agent.runtime.AgentModelRouter",
+        return_value=object(),
+    ), patch(
+        "app.agent.runtime.build_specialist_graph",
+        return_value=graph,
+    ):
+        with unittest.TestCase().assertRaises(ValueError):
+            resume_interrupted_specialist_graph(
+                workflow_id=workflow_id,
+                owner_user_id=5,
+                dataset_id=17,
+                context={},
+                workflow_scheduler=lambda *_args, **_kwargs: None,
+                checkpointer=object(),
+                completed_engine_task_references={"engine:task"},
+            )
+    graph.invoke.assert_not_called()
 
 
 if __name__ == "__main__":

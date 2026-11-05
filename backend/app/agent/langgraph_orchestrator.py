@@ -5,11 +5,12 @@ import hashlib
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, TypedDict
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, ValidationError
 
 from app.agent.checkpointer import (
@@ -52,10 +53,14 @@ class SpecialistGraphState(TypedDict, total=False):
     arguments: dict[str, Any]
     source_scope: dict[str, Any]
     source_fingerprint: str
+    source_inspection: dict[str, Any]
     evidence_references: list[dict[str, Any]]
+    prior_analytics_outputs: list[dict[str, Any]]
     data_intelligence_result: dict[str, Any]
+    data_intelligence_model: str
     data_intelligence_task_reference: str
     analytics_decision: dict[str, Any]
+    analytics_model: str
     analytics_task_reference: str
     execution_permitted: bool
     engine_task_reference: str
@@ -65,6 +70,7 @@ class SpecialistGraphState(TypedDict, total=False):
     validation_structured_results: list[dict[str, Any]]
     validation_result: dict[str, Any]
     presentation_result: dict[str, Any]
+    presentation_model: str
     presentation_task_reference: str
     execution_status: str
     error_code: str
@@ -87,10 +93,19 @@ class _GraphInput(BaseModel):
     operation_type: StrictStr = Field(min_length=1, max_length=96)
     arguments: dict[str, Any]
     source_scope: dict[str, Any]
-    validation_response: StrictStr = Field(min_length=1, max_length=32 * 1024)
-    validation_structured_results: list[dict[str, Any]] = Field(
+    validation_response: StrictStr | None = Field(
+        default=None,
+        min_length=1,
+        max_length=32 * 1024,
+    )
+    validation_structured_results: list[dict[str, Any]] | None = Field(
+        default=None,
         min_length=1,
         max_length=10,
+    )
+    prior_analytics_outputs: list[dict[str, Any]] = Field(
+        default_factory=list,
+        max_length=8,
     )
 
 
@@ -103,6 +118,8 @@ class SpecialistGraphServices:
     registry: ToolRegistry
     workflow_scheduler: WorkflowScheduler
     request_context: dict[str, Any]
+    pause_before_presentation: bool = False
+    preparation_futures: dict[str, Any] = field(default_factory=dict)
 
 
 def _encoded_size(value: Any) -> int:
@@ -348,7 +365,11 @@ def build_specialist_graph(
             if not _safe_state_size(state):
                 raise ValueError("The graph state exceeds the safe size limit.")
             request = _GraphInput.model_validate(
-                {key: state.get(key) for key in _GraphInput.model_fields}
+                {
+                    key: state[key]
+                    for key in _GraphInput.model_fields
+                    if key in state
+                }
             )
             if request.dataset_id != request.source_scope.get("dataset_id"):
                 raise ValueError("The source scope does not match the selected dataset.")
@@ -454,6 +475,28 @@ def build_specialist_graph(
                 message="The selected-file inspection exceeded the specialist context limit.",
             )
         try:
+            services.preparation_futures[workflow_id] = (
+                SPECIALIST_PREPARATION.prepare_async(
+                    registry=services.registry,
+                    workflow_id=workflow_id,
+                    dataset_id=state["dataset_id"],
+                    file_id=state["source_scope"]["file_id"],
+                    source_fingerprint=source_fingerprint,
+                    operation=operation,
+                    inspection=inspection,
+                    evidence_references=evidence_references,
+                    context=context,
+                    analytics_outputs=state.get("prior_analytics_outputs", []),
+                )
+            )
+        except PreparationError as error:
+            return _failure(
+                state,
+                node="data_intelligence",
+                code=error.code,
+                message=error.message,
+            )
+        try:
             verified_schema = verified_schema_summary(inspection)
             input_material = {
                 "objective": state["user_request"],
@@ -462,7 +505,7 @@ def build_specialist_graph(
                 "inspection": inspection,
                 "evidence_references": evidence_references,
             }
-            handoff, _model, task_key = _schedule_specialist(
+            handoff, model_name, task_key = _schedule_specialist(
                 services,
                 state={
                     **state,
@@ -491,6 +534,12 @@ def build_specialist_graph(
             )
             output = DataIntelligenceResult.model_validate(handoff["output"])
         except SpecialistAgentError as error:
+            preparation_future = services.preparation_futures.pop(
+                workflow_id,
+                None,
+            )
+            if preparation_future is not None:
+                preparation_future.cancel()
             return _failure(
                 state,
                 node="data_intelligence",
@@ -498,6 +547,12 @@ def build_specialist_graph(
                 message=error.message,
             )
         except (TypeError, ValueError, ValidationError, OverflowError):
+            preparation_future = services.preparation_futures.pop(
+                workflow_id,
+                None,
+            )
+            if preparation_future is not None:
+                preparation_future.cancel()
             return _failure(
                 state,
                 node="data_intelligence",
@@ -506,6 +561,7 @@ def build_specialist_graph(
             )
         result: SpecialistGraphState = {
             "source_fingerprint": source_fingerprint,
+            "source_inspection": inspection,
             "source_scope": {
                 **state["source_scope"],
                 "dataset_id": dataset_id,
@@ -513,6 +569,7 @@ def build_specialist_graph(
             },
             "evidence_references": evidence_references,
             "data_intelligence_result": output.model_dump(mode="json"),
+            "data_intelligence_model": model_name,
             "data_intelligence_task_reference": task_key or "",
             "execution_status": "completed",
             "node_metadata": _record_node(
@@ -524,6 +581,12 @@ def build_specialist_graph(
             ),
         }
         if not _safe_state_size({**state, **result}):
+            preparation_future = services.preparation_futures.pop(
+                workflow_id,
+                None,
+            )
+            if preparation_future is not None:
+                preparation_future.cancel()
             return _failure(
                 state,
                 node="data_intelligence",
@@ -559,17 +622,23 @@ def build_specialist_graph(
                     "The selected-file source changed before Analytics Decision.",
                 )
             inspection = inspection_result.data
-            preparation_future = SPECIALIST_PREPARATION.prepare_async(
-                registry=services.registry,
-                workflow_id=state["workflow_id"],
-                dataset_id=state["dataset_id"],
-                file_id=state["source_scope"]["file_id"],
-                source_fingerprint=state["source_fingerprint"],
-                operation=state["operation_type"],
-                inspection=inspection,
-                evidence_references=state["evidence_references"],
-                context=context,
+            preparation_future = services.preparation_futures.pop(
+                state["workflow_id"],
+                None,
             )
+            if preparation_future is None:
+                preparation_future = SPECIALIST_PREPARATION.prepare_async(
+                    registry=services.registry,
+                    workflow_id=state["workflow_id"],
+                    dataset_id=state["dataset_id"],
+                    file_id=state["source_scope"]["file_id"],
+                    source_fingerprint=state["source_fingerprint"],
+                    operation=state["operation_type"],
+                    inspection=inspection,
+                    evidence_references=state["evidence_references"],
+                    context=context,
+                    analytics_outputs=state.get("prior_analytics_outputs", []),
+                )
             try:
                 preparation = preparation_future.result(timeout=30)
             except FutureTimeoutError:
@@ -594,7 +663,7 @@ def build_specialist_graph(
                 "data_intelligence": data_output.model_dump(mode="json"),
                 "preparation": preparation.model_dump(mode="json"),
             }
-            handoff, _model, task_key = _schedule_specialist(
+            handoff, model_name, task_key = _schedule_specialist(
                 services,
                 state=state,
                 role="analytics_modelling",
@@ -640,6 +709,7 @@ def build_specialist_graph(
             )
         result: SpecialistGraphState = {
             "analytics_decision": decision.model_dump(mode="json"),
+            "analytics_model": model_name,
             "analytics_task_reference": task_key or "",
             "execution_status": "completed",
             "node_metadata": _record_node(
@@ -781,6 +851,40 @@ def build_specialist_graph(
                 code=engine_result.error_code or "engine_execution_failed",
                 message=engine_result.summary,
             )
+        engine_data = engine_result.data
+        if (
+            not isinstance(engine_data, dict)
+            or isinstance(engine_data.get("dataset_id"), bool)
+            or engine_data.get("dataset_id") != state["dataset_id"]
+            or isinstance(engine_data.get("file_id"), bool)
+            or engine_data.get("file_id") != state["source_scope"]["file_id"]
+        ):
+            return _failure(
+                state,
+                node="deterministic_bi_engine",
+                code="engine_result_scope_mismatch",
+                message="The engine result does not match the selected dataset and file.",
+            )
+        if operation == "run_eda_analysis":
+            eda_result = engine_data.get("result")
+            eda_source = (
+                eda_result.get("source")
+                if isinstance(eda_result, dict)
+                else None
+            )
+            if (
+                not isinstance(eda_source, dict)
+                or isinstance(eda_source.get("dataset_id"), bool)
+                or eda_source.get("dataset_id") != state["dataset_id"]
+                or isinstance(eda_source.get("file_id"), bool)
+                or eda_source.get("file_id") != state["source_scope"]["file_id"]
+            ):
+                return _failure(
+                    state,
+                    node="deterministic_bi_engine",
+                    code="engine_result_scope_mismatch",
+                    message="The EDA result does not match the selected dataset and file.",
+                )
         try:
             engine_payload = _engine_result_payload(engine_result)
         except SpecialistAgentError as error:
@@ -823,9 +927,57 @@ def build_specialist_graph(
         state: SpecialistGraphState,
     ) -> SpecialistGraphState:
         started = time.monotonic()
+        validation_response = state.get("validation_response")
+        structured_results = state.get("validation_structured_results")
+        if validation_response is None and structured_results is None:
+            engine_result = state.get("engine_result")
+            if (
+                state.get("engine_result_reference")
+                != state.get("engine_task_reference")
+                or not state.get("engine_task_reference")
+                or not isinstance(engine_result, dict)
+                or engine_result.get("status") != "succeeded"
+                or not state.get("source_fingerprint")
+                or not state.get("data_intelligence_task_reference")
+                or not state.get("analytics_task_reference")
+            ):
+                return _failure(
+                    state,
+                    node="claim_and_evidence_validation",
+                    code="engine_evidence_unavailable",
+                    message="The engine result could not be tied to the verified workflow and source.",
+                    status="blocked",
+                )
+            result_data = {
+                "status": "passed",
+                "method": "verified_engine_handoff",
+                "decisions": [],
+                "validated_text": "",
+            }
+            return {
+                "validation_result": result_data,
+                "execution_status": "completed",
+                "node_metadata": _record_node(
+                    state,
+                    node="claim_and_evidence_validation",
+                    status="completed",
+                    started=started,
+                ),
+            }
+        if (
+            not isinstance(validation_response, str)
+            or not isinstance(structured_results, list)
+        ):
+            return _failure(
+                state,
+                node="claim_and_evidence_validation",
+                code="claim_validation_input_invalid",
+                message="Claim validation requires both the response and its structured evidence.",
+                status="blocked",
+            )
         validated_text, decisions, supported = validate_claim_envelope(
-            state["validation_response"],
-            structured_results=state["validation_structured_results"],
+            validation_response,
+            structured_results=structured_results,
             context={
                 **services.request_context,
                 "workflow_id": state["workflow_id"],
@@ -860,6 +1012,14 @@ def build_specialist_graph(
 
     def presentation_specialist(state: SpecialistGraphState) -> SpecialistGraphState:
         started = time.monotonic()
+        if services.pause_before_presentation:
+            interrupt(
+                {
+                    "phase": "presentation",
+                    "workflow_id": state["workflow_id"],
+                    "engine_task_reference": state.get("engine_task_reference"),
+                }
+            )
         if (
             state.get("validation_result", {}).get("status") != "passed"
             or state.get("engine_result", {}).get("status") != "succeeded"
@@ -870,6 +1030,31 @@ def build_specialist_graph(
                 code="presentation_evidence_unavailable",
                 message="Presentation requires a successful engine result and passed claim validation.",
                 status="blocked",
+            )
+        current_source = services.registry.prepare_engine_inspection(
+            state["operation_type"],
+            state["arguments"],
+            context={
+                **services.request_context,
+                "workflow_id": state["workflow_id"],
+                "user_message": state["user_request"],
+            },
+        )
+        if (
+            current_source.status != "succeeded"
+            or not isinstance(current_source.data, dict)
+            or current_source.data.get("source_fingerprint")
+            != state["source_fingerprint"]
+            or current_source.data.get("dataset_id") != state["dataset_id"]
+            or current_source.data.get("file_id")
+            != state["source_scope"]["file_id"]
+        ):
+            return _failure(
+                state,
+                node="presentation_specialist",
+                code="specialist_source_changed",
+                message="The selected source changed before presentation could complete.",
+                status="partial",
             )
         try:
             data_output = DataIntelligenceResult.model_validate(
@@ -896,7 +1081,7 @@ def build_specialist_graph(
                     separators=(",", ":"),
                 ).encode("utf-8")
             ).hexdigest()
-            handoff, _model, task_key = _schedule_specialist(
+            handoff, model_name, task_key = _schedule_specialist(
                 services,
                 state=state,
                 role="insights_visualization",
@@ -942,6 +1127,7 @@ def build_specialist_graph(
                 node="presentation_specialist",
                 code=error.code,
                 message=error.message,
+                status="partial",
             )
         except (TypeError, ValueError, ValidationError, OverflowError):
             return _failure(
@@ -949,6 +1135,7 @@ def build_specialist_graph(
                 node="presentation_specialist",
                 code="presentation_result_invalid",
                 message="The Presentation Specialist output failed its typed contract.",
+                status="partial",
             )
         if presentation.status not in {"completed", "partial"}:
             return _failure(
@@ -956,10 +1143,12 @@ def build_specialist_graph(
                 node="presentation_specialist",
                 code="presentation_not_completed",
                 message="The Presentation Specialist did not produce a usable presentation.",
+                status="partial",
             )
         final_status = "completed" if presentation.status == "completed" else "partial"
         result: SpecialistGraphState = {
             "presentation_result": presentation.model_dump(mode="json"),
+            "presentation_model": model_name,
             "presentation_task_reference": task_key or "",
             "execution_status": final_status,
             "final_response": {

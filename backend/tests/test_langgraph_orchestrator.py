@@ -4,6 +4,8 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
 from app.agent import langgraph_orchestrator as graph_module
 from app.agent.contracts import ToolResult
@@ -56,7 +58,14 @@ class FakeRegistry:
         self.engine_result = ToolResult(
             status="succeeded",
             summary="EDA completed.",
-            data={"result_id": "result-1", "dataset_id": DATASET_ID, "file_id": FILE_ID},
+            data={
+                "result_id": "result-1",
+                "dataset_id": DATASET_ID,
+                "file_id": FILE_ID,
+                "result": {
+                    "source": {"dataset_id": DATASET_ID, "file_id": FILE_ID}
+                },
+            },
             references=tuple(ENGINE_REFERENCES),
         )
 
@@ -330,6 +339,41 @@ def test_graph_invokes_existing_specialists_scheduler_validator_and_presentation
     assert result["engine_task_reference"] in scheduler.calls[3]["depends_on"]
 
 
+def test_interrupted_presentation_resumes_without_replaying_engine(monkeypatch):
+    calls = _mock_specialists(monkeypatch)
+    registry = FakeRegistry()
+    scheduler = FakeScheduler()
+    services = SpecialistGraphServices(
+        router=object(),
+        registry=registry,
+        workflow_scheduler=scheduler,
+        request_context={"dataset_id": DATASET_ID, "project_id": 9},
+        pause_before_presentation=True,
+    )
+    graph = build_specialist_graph(
+        services=services,
+        checkpointer=InMemorySaver(),
+    )
+    state = _initial_state()
+    state.pop("validation_response")
+    state.pop("validation_structured_results")
+    config = workflow_checkpoint_config(WORKFLOW_ID)
+
+    interrupted = graph.invoke(state, config)
+
+    assert interrupted["__interrupt__"]
+    assert registry.engine_calls == 1
+    snapshot = graph.get_state(config)
+    assert snapshot.next == ("presentation_specialist",)
+    assert any(task.interrupts for task in snapshot.tasks)
+
+    resumed = graph.invoke(Command(resume="continue"), config)
+
+    assert resumed["execution_status"] == "completed"
+    assert registry.engine_calls == 1
+    assert [name for name, _ in calls].count("presentation") == 1
+
+
 @pytest.mark.parametrize(
     ("fail_at", "expected_error"),
     [
@@ -424,6 +468,33 @@ def test_engine_failure_stops_claim_validation_and_presentation(monkeypatch):
 
     assert result["error_code"] == "engine_failed"
     assert validator_calls == []
+    assert "presentation" not in [name for name, _ in calls]
+
+
+def test_engine_result_scope_mismatch_prevents_presentation(monkeypatch):
+    calls = _mock_specialists(monkeypatch)
+    registry = FakeRegistry()
+    registry.engine_result = ToolResult(
+        status="succeeded",
+        summary="EDA completed for an unexpected file.",
+        data={
+            "dataset_id": DATASET_ID,
+            "file_id": FILE_ID + 1,
+            "result": {
+                "source": {"dataset_id": DATASET_ID, "file_id": FILE_ID + 1}
+            },
+        },
+    )
+    monkeypatch.setattr(
+        graph_module,
+        "validate_claim_envelope",
+        lambda *args, **kwargs: ("", [], True),
+    )
+
+    result = _invoke(build_specialist_graph(services=_services(registry)))
+
+    assert result["error_code"] == "engine_result_scope_mismatch"
+    assert registry.engine_calls == 1
     assert "presentation" not in [name for name, _ in calls]
 
 

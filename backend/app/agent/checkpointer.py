@@ -152,6 +152,11 @@ def get_postgres_checkpoint_saver(
     return initialize_postgres_checkpoint_saver(conn_string, required=required)
 
 
+def get_initialized_postgres_checkpoint_saver() -> Any | None:
+    with _CHECKPOINTER_LOCK:
+        return _POSTGRES_CHECKPOINTER
+
+
 def close_postgres_checkpoint_saver() -> None:
     global _POSTGRES_CHECKPOINTER, _POSTGRES_POOL
 

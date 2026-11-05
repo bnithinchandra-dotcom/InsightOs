@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import logging
 import math
 import re
-from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import replace
 from typing import Any, Callable
 from uuid import uuid4
@@ -39,24 +37,13 @@ from app.agent.orchestrator import (
     build_engine_workflow_trace,
     execute_orchestrated_inspection,
 )
-from app.agent.preparation import (
-    SPECIALIST_PREPARATION,
-    PreparationError,
-    SpecialistPreparationArtifact,
-)
 from app.agent.providers import ModelProvider, create_provider
-from app.agent.specialist_agents import (
-    AnalyticsDecision,
-    DataIntelligenceResult,
-    PresentationResult,
-    SpecialistAgentError,
-    SpecialistHandoff,
-    build_specialist_handoff,
-    run_analytics_decision,
-    run_data_intelligence,
-    run_presentation,
-    verified_schema_summary,
+from app.agent.langgraph_orchestrator import (
+    SpecialistGraphServices,
+    build_specialist_graph,
+    workflow_checkpoint_config,
 )
+from langgraph.types import Command
 from app.agent.arithmetic import execute_deterministic_arithmetic
 from app.agent.tools import TOOL_DEFINITIONS, ToolRegistry
 
@@ -504,6 +491,88 @@ def _specialist_result(
     }
 
 
+def resume_interrupted_specialist_graph(
+    *,
+    workflow_id: str,
+    owner_user_id: int,
+    dataset_id: int,
+    context: dict[str, Any],
+    workflow_scheduler: WorkflowToolScheduler,
+    checkpointer: Any | None,
+    completed_engine_task_references: set[str],
+) -> dict[str, Any] | None:
+    if checkpointer is None:
+        return None
+
+    settings = get_agent_settings()
+    provider = create_provider(settings)
+    router = AgentModelRouter(
+        settings=settings,
+        provider=provider,
+        workflow_budget=WorkflowTokenBudget(
+            settings.workflow_token_budget,
+            settings.workflow_final_reserve_tokens,
+        ),
+        manage_model_lifecycle=True,
+    )
+    registry = ToolRegistry()
+    services = SpecialistGraphServices(
+        router=router,
+        registry=registry,
+        workflow_scheduler=workflow_scheduler,
+        request_context={
+            **context,
+            "workflow_id": workflow_id,
+            "owner_user_id": owner_user_id,
+            "dataset_id": dataset_id,
+        },
+        pause_before_presentation=True,
+    )
+    graph = build_specialist_graph(services=services, checkpointer=checkpointer)
+    config = workflow_checkpoint_config(workflow_id)
+    snapshot = graph.get_state(config)
+    state = snapshot.values
+    if not state:
+        return None
+
+    stored_owner = state.get("owner_id")
+    stored_dataset = state.get("dataset_id")
+    engine_task_reference = state.get("engine_task_reference")
+    engine_result = state.get("engine_result")
+    source_scope = state.get("source_scope")
+    arguments = state.get("arguments")
+    if (
+        state.get("workflow_id") != workflow_id
+        or not isinstance(stored_owner, int)
+        or isinstance(stored_owner, bool)
+        or stored_owner != owner_user_id
+        or not isinstance(stored_dataset, int)
+        or isinstance(stored_dataset, bool)
+        or stored_dataset != dataset_id
+        or not isinstance(source_scope, dict)
+        or source_scope.get("dataset_id") != dataset_id
+        or not isinstance(source_scope.get("file_id"), int)
+        or isinstance(source_scope.get("file_id"), bool)
+        or not isinstance(arguments, dict)
+        or arguments.get("dataset_id", dataset_id) != dataset_id
+        or arguments.get("file_id") != source_scope.get("file_id")
+        or not isinstance(engine_task_reference, str)
+        or engine_task_reference not in completed_engine_task_references
+        or state.get("engine_result_reference") != engine_task_reference
+        or not isinstance(engine_result, dict)
+        or engine_result.get("status") != "succeeded"
+    ):
+        raise ValueError("The checkpoint does not match the owned completed workflow.")
+
+    if (
+        "presentation_specialist" not in snapshot.next
+        or not any(task.interrupts for task in snapshot.tasks)
+    ):
+        return None
+
+    return graph.invoke(Command(resume="continue"), config)
+
+
 def execute_agent_request(
     *,
     user_message: str,
@@ -513,6 +582,7 @@ def execute_agent_request(
     provider: ModelProvider | None = None,
     registry: ToolRegistry | None = None,
     workflow_scheduler: WorkflowToolScheduler | None = None,
+    checkpointer: Any | None = None,
 ) -> AgentOutcome:
     if not user_message.strip() or len(user_message) > MAX_USER_MESSAGE_CHARS:
         return AgentOutcome(
@@ -665,8 +735,7 @@ def execute_agent_request(
     )
     turn_limit_reached = True
     engine_request_scope: dict[str, int | None] | None = None
-    specialist_task_keys: dict[str, str] = {}
-    engine_task_keys: list[str] = []
+    specialist_graph_runs: list[dict[str, Any]] = []
 
     def execute_registered_tool(
         name: str,
@@ -690,150 +759,62 @@ def execute_agent_request(
             max_retries=1 if is_read_only else 0,
             depends_on=depends_on,
         )
-        if selected_registry.is_engine_operation(name) and _task_key is not None:
-            engine_task_keys.append(_task_key)
         return raw_output, result, label
 
-    def run_specialist_stage(
-        *,
-        role: str,
+    def invoke_specialist_graph(
         operation: str,
         arguments: dict[str, Any],
-        source_fingerprint: str,
-        dependency_task_ids: list[str],
-        input_material: dict[str, Any],
-        runner: Callable[[], tuple[Any, str]],
-        parameters: dict[str, Any] | None = None,
-        verified_schema: dict[str, Any] | None = None,
-        actual_operations: list[dict[str, Any]] | None = None,
-        handoff_warnings: list[str] | None = None,
-        artifact_references: list[dict[str, Any]] | None = None,
-        preparation: SpecialistPreparationArtifact | None = None,
-    ) -> tuple[Any, str, str | None]:
-        stage_fingerprint = hashlib.sha256(
-            json.dumps(
-                input_material,
-                ensure_ascii=False,
-                allow_nan=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
-        task_type = f"specialist_{role}"
-        task_arguments = {
-            "dataset_id": arguments.get("dataset_id", request_context.get("dataset_id")),
-            "file_id": arguments.get("file_id"),
-            "requested_operation": operation,
-            "requested_arguments": arguments,
-            "stage_input_fingerprint": stage_fingerprint,
-            "source_fingerprint": source_fingerprint,
-        }
-        if preparation is not None:
-            task_arguments["preparation"] = preparation.model_dump(mode="json")
-
-        def execute_stage() -> tuple[str, ToolResult, str]:
-            nonlocal input_tokens, output_tokens
-            try:
-                output, model_name = runner()
-            except SpecialistAgentError as error:
-                return (
-                    "",
-                    ToolResult(
-                        status="failed",
-                        summary=error.message,
-                        error_code=error.code,
-                    ),
-                    role,
-                )
-            finally:
-                (
-                    input_tokens,
-                    output_tokens,
-                    _total_budget,
-                    _budget_used,
-                ) = workflow_budget.snapshot()
-            _handoff, envelope, reference = build_specialist_handoff(
-                stage=role,
-                operation=operation,
-                source_fingerprint=source_fingerprint,
-                dataset_id=task_arguments["dataset_id"],
-                file_id=task_arguments["file_id"],
-                dependency_task_ids=dependency_task_ids,
-                output=output,
-                model_name=model_name,
-                parameters=parameters or task_arguments["requested_arguments"],
-                verified_schema=verified_schema,
-                actual_operations=actual_operations,
-                warnings=handoff_warnings,
-                artifact_references=artifact_references,
-            )
-            result = ToolResult(
-                status="succeeded",
-                summary=f"{role} completed with a validated handoff.",
-                data=envelope,
-                references=(reference,),
-            )
-            raw = json.dumps(
-                envelope,
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
-            )
-            return raw, result, role
-
+    ) -> dict[str, Any]:
+        owner_id = request_context.get("owner_user_id")
+        dataset_id = arguments.get("dataset_id", request_context.get("dataset_id"))
+        file_id = arguments.get("file_id")
         if workflow_scheduler is None:
-            _raw, result, _label = execute_stage()
-            if result.status != "succeeded" or not isinstance(result.data, dict):
-                raise SpecialistAgentError(
-                    result.error_code or "specialist_task_failed",
-                    result.summary or "The specialist stage did not complete.",
-                )
-            return result.data["handoff"]["output"], result.data["model"], None
-
-        raw, result, _label, task_key = workflow_scheduler(
-            task_type,
-            task_arguments,
-            execute_stage,
-            idempotent=True,
-            max_retries=1,
-            depends_on=dependency_task_ids,
-            agent=role,
+            return {
+                "execution_status": "failed",
+                "error_code": "workflow_scheduler_required",
+                "final_response": {
+                    "message": "Analytics execution requires the durable workflow scheduler."
+                },
+            }
+        services = SpecialistGraphServices(
+            router=model_router,
+            registry=selected_registry,
+            workflow_scheduler=workflow_scheduler,
+            request_context=request_context,
+            pause_before_presentation=checkpointer is not None,
         )
-        if result.status != "succeeded" or not isinstance(result.data, dict):
-            raise SpecialistAgentError(
-                result.error_code or "specialist_task_failed",
-                result.summary or "The specialist stage did not complete.",
+        graph = build_specialist_graph(
+            services=services,
+            checkpointer=checkpointer,
+        )
+        state = graph.invoke(
+            {
+                "workflow_id": workflow_id,
+                "conversation_id": request_context.get("conversation_id"),
+                "owner_id": owner_id,
+                "dataset_id": dataset_id,
+                "user_request": user_message.strip(),
+                "operation_type": operation,
+                "arguments": arguments,
+                "source_scope": {"dataset_id": dataset_id, "file_id": file_id},
+                "prior_analytics_outputs": [
+                    item
+                    for item in structured_results
+                    if isinstance(item, dict)
+                    and item.get("status") == "succeeded"
+                    and item.get("tool")
+                    in {"generate_evidence_report", "generate_eda_evidence_report"}
+                ][:8],
+            },
+            workflow_checkpoint_config(workflow_id),
+        )
+        if state.get("__interrupt__"):
+            state = graph.invoke(
+                Command(resume="continue"),
+                workflow_checkpoint_config(workflow_id),
             )
-        try:
-            handoff = SpecialistHandoff.model_validate(result.data.get("handoff"))
-            if (
-                handoff.stage != role
-                or handoff.requested_operation != operation
-                or handoff.source_fingerprint != source_fingerprint
-                or handoff.dataset_id != task_arguments["dataset_id"]
-                or handoff.file_id != task_arguments["file_id"]
-                or handoff.dependency_task_ids != dependency_task_ids
-                or handoff.parameters != task_arguments["requested_arguments"]
-                or handoff.artifact_references
-                != handoff.output.get("evidence_references")
-                or role == "data_intelligence"
-                and not isinstance(handoff.verified_schema, dict)
-                or role == "insights_visualization"
-                and (
-                    len(handoff.actual_operations) != 1
-                    or handoff.actual_operations[0].get("operation") != operation
-                    or handoff.actual_operations[0].get("status") != "succeeded"
-                )
-                or not handoff.verified
-            ):
-                raise ValueError("Specialist handoff does not match the scheduled task.")
-        except (TypeError, ValueError):
-            raise SpecialistAgentError(
-                "specialist_handoff_invalid",
-                "The persisted specialist handoff failed validation.",
-            ) from None
-        specialist_task_keys[role] = task_key or ""
-        return handoff.output, str(result.data.get("model") or ""), task_key
+        specialist_graph_runs.append(state)
+        return state
 
     max_model_turns = min(
         selected_settings.max_model_turns,
@@ -1055,7 +1036,10 @@ def execute_agent_request(
             ):
                 requested_file_id = call.arguments.get("file_id")
                 engine_request_scope = {
-                    "dataset_id": request_context.get("dataset_id"),
+                    "dataset_id": call.arguments.get(
+                        "dataset_id",
+                        request_context.get("dataset_id"),
+                    ),
                     "conversation_id": request_context.get("conversation_id"),
                     "file_id": (
                         requested_file_id
@@ -1065,11 +1049,6 @@ def execute_agent_request(
                     ),
                 }
             if selected_registry.is_engine_operation(call.name):
-                inspection_result = selected_registry.prepare_engine_inspection(
-                    call.name,
-                    call.arguments,
-                    context=request_context,
-                )
                 label = next(
                     (
                         definition.label
@@ -1078,254 +1057,162 @@ def execute_agent_request(
                     ),
                     "Dataset engine",
                 )
-                agent1_data = (
-                    inspection_result.data
-                    if isinstance(inspection_result.data, dict)
+                graph_state = invoke_specialist_graph(call.name, call.arguments)
+                data_intelligence = graph_state.get("data_intelligence_result")
+                analytics_decision = graph_state.get("analytics_decision")
+                node_metadata = graph_state.get("node_metadata", {})
+                data_stage = (
+                    node_metadata.get("data_intelligence", {})
+                    if isinstance(node_metadata, dict)
                     else {}
                 )
-                agent1_model: str | None = None
-                agent1_output: dict[str, Any] | None = None
-                analytics_output: dict[str, Any] | None = None
-                agent2_model: str | None = None
-                specialist_error: SpecialistAgentError | None = None
-                preparation_future = None
-                if inspection_result.status == "succeeded":
-                    try:
-                        source_fingerprint = agent1_data.get("source_fingerprint")
-                        if not isinstance(source_fingerprint, str) or not source_fingerprint:
-                            raise SpecialistAgentError(
-                                "specialist_source_unavailable",
-                                "The selected-file source version could not be verified.",
-                            )
-                        try:
-                            preparation_future = SPECIALIST_PREPARATION.prepare_async(
-                                registry=selected_registry,
-                                workflow_id=request_context["workflow_id"],
-                                dataset_id=call.arguments["dataset_id"],
-                                file_id=call.arguments["file_id"],
-                                source_fingerprint=source_fingerprint,
-                                operation=call.name,
-                                inspection=agent1_data,
-                                evidence_references=list(inspection_result.references),
-                                context=request_context,
-                                analytics_outputs=[
-                                    item
-                                    for item in structured_results
-                                    if isinstance(item, dict)
-                                    and item.get("status") == "succeeded"
-                                    and item.get("tool")
-                                    in {"generate_evidence_report", "generate_eda_evidence_report"}
-                                ],
-                            )
-                        except PreparationError as error:
-                            raise SpecialistAgentError(
-                                error.code,
-                                error.message,
-                            ) from None
-                        agent1_payload, agent1_model, agent1_task_key = run_specialist_stage(
+                analytics_stage = (
+                    node_metadata.get("analytics_decision", {})
+                    if isinstance(node_metadata, dict)
+                    else {}
+                )
+                if isinstance(data_intelligence, dict):
+                    structured_results.append(
+                        _specialist_result(
+                            tool_name="agent1_data_intelligence",
+                            status="succeeded",
+                            summary=str(data_intelligence.get("summary", "")),
+                            workflow_id=workflow_id,
                             role="data_intelligence",
-                            operation=call.name,
-                            arguments=call.arguments,
-                            source_fingerprint=source_fingerprint,
-                            dependency_task_ids=[],
-                            input_material={
-                                "objective": user_message.strip(),
-                                "operation": call.name,
-                                "arguments": call.arguments,
-                                "inspection": agent1_data,
-                                "evidence_references": list(inspection_result.references),
-                            },
-                            runner=lambda: run_data_intelligence(
-                                model_router,
-                                objective=user_message.strip(),
-                                workflow_id=request_context["workflow_id"],
-                                conversation_id=request_context.get("conversation_id"),
-                                inspection=agent1_data,
-                                operation=call.name,
-                                evidence_references=list(inspection_result.references),
-                            ),
-                            parameters=call.arguments,
-                            verified_schema=verified_schema_summary(agent1_data),
+                            model=graph_state.get("data_intelligence_model"),
+                            data=data_intelligence,
                         )
-                        agent1 = DataIntelligenceResult.model_validate(agent1_payload)
-                        agent1_output = agent1.model_dump(mode="json")
-                        if agent1_task_key is not None:
-                            specialist_task_keys["data_intelligence"] = agent1_task_key
-                        structured_results.append(
-                            _specialist_result(
-                                tool_name="agent1_data_intelligence",
-                                status="succeeded",
-                                summary=agent1.summary,
-                                workflow_id=request_context["workflow_id"],
-                                role="data_intelligence",
-                                model=agent1_model,
-                                data=agent1_output,
-                            )
-                        )
-                    except SpecialistAgentError as error:
-                        if preparation_future is not None:
-                            preparation_future.cancel()
-                        specialist_error = error
-                        structured_results.append(
-                            _specialist_result(
-                                tool_name="agent1_data_intelligence",
-                                status="failed",
-                                summary=error.message,
-                                workflow_id=request_context["workflow_id"],
-                                role="data_intelligence",
-                                model=None,
-                                error_code=error.code,
-                            )
-                        )
-
-                if inspection_result.status != "succeeded":
-                    result = inspection_result
-                elif specialist_error is not None or agent1_output is None:
-                    result = ToolResult(
-                        status="failed",
-                        summary="Data Intelligence could not validate the selected-file evidence.",
-                        data={
-                            "dataset_id": request_context.get("dataset_id"),
-                            "file_id": call.arguments.get("file_id"),
-                            "agent1_inspection": agent1_data,
-                        },
-                        references=inspection_result.references,
-                        error_code=(
-                            specialist_error.code
-                            if specialist_error is not None
-                            else "agent1_result_invalid"
-                        ),
                     )
-                else:
-                    try:
-                        if preparation_future is None:
-                            raise SpecialistAgentError(
-                                "agent_preparation_unavailable",
-                                "Deterministic specialist preparation did not start.",
-                            )
-                        try:
-                            analytics_preparation = preparation_future.result(
-                                timeout=30
-                            )
-                        except FutureTimeoutError:
-                            raise SpecialistAgentError(
-                                "agent_preparation_timeout",
-                                "Deterministic specialist preparation did not finish in time.",
-                            ) from None
-                        except PreparationError as error:
-                            raise SpecialistAgentError(
-                                error.code,
-                                error.message,
-                            ) from None
-                        analytics_preparation = analytics_preparation.model_copy(
-                            update={
-                                "handoff_context": analytics_preparation.handoff_context.model_copy(
-                                    update={"previous_stage": agent1_output}
-                                )
-                            }
+                elif data_stage.get("status") in {"failed", "blocked"}:
+                    structured_results.append(
+                        _specialist_result(
+                            tool_name="agent1_data_intelligence",
+                            status="failed",
+                            summary=str(
+                                graph_state.get("error_message")
+                                or "Data Intelligence could not verify the selected source."
+                            ),
+                            workflow_id=workflow_id,
+                            role="data_intelligence",
+                            model=None,
+                            error_code=data_stage.get("error_category")
+                            or graph_state.get("error_code"),
                         )
-                        analytics_dependencies = (
-                            [specialist_task_keys["data_intelligence"]]
-                            if specialist_task_keys.get("data_intelligence")
-                            else []
-                        )
-                        analytics_payload, agent2_model, agent2_task_key = run_specialist_stage(
+                    )
+                if isinstance(analytics_decision, dict):
+                    structured_results.append(
+                        _specialist_result(
+                            tool_name="agent2_analytics_decision",
+                            status="succeeded",
+                            summary=str(analytics_decision.get("summary", "")),
+                            workflow_id=workflow_id,
                             role="analytics_modelling",
-                            operation=call.name,
-                            arguments=call.arguments,
-                            source_fingerprint=source_fingerprint,
-                            dependency_task_ids=analytics_dependencies,
-                            input_material={
-                                "objective": user_message.strip(),
-                                "operation": call.name,
-                                "arguments": call.arguments,
-                                "inspection": agent1_data,
-                                "data_intelligence": agent1_output,
-                                "preparation": analytics_preparation.model_dump(
-                                    mode="json"
+                            model=graph_state.get("analytics_model"),
+                            data=analytics_decision,
+                        )
+                    )
+                elif analytics_stage.get("status") in {"failed", "blocked"}:
+                    structured_results.append(
+                        _specialist_result(
+                            tool_name="agent2_analytics_decision",
+                            status="failed",
+                            summary=str(
+                                graph_state.get("error_message")
+                                or "Analytics could not approve the requested operation."
+                            ),
+                            workflow_id=workflow_id,
+                            role="analytics_modelling",
+                            model=None,
+                            error_code=analytics_stage.get("error_category")
+                            or graph_state.get("error_code"),
+                        )
+                    )
+                engine_payload = graph_state.get("engine_result")
+                if isinstance(engine_payload, dict):
+                    engine_data = engine_payload.get("data")
+                    engine_data = engine_data if isinstance(engine_data, dict) else None
+                    if engine_data is not None:
+                        engine_data = {
+                            **engine_data,
+                            "agent1_inspection": {
+                                "status": "completed",
+                                **graph_state.get("source_inspection", {}),
+                            },
+                            "agent1_model_result": data_intelligence,
+                            "agent2_model_result": analytics_decision,
+                            "agent_execution_models": {
+                                "data_intelligence": graph_state.get(
+                                    "data_intelligence_model"
+                                ),
+                                "analytics_modelling": graph_state.get(
+                                    "analytics_model"
                                 ),
                             },
-                            runner=lambda: run_analytics_decision(
-                                model_router,
-                                objective=user_message.strip(),
-                                workflow_id=request_context["workflow_id"],
-                                conversation_id=request_context.get("conversation_id"),
-                                inspection=agent1_data,
-                                data_intelligence=agent1_output,
-                                tool_name=call.name,
-                                arguments=call.arguments,
-                                preparation=analytics_preparation,
-                            ),
-                            parameters=call.arguments,
-                            preparation=analytics_preparation,
-                        )
-                        analytics_decision = AnalyticsDecision.model_validate(
-                            analytics_payload
-                        )
-                        analytics_output = analytics_decision.model_dump(mode="json")
-                        if agent2_task_key is not None:
-                            specialist_task_keys["analytics_modelling"] = agent2_task_key
-                        structured_results.append(
-                            _specialist_result(
-                                tool_name="agent2_analytics_decision",
-                                status="succeeded",
-                                summary=analytics_decision.summary,
-                                workflow_id=request_context["workflow_id"],
-                                role="analytics_modelling",
-                                model=agent2_model,
-                                data=analytics_output,
+                        }
+                    task_key = graph_state.get("engine_task_reference")
+                    result = ToolResult(
+                        status=(
+                            "succeeded"
+                            if engine_payload.get("status") == "succeeded"
+                            else "failed"
+                        ),
+                        summary=str(
+                            engine_payload.get(
+                                "summary",
+                                graph_state.get("error_message")
+                                or "The engine returned no summary.",
                             )
-                        )
-                    except SpecialistAgentError as error:
-                        if preparation_future is not None:
-                            preparation_future.cancel()
-                        specialist_error = error
-                        structured_results.append(
-                            _specialist_result(
-                                tool_name="agent2_analytics_decision",
-                                status="failed",
-                                summary=error.message,
-                                workflow_id=request_context["workflow_id"],
-                                role="analytics_modelling",
-                                model=None,
-                                error_code=error.code,
-                            )
-                        )
-                    if specialist_error is not None:
-                        result = ToolResult(
-                            status="failed",
-                            summary="Analytics could not approve the exact requested operation and evidence.",
-                            data={
-                                "dataset_id": request_context.get("dataset_id"),
-                                "file_id": call.arguments.get("file_id"),
-                                "agent1_inspection": agent1_data,
-                            },
-                            references=inspection_result.references,
-                            error_code=specialist_error.code,
-                        )
-                    else:
-                        _tool_output, result, label = execute_registered_tool(
-                            call.name,
-                            call.arguments,
-                            depends_on=(
-                                [specialist_task_keys["analytics_modelling"]]
-                                if specialist_task_keys.get("analytics_modelling")
+                        )[:1_000],
+                        data=engine_data,
+                        warnings=tuple(
+                            item
+                            for item in engine_payload.get("warnings", [])
+                            if isinstance(item, str)
+                        ),
+                        references=tuple(
+                            item
+                            for item in engine_payload.get("references", [])
+                            if isinstance(item, dict)
+                        ),
+                        limitations=tuple(
+                            item
+                            for item in engine_payload.get("limitations", [])
+                            if isinstance(item, str)
+                        ),
+                        error_code=engine_payload.get("error_code"),
+                    )
+                else:
+                    final_response = graph_state.get("final_response", {})
+                    source_inspection = graph_state.get("source_inspection")
+                    failure_data = None
+                    if isinstance(source_inspection, dict):
+                        source_scope = graph_state.get("source_scope", {})
+                        failure_data = {
+                            "dataset_id": graph_state.get("dataset_id"),
+                            "file_id": (
+                                source_scope.get("file_id")
+                                if isinstance(source_scope, dict)
                                 else None
                             ),
-                        )
-                if isinstance(result.data, dict) and inspection_result.status == "succeeded":
-                    result = replace(
-                        result,
-                        data={
-                            **result.data,
-                            "agent1_model_result": agent1_output,
-                            "agent2_model_result": analytics_output,
-                            "agent_execution_models": {
-                                "data_intelligence": agent1_model,
-                                "analytics_modelling": agent2_model,
+                            "agent1_inspection": {
+                                "status": "completed",
+                                **source_inspection,
                             },
-                        },
+                            "agent1_model_result": data_intelligence,
+                            "agent2_model_result": analytics_decision,
+                        }
+                    result = ToolResult(
+                        status="failed",
+                        summary=str(
+                            final_response.get("message")
+                            or "The specialist analytics workflow did not complete."
+                        )[:1_000],
+                        data=failure_data,
+                        error_code=graph_state.get("error_code")
+                        or "specialist_graph_failed",
                     )
+                presentation = graph_state.get("presentation_result")
+                _tool_output = ""
             else:
                 result_text, result, label = execute_registered_tool(
                     call.name,
@@ -1417,10 +1304,15 @@ def execute_agent_request(
                 ),
             }
             engine_results[0]["workflow_id"] = request_context["workflow_id"]
-            structured_results.append(workflow_trace)
             identity_mismatch = (
-                engine_results[0].get("status") == "succeeded" and not verified
+                (
+                    engine_results[0].get("status") == "succeeded"
+                    and not verified
+                )
+                or engine_results[0].get("error_code")
+                == "engine_result_scope_mismatch"
             )
+            structured_results.append(workflow_trace)
             if identity_mismatch:
                 rejected_summary = (
                     "The engine result was rejected because its dataset/file identity "
@@ -1447,162 +1339,81 @@ def execute_agent_request(
                             warnings=activity.warnings,
                         )
                         break
-            else:
-                data_intelligence_result = next(
-                    (
-                        item.get("data")
-                        for item in reversed(structured_results)
-                        if item.get("tool") == "agent1_data_intelligence"
-                        and item.get("status") == "succeeded"
-                        and isinstance(item.get("data"), dict)
-                    ),
-                    None,
-                )
-                if engine_results[0].get("status") == "succeeded" and isinstance(
-                    data_intelligence_result,
-                    dict,
-                ):
-                    try:
-                        presentation_source = workflow_trace["data"].get(
-                            "source_identity"
-                        )
-                        presentation_source_fingerprint = (
-                            presentation_source.get("source_fingerprint")
-                            if isinstance(presentation_source, dict)
-                            else None
-                        )
-                        if not isinstance(presentation_source_fingerprint, str):
-                            raise SpecialistAgentError(
-                                "specialist_source_unavailable",
-                                "The engine result source version could not be verified.",
-                            )
-                        presentation_dependencies = [
-                            task_key
-                            for task_key in (
-                                specialist_task_keys.get("data_intelligence"),
-                                specialist_task_keys.get("analytics_modelling"),
-                                engine_task_keys[-1] if engine_task_keys else None,
-                            )
-                            if task_key
-                        ]
-                        presentation_payload, presentation_model, _ = run_specialist_stage(
+            graph_state = specialist_graph_runs[-1] if specialist_graph_runs else {}
+            presentation = graph_state.get("presentation_result")
+            if not identity_mismatch and engine_results[0].get("status") == "succeeded":
+                if isinstance(presentation, dict):
+                    graph_presentation_status = presentation.get("status")
+                    presentation_status = (
+                        "succeeded"
+                        if graph_presentation_status == "completed"
+                        else "partial"
+                        if graph_presentation_status == "partial"
+                        else "failed"
+                    )
+                    presentation_summary = str(presentation.get("summary", ""))
+                    presentation_model = graph_state.get("presentation_model")
+                    structured_results.append(
+                        _specialist_result(
+                            tool_name="agent3_insights_visualization",
+                            status=presentation_status,
+                            summary=presentation_summary,
+                            workflow_id=request_context["workflow_id"],
                             role="insights_visualization",
-                            operation=str(engine_results[0].get("tool", "")),
-                            arguments={
-                                "dataset_id": engine_request_scope.get("dataset_id"),
-                                "file_id": engine_request_scope.get("file_id"),
-                            },
-                            source_fingerprint=presentation_source_fingerprint,
-                            dependency_task_ids=presentation_dependencies,
-                            input_material={
-                                "objective": user_message.strip(),
-                                "data_intelligence": data_intelligence_result,
-                                "engine_result": engine_results[0],
-                            },
-                            runner=lambda: run_presentation(
-                                model_router,
-                                objective=user_message.strip(),
-                                workflow_id=request_context["workflow_id"],
-                                conversation_id=request_context.get("conversation_id"),
-                                data_intelligence=data_intelligence_result,
-                                engine_result=engine_results[0],
-                                allowed_references=[
-                                    item
-                                    for item in engine_results[0].get("references", [])
-                                    if isinstance(item, dict)
-                                ],
+                            model=presentation_model,
+                            data=presentation,
+                            error_code=(
+                                None
+                                if presentation_status == "succeeded"
+                                else graph_state.get("error_code")
                             ),
-                            parameters={
-                                "dataset_id": engine_request_scope.get("dataset_id"),
-                                "file_id": engine_request_scope.get("file_id"),
-                            },
-                            actual_operations=[
-                                {
-                                    "operation": str(engine_results[0].get("tool", "")),
-                                    "status": engine_results[0].get("status"),
-                                    "execution_fingerprint": hashlib.sha256(
-                                        json.dumps(
-                                            engine_results[0],
-                                            ensure_ascii=False,
-                                            allow_nan=False,
-                                            sort_keys=True,
-                                            separators=(",", ":"),
-                                        ).encode("utf-8")
-                                    ).hexdigest(),
-                                }
-                            ],
-                            handoff_warnings=[
-                                warning
-                                for warning in engine_results[0].get("warnings", [])
-                                if isinstance(warning, str)
-                            ],
-                            artifact_references=[
-                                item
-                                for item in engine_results[0].get("references", [])
-                                if isinstance(item, dict)
-                            ],
                         )
-                        presentation = PresentationResult.model_validate(
-                            presentation_payload
-                        )
-                        presentation_data = presentation.model_dump(mode="json")
-                        structured_results.append(
-                            _specialist_result(
-                                tool_name="agent3_insights_visualization",
-                                status="succeeded",
-                                summary=presentation.summary,
-                                workflow_id=request_context["workflow_id"],
-                                role="insights_visualization",
-                                model=presentation_model,
-                                data=presentation_data,
-                            )
-                        )
-                        workflow_trace["data"]["models"][
-                            "insights_visualization"
-                        ] = presentation_model
-                        presentation_stage = workflow_trace["data"]["stages"][-1]
-                        presentation_stage["status"] = presentation.status
-                        presentation_stage["summary"] = presentation.summary
-                        workflow_trace["data"]["execution_plan"][-1][
-                            "status"
-                        ] = presentation.status
-                        response_text = (
-                            response_text + "\n\n" + presentation.summary
-                        )
-                        if presentation.status == "partial":
-                            engine_status = "partial"
-                        elif presentation.status in {"blocked", "unsupported"}:
-                            engine_status = "partial"
-                    except SpecialistAgentError as error:
-                        warnings.append(
-                            "Insights and Visualization could not complete: "
-                            + error.message
-                        )
-                        structured_results.append(
-                            _specialist_result(
-                                tool_name="agent3_insights_visualization",
-                                status="failed",
-                                summary=error.message,
-                                workflow_id=request_context["workflow_id"],
-                                role="insights_visualization",
-                                model=None,
-                                error_code=error.code,
-                            )
-                        )
+                    )
+                    workflow_trace["data"]["models"][
+                        "insights_visualization"
+                    ] = presentation_model
+                    stages = workflow_trace["data"].get("stages")
+                    if stages and isinstance(stages[-1], dict):
+                        stages[-1]["status"] = graph_presentation_status
+                        stages[-1]["summary"] = presentation_summary
+                    execution_plan = workflow_trace["data"].get("execution_plan")
+                    if execution_plan and isinstance(execution_plan[-1], dict):
+                        execution_plan[-1]["status"] = graph_presentation_status
+                    response_text = response_text + "\n\n" + presentation_summary
+                    if presentation_status != "succeeded":
                         engine_status = "partial"
-                        workflow_trace["data"]["stages"][-1]["status"] = "failed"
-                        workflow_trace["data"]["stages"][-1]["summary"] = (
-                            "Presentation failed; verified engine results were retained."
+                elif graph_state.get("execution_status") != "completed":
+                    summary = str(
+                        graph_state.get("error_message")
+                        or "The presentation stage did not complete."
+                    )
+                    structured_results.append(
+                        _specialist_result(
+                            tool_name="agent3_insights_visualization",
+                            status="failed",
+                            summary=summary,
+                            workflow_id=request_context["workflow_id"],
+                            role="insights_visualization",
+                            model=None,
+                            error_code=graph_state.get("error_code"),
                         )
-                        workflow_trace["data"]["execution_plan"][-1][
-                            "status"
-                        ] = "failed"
-                    if engine_status != "completed":
-                        workflow_trace["data"]["outcome"] = engine_status
-                        workflow_trace["status"] = engine_status
-                        workflow_trace["summary"] = (
-                            "The engine completed, but a later workflow stage was partial."
+                    )
+                    stages = workflow_trace["data"].get("stages")
+                    if stages and isinstance(stages[-1], dict):
+                        stages[-1]["status"] = "failed"
+                        stages[-1]["summary"] = (
+                            "Presentation did not complete; verified engine results were retained."
                         )
+                    execution_plan = workflow_trace["data"].get("execution_plan")
+                    if execution_plan and isinstance(execution_plan[-1], dict):
+                        execution_plan[-1]["status"] = "failed"
+                    engine_status = "partial"
+                if engine_status != "completed":
+                    workflow_trace["data"]["outcome"] = engine_status
+                    workflow_trace["status"] = engine_status
+                    workflow_trace["summary"] = (
+                        "The engine completed, but a later workflow stage was partial."
+                    )
             return AgentOutcome(
                 status=engine_status,
                 assistant_text=response_text,
@@ -1613,6 +1424,8 @@ def execute_agent_request(
                 error_code=(
                     "engine_result_scope_mismatch"
                     if identity_mismatch
+                    or engine_results[0].get("error_code")
+                    == "engine_result_scope_mismatch"
                     else "engine_execution_incomplete"
                     if engine_status != "completed"
                     else None

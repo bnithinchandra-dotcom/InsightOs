@@ -255,6 +255,24 @@ class DatasetEngineToolTests(unittest.TestCase):
         self.main_patch.start()
         self.addCleanup(self.main_patch.stop)
 
+    def _workflow_scheduler(self):
+        task_number = 0
+
+        def schedule(
+            _name,
+            _arguments,
+            execute,
+            *,
+            task_key=None,
+            **_kwargs,
+        ):
+            nonlocal task_number
+            task_number += 1
+            raw, result, label = execute()
+            return raw, result, label, task_key or f"test-task-{task_number}"
+
+        return schedule
+
     def test_end_to_end_lifecycle_preparation_and_persisted_handoffs(self):
         self.main.list_dataset_files = Mock(
             return_value=[self.main.get_dataset_file.return_value]
@@ -321,7 +339,11 @@ class DatasetEngineToolTests(unittest.TestCase):
             outcome = execute_agent_request(
                 user_message="Run EDA on the sales column.",
                 history=[],
-                context={"dataset_id": 42, "conversation_id": 301},
+                context={
+                    "dataset_id": 42,
+                    "conversation_id": 301,
+                    "owner_user_id": 1,
+                },
                 settings=_settings(),
                 provider=provider,
                 registry=registry,
@@ -551,10 +573,15 @@ class DatasetEngineToolTests(unittest.TestCase):
         outcome = execute_agent_request(
             user_message="Generate a monthly forecast of net_sales.",
             history=[],
-            context={"dataset_id": 42, "conversation_id": 301},
+            context={
+                "dataset_id": 42,
+                "conversation_id": 301,
+                "owner_user_id": 1,
+            },
             settings=_settings(),
             provider=provider,
             registry=ToolRegistry(),
+            workflow_scheduler=self._workflow_scheduler(),
         )
 
         self.assertEqual(outcome.status, "completed")
@@ -585,10 +612,15 @@ class DatasetEngineToolTests(unittest.TestCase):
         outcome = execute_agent_request(
             user_message="Run EDA on the sales column.",
             history=[],
-            context={"dataset_id": 42, "conversation_id": 301},
+            context={
+                "dataset_id": 42,
+                "conversation_id": 301,
+                "owner_user_id": 1,
+            },
             settings=_settings(),
             provider=provider,
             registry=ToolRegistry(),
+            workflow_scheduler=self._workflow_scheduler(),
         )
 
         self.assertEqual(outcome.status, "completed")
@@ -628,7 +660,7 @@ class DatasetEngineToolTests(unittest.TestCase):
             result["data"]["provenance"]["source_sha256"],
             "abc",
         )
-        self.assertEqual(self.main.get_dataset_file.call_count, 3)
+        self.assertEqual(self.main.get_dataset_file.call_count, 6)
         trace = next(
             item
             for item in outcome.structured_results
@@ -735,7 +767,7 @@ class DatasetEngineToolTests(unittest.TestCase):
         mismatched_file = execute_agent_request(
             user_message="Run EDA on the sales column.",
             history=[],
-            context={"dataset_id": 42},
+            context={"dataset_id": 42, "owner_user_id": 1},
             settings=_settings(),
             provider=EngineRequestProvider(
                 "run_eda_analysis",
@@ -748,6 +780,7 @@ class DatasetEngineToolTests(unittest.TestCase):
                 },
             ),
             registry=ToolRegistry(),
+            workflow_scheduler=self._workflow_scheduler(),
         )
         self.assertEqual(mismatched_file.error_code, "engine_result_scope_mismatch")
 
@@ -812,7 +845,11 @@ class DatasetEngineToolTests(unittest.TestCase):
         outcome = execute_agent_request(
             user_message="Run EDA on the sales column.",
             history=[],
-            context={"dataset_id": 42, "conversation_id": 301},
+            context={
+                "dataset_id": 42,
+                "conversation_id": 301,
+                "owner_user_id": 1,
+            },
             settings=_settings(),
             provider=provider,
             registry=ToolRegistry(),
@@ -869,7 +906,11 @@ class DatasetEngineToolTests(unittest.TestCase):
         outcome = execute_agent_request(
             user_message="Run EDA on the sales column.",
             history=[],
-            context={"dataset_id": 42, "conversation_id": 301},
+            context={
+                "dataset_id": 42,
+                "conversation_id": 301,
+                "owner_user_id": 1,
+            },
             settings=_settings(),
             provider=provider,
             registry=ToolRegistry(),
@@ -894,7 +935,7 @@ class DatasetEngineToolTests(unittest.TestCase):
         outcome = execute_agent_request(
             user_message="Run EDA on the sales column.",
             history=[],
-            context={"dataset_id": 42},
+            context={"dataset_id": 42, "owner_user_id": 1},
             settings=_settings(),
             provider=EngineRequestProvider(
                 "run_eda_analysis",
@@ -907,6 +948,7 @@ class DatasetEngineToolTests(unittest.TestCase):
                 },
             ),
             registry=ToolRegistry(),
+            workflow_scheduler=self._workflow_scheduler(),
         )
 
         self.assertEqual(outcome.status, "failed")
@@ -944,7 +986,7 @@ class DatasetEngineToolTests(unittest.TestCase):
                 outcome = execute_agent_request(
                     user_message="Run EDA on the sales column.",
                     history=[],
-                    context={"dataset_id": 42},
+                    context={"dataset_id": 42, "owner_user_id": 1},
                     settings=_settings(),
                     provider=EngineRequestProvider(
                         "run_eda_analysis",
@@ -958,6 +1000,7 @@ class DatasetEngineToolTests(unittest.TestCase):
                         fail_role=failed_role,
                     ),
                     registry=ToolRegistry(),
+                    workflow_scheduler=self._workflow_scheduler(),
                 )
 
                 if failed_role == "Agent 1, Data Intelligence":
@@ -1002,10 +1045,11 @@ class DatasetEngineToolTests(unittest.TestCase):
         outcome = execute_agent_request(
             user_message="Normalize the selected file.",
             history=[],
-            context={"dataset_id": 42},
+            context={"dataset_id": 42, "owner_user_id": 1},
             settings=_settings(),
             provider=provider,
             registry=ToolRegistry(),
+            workflow_scheduler=self._workflow_scheduler(),
         )
 
         self.assertEqual(outcome.status, "completed")
@@ -1020,10 +1064,11 @@ class DatasetEngineToolTests(unittest.TestCase):
         outcome = execute_agent_request(
             user_message="Run quality analysis on the selected file.",
             history=[],
-            context={"dataset_id": 42},
+            context={"dataset_id": 42, "owner_user_id": 1},
             settings=_settings(),
             provider=provider,
             registry=ToolRegistry(),
+            workflow_scheduler=self._workflow_scheduler(),
         )
 
         self.assertEqual(outcome.status, "completed")
@@ -1036,13 +1081,14 @@ class DatasetEngineToolTests(unittest.TestCase):
         partial_outcome = execute_agent_request(
             user_message="Run quality analysis on the selected file.",
             history=[],
-            context={"dataset_id": 42},
+            context={"dataset_id": 42, "owner_user_id": 1},
             settings=_settings(),
             provider=EngineRequestProvider(
                 "run_quality_analysis",
                 {"dataset_id": 42, "file_id": 7},
             ),
             registry=ToolRegistry(),
+            workflow_scheduler=self._workflow_scheduler(),
         )
         self.assertEqual(partial_outcome.status, "partial")
         partial_trace = next(
@@ -1062,13 +1108,14 @@ class DatasetEngineToolTests(unittest.TestCase):
         failed_outcome = execute_agent_request(
             user_message="Run quality analysis on the selected file.",
             history=[],
-            context={"dataset_id": 42},
+            context={"dataset_id": 42, "owner_user_id": 1},
             settings=_settings(),
             provider=EngineRequestProvider(
                 "run_quality_analysis",
                 {"dataset_id": 42, "file_id": 7},
             ),
             registry=ToolRegistry(),
+            workflow_scheduler=self._workflow_scheduler(),
         )
         self.assertEqual(failed_outcome.status, "failed")
         engine_failure = next(

@@ -21,6 +21,7 @@ from app.agent.config import (
     MAX_USER_MESSAGE_CHARS,
     get_agent_settings,
 )
+from app.agent.checkpointer import get_initialized_postgres_checkpoint_saver
 from app.agent.contracts import (
     AgentOutcome,
     CapabilityStatus,
@@ -40,7 +41,11 @@ from app.agent.specialist_agents import (
     run_presentation,
     verified_schema_summary,
 )
-from app.agent.runtime import execute_agent_request, public_outcome_metadata
+from app.agent.runtime import (
+    execute_agent_request,
+    public_outcome_metadata,
+    resume_interrupted_specialist_graph,
+)
 from app.agent.tools import ToolRegistry
 from app.database import SessionLocal
 from app.provenance import canonical_sha256, validate_provenance
@@ -2157,6 +2162,7 @@ def send_conversation_message(
                 context["owner_user_id"],
                 context,
             ),
+            checkpointer=get_initialized_postgres_checkpoint_saver(),
         )
         metadata = public_outcome_metadata(outcome)
     except Exception as error:
@@ -3725,20 +3731,58 @@ def recover_chat_workflow(workflow_id: str):
                 stale_before=stale_before,
                 max_steps=MAX_WORKFLOW_TASKS,
             )
-            if (
-                workflow.status == "completed"
-                and (
-                    requires_conversation_continuation
-                    or any(
-                        task.task_key in recovery["recovered"]
-                        and task.agent
-                        in {
-                            "data_intelligence",
-                            "analytics_modelling",
-                            "insights_visualization",
-                        }
-                        for task in workflow.tasks
-                    )
+            completed_engine_task_references = {
+                task.task_key
+                for task in workflow.tasks
+                if task.agent == "deterministic_bi_engine"
+                and task.status == "completed"
+            }
+            session.commit()
+            resumed_graph_state = (
+                resume_interrupted_specialist_graph(
+                    workflow_id=workflow.id,
+                    owner_user_id=owner.id,
+                    dataset_id=workflow.dataset_id,
+                    context=recovery_context,
+                    workflow_scheduler=_workflow_tool_scheduler(
+                        workflow.id,
+                        owner.id,
+                        recovery_context,
+                    ),
+                    checkpointer=get_initialized_postgres_checkpoint_saver(),
+                    completed_engine_task_references=completed_engine_task_references,
+                )
+                if workflow.dataset_id is not None
+                else None
+            )
+            specialist_graph_recovery = (
+                {
+                    "resumed": True,
+                    "execution_status": resumed_graph_state.get(
+                        "execution_status"
+                    ),
+                    "error_code": resumed_graph_state.get("error_code"),
+                }
+                if resumed_graph_state is not None
+                else None
+            )
+            session.refresh(workflow)
+            if specialist_graph_recovery is not None:
+                workflow.status = "partial"
+                workflow.error_code = "specialist_recovery_requires_continuation"
+                workflow.completed_at = _utcnow()
+                session.commit()
+            elif workflow.status == "completed" and (
+                requires_conversation_continuation
+                or any(
+                    task.task_key in recovery["recovered"]
+                    and task.agent
+                    in {
+                        "data_intelligence",
+                        "analytics_modelling",
+                        "insights_visualization",
+                    }
+                    for task in workflow.tasks
                 )
             ):
                 workflow.status = "partial"
@@ -3746,15 +3790,29 @@ def recover_chat_workflow(workflow_id: str):
                 workflow.completed_at = _utcnow()
                 session.commit()
             session.refresh(workflow)
-            return {
+            response = {
                 "workflow_id": workflow.id,
                 "status": workflow.status,
                 "error_code": workflow.error_code,
                 "recovery": recovery,
             }
+            if specialist_graph_recovery is not None:
+                response["specialist_graph"] = specialist_graph_recovery
+            return response
         except HTTPException:
             raise
-        except (SQLAlchemyError, WorkflowPlanError, LookupError) as error:
+        except ProviderError as error:
+            session.rollback()
+            logger.error(
+                "Workflow graph recovery provider failed for %s (%s)",
+                workflow_id,
+                error.code,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="The interrupted specialist workflow could not be resumed.",
+            ) from None
+        except (SQLAlchemyError, WorkflowPlanError, LookupError, ValueError) as error:
             session.rollback()
             logger.error(
                 "Workflow recovery failed for %s (%s)",

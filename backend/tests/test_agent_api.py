@@ -198,12 +198,22 @@ class ConversationApiTests(unittest.TestCase):
             warnings=(),
             usage=UsageMetadata(input_tokens=12, output_tokens=8),
         )
-        with patch.object(chat_api, "execute_agent_request", return_value=outcome):
+        checkpointer = object()
+        with patch.object(
+            chat_api,
+            "get_initialized_postgres_checkpoint_saver",
+            return_value=checkpointer,
+        ), patch.object(
+            chat_api,
+            "execute_agent_request",
+            return_value=outcome,
+        ) as execute:
             response = self.client.post(
                 f"/api/v1/chat/conversations/{conversation['id']}/messages",
                 json={"content": "Summarize my profile"},
             )
 
+        self.assertIs(execute.call_args.kwargs["checkpointer"], checkpointer)
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["execution_status"], "completed")
         detail = self.client.get(f"/api/v1/chat/conversations/{conversation['id']}")
@@ -1208,11 +1218,15 @@ class ConversationApiTests(unittest.TestCase):
             chat_api,
             "_require_workspace_owner",
             return_value=other_owner,
-        ):
+        ), patch.object(
+            chat_api,
+            "get_initialized_postgres_checkpoint_saver",
+        ) as checkpoint_getter:
             unauthorized_recovery = self.client.post(
                 f"/api/v1/chat/workflows/{response.json()['workflow_id']}/recover"
             )
         self.assertEqual(unauthorized_recovery.status_code, 404)
+        checkpoint_getter.assert_not_called()
 
     def test_unexpected_agent_failure_is_saved_as_failed_not_success(self):
         conversation = self._create_conversation()
