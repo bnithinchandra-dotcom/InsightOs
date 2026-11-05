@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Literal
 import unicodedata
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from email.message import Message
 from os import getenv
@@ -42,6 +42,10 @@ from urllib3.exceptions import HTTPError
 
 from app.database import SessionLocal
 from app.agent.api import router as chat_router
+from app.agent.checkpointer import (
+    close_postgres_checkpoint_saver,
+    initialize_postgres_checkpoint_saver,
+)
 from app.execution import ExecutionBudget
 from app.jev import (
     VerificationAssessment,
@@ -184,9 +188,20 @@ MAX_MULTI_DATASET_RESULT_BYTES = 1024 * 1024
 _UPLOAD_CONNECTION_QUARANTINE: list[object] = []
 _UPLOAD_CONNECTION_QUARANTINE_LOCK = Lock()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.langgraph_checkpointer = initialize_postgres_checkpoint_saver()
+    try:
+        yield
+    finally:
+        close_postgres_checkpoint_saver()
+
+
 app = FastAPI(
     title="InsightOS API",
     version="0.1.0",
+    lifespan=lifespan,
 )
 app.include_router(chat_router)
 

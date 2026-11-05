@@ -3,7 +3,7 @@ httpx2>=2.0.0
 python-multipart
 uvicorn[standard]
 sqlalchemy
-psycopg[binary]
+psycopg[binary,pool]
 alembic
 redis
 minio
@@ -13,3 +13,5 @@ pyarrow>=18,<24
 pysbd>=0.3.4,<0.4
 numpy>=1.26,<3
 scikit-learn>=1.5,<2
+langgraph==1.2.20
+langgraph-checkpoint-postgres==3.2.0
