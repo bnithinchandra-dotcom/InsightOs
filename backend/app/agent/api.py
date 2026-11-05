@@ -750,7 +750,23 @@ def _workflow_tool_scheduler(
         max_retries: int = 0,
         depends_on: list[str] | None = None,
         agent: str = "registered_tool",
+        task_key: str | None = None,
     ) -> tuple[str, ToolResult, str, str | None]:
+        if task_key is not None and (
+            not isinstance(task_key, str)
+            or not task_key
+            or len(task_key) > 80
+        ):
+            return (
+                "",
+                ToolResult(
+                    status="failed",
+                    summary="The scheduled task identifier is invalid.",
+                    error_code="workflow_task_key_invalid",
+                ),
+                tool_name,
+                None,
+            )
         try:
             arguments_identity = json.dumps(
                 arguments,
@@ -841,9 +857,12 @@ def _workflow_tool_scheduler(
                     else None
                 )
                 task_key = (
-                    f"tool:{tool_name}:{input_digest[:24]}"
-                    if idempotent
-                    else f"tool:{tool_name}:{uuid4().hex[:24]}"
+                    task_key
+                    or (
+                        f"tool:{tool_name}:{input_digest[:24]}"
+                        if idempotent
+                        else f"tool:{tool_name}:{uuid4().hex[:24]}"
+                    )
                 )
                 dependencies = depends_on or []
                 plan_item = {

@@ -1015,6 +1015,71 @@ class ConversationApiTests(unittest.TestCase):
             self.assertFalse(task.idempotent)
             self.assertEqual(task.result_summary["data"]["rows"], 3)
 
+    def test_scheduler_reuses_stable_non_idempotent_engine_task_key(self):
+        workflow_id = "6" * 32
+        with self.session_factory() as session:
+            session.add(
+                WorkflowExecution(
+                    id=workflow_id,
+                    owner_user_id=self.user_id,
+                    dataset_id=self.dataset_id,
+                    idempotency_key="7" * 32,
+                    objective="Run deterministic analysis",
+                    status="running",
+                    current_step=0,
+                    source_scope={
+                        "project_id": self.project_id,
+                        "dataset_id": self.dataset_id,
+                    },
+                )
+            )
+            session.commit()
+
+        schedule = chat_api._workflow_tool_scheduler(
+            workflow_id,
+            self.user_id,
+            {"project_id": self.project_id, "dataset_id": self.dataset_id},
+        )
+        executions = []
+
+        def execute():
+            executions.append("engine")
+            return "{}", ToolResult(
+                status="succeeded",
+                summary="Deterministic result was persisted.",
+                data={"dataset_id": self.dataset_id, "file_id": 1, "rows": 3},
+            ), "Run analysis"
+
+        task_key = "engine:" + "a" * 48
+        scheduled = schedule(
+            "run_eda_analysis",
+            {"dataset_id": self.dataset_id, "file_id": 1},
+            execute,
+            idempotent=False,
+            max_retries=0,
+            task_key=task_key,
+        )
+        reused = schedule(
+            "run_eda_analysis",
+            {"dataset_id": self.dataset_id, "file_id": 1},
+            execute,
+            idempotent=False,
+            max_retries=0,
+            task_key=task_key,
+        )
+
+        self.assertEqual(scheduled[3], task_key)
+        self.assertEqual(reused[3], task_key)
+        self.assertEqual(executions, ["engine"])
+        with self.session_factory() as session:
+            task = session.query(WorkflowTask).filter_by(
+                workflow_id=workflow_id,
+                task_key=task_key,
+            ).one()
+            self.assertEqual(task.status, "completed")
+            self.assertFalse(task.idempotent)
+            self.assertEqual(task.max_retries, 0)
+
     def test_recovery_invalidates_dependent_task_when_upstream_output_changes(self):
         stale = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)
         with self.session_factory() as session:

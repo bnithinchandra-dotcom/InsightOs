@@ -5,6 +5,7 @@ import pytest
 from app.agent import checkpointer
 from app.agent.checkpointer import CheckpointerInitializationError
 from app.agent.langgraph_orchestrator import (
+    SpecialistGraphServices,
     build_request_orchestration_graph,
     build_specialist_graph,
     workflow_checkpoint_config,
@@ -116,17 +117,14 @@ def test_production_requires_checkpointing_by_default(monkeypatch):
     monkeypatch.setenv("INSIGHTOS_ENV", "production")
 
     with pytest.raises(CheckpointerInitializationError, match="required"):
-        build_specialist_graph()
-
-
-def test_specialist_graph_never_fabricates_completed_results():
-    result = build_specialist_graph().invoke({"user_request": "analyze this dataset"})
-
-    assert result["execution_status"] == "blocked"
-    assert result["error_code"] == "langgraph_specialist_pipeline_not_integrated"
-    assert "analytics_decision" not in result
-    assert "validation_result" not in result
-    assert "presentation_result" not in result
+        build_specialist_graph(
+            services=SpecialistGraphServices(
+                router=object(),
+                registry=object(),
+                workflow_scheduler=lambda *args, **kwargs: None,
+                request_context={},
+            )
+        )
 
 
 def test_request_graph_compiles_and_returns_safe_non_success_result():
@@ -136,7 +134,7 @@ def test_request_graph_compiles_and_returns_safe_non_success_result():
     )
 
     assert result["execution_status"] == "blocked"
-    assert result["error_code"] == "langgraph_specialist_pipeline_not_integrated"
+    assert result["error_code"] == "specialist_graph_not_configured"
     assert result["final_response"]["status"] == "blocked"
 
 
@@ -145,6 +143,26 @@ def test_request_graph_rejects_empty_requests():
 
     assert result["execution_status"] == "blocked"
     assert result["error_code"] == "missing_user_request"
+
+
+def test_request_graph_propagates_checkpoint_identity_to_specialist_graph():
+    invocations = []
+
+    class SpecialistGraph:
+        def invoke(self, state, *, config):
+            invocations.append(config)
+            return {"execution_status": "completed"}
+
+    result = build_request_orchestration_graph(
+        specialist_graph=SpecialistGraph()
+    ).invoke(
+        {"user_request": "analyze data"},
+        config={"configurable": {"thread_id": "workflow-" + "a" * 32}},
+    )
+
+    assert result["execution_status"] == "completed"
+    assert invocations[0]["configurable"]["thread_id"] == "workflow-" + "a" * 32
+    assert invocations[0]["configurable"]["checkpoint_ns"] == "specialist_graph"
 
 
 def test_workflow_id_is_used_as_checkpoint_thread_id():
