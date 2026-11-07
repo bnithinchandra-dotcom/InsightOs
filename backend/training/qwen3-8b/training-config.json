@@ -1,13 +1,13 @@
 {
-  "config_version": "insightos-qwen3-8b-lora-v1",
+  "config_version": "insightos-qwen3-8b-lora-v2",
   "base_model": "Qwen/Qwen3-8B",
   "base_model_revision": null,
   "base_model_revision_required_before_run": true,
-  "dataset_version": "insightos-agent-sft-v1",
-  "dataset_path": "backend/training/qwen3-8b/insightos-agent-sft-v1.jsonl",
+  "dataset_version": "insightos-qwen3-8b-orchestration-v2",
+  "dataset_path": "backend/training/qwen3-8b/insightos-agent-sft-v2.jsonl",
   "dataset_schema_path": "backend/training/qwen3-0.6b/insightos-sft.schema.json",
   "require_approved_examples": true,
-  "evaluation_suite_path": "backend/training/evaluation/suite_v1.json",
+  "evaluation_suite_path": "backend/training/milestone4/qwen3-8b-orchestration-benchmark-v1.json",
   "held_out_sft_split": "test",
   "method": "LoRA",
   "load_in_4bit": false,
@@ -41,7 +41,8 @@
   "status": "preparation_only",
   "blockers": [
     "Pin the immutable Hugging Face model revision before resolving or downloading the checkpoint.",
-    "Obtain human approval for every training example; the current dataset is draft-only.",
+    "Obtain record-level human approval for every training example; the dataset is draft-only.",
+    "The independent orchestration benchmark has not been run against the base model.",
     "Run resource checks and a smoke test on hardware with adequate model-training memory."
   ]
 }

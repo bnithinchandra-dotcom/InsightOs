@@ -1,0 +1,28 @@
+{
+  "assessment_version": "insightos-qwen3-8b-training-readiness-v1",
+  "benchmark_sha256": "fba8f386bf8796edf76799f681bd17bd2a7151fb35c80fc474037d38b30ca569",
+  "benchmark_version": "insightos-qwen3-8b-orchestration-benchmark-v3",
+  "checks": {
+    "adapter_output_and_evaluation_plan_defined": true,
+    "baseline_execution_completed": false,
+    "baseline_results_imported": false,
+    "benchmark_and_bundle_hashes_pinned": true,
+    "dataset_provenance_scope_documented": true,
+    "kaggle_qlora_compatibility_verified": false,
+    "sft_v3_release_hash_verified": true,
+    "training_authorization": false,
+    "training_benchmark_duplicate_audit_passed": true
+  },
+  "model_id": "Qwen/Qwen3-8B",
+  "model_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+  "recommendation": "NOT READY — BASELINE INCOMPLETE",
+  "reasons": [
+    "The original base-model Kaggle inference has not been run or imported.",
+    "Human semantic review of the baseline is pending.",
+    "Kaggle QLoRA runtime compatibility has not been verified.",
+    "No training authorization has been granted."
+  ],
+  "sft_dataset_sha256": "e0ca35eed8556a7321eccd27a7a98b0f194eb12b4e89c78645b84527f698e7f0",
+  "sft_dataset_version": "insightos-qwen3-8b-orchestration-v3",
+  "training_authorized": false
+}

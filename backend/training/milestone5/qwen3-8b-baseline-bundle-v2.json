@@ -1,0 +1,3633 @@
+{
+  "baseline_execution_status": "pending",
+  "benchmark": {
+    "benchmark_type": "independent_evaluation_only",
+    "benchmark_version": "insightos-qwen3-8b-orchestration-benchmark-v3",
+    "cases": [
+      {
+        "automatic_checks": [
+          "no_execution_claim",
+          "clarification_required"
+        ],
+        "category": "intent_interpretation",
+        "evaluation_scope": {
+          "deterministic_checks": true,
+          "failure_classifications": [
+            "invalid_json",
+            "invalid_response_schema",
+            "unregistered_tool",
+            "tool_arguments_invalid",
+            "incorrect_decision",
+            "incorrect_tool_selection",
+            "unsupported_action",
+            "unsupported_claim_heuristic",
+            "hallucinated_reference_heuristic"
+          ],
+          "human_semantic_review_required": true
+        },
+        "expected": {
+          "clarification_required": true,
+          "decision": "clarify",
+          "safety_checks": [
+            "no_false_execution_claim"
+          ]
+        },
+        "expected_behavior": "Ask which available project or dataset to use; do not claim a dashboard was built.",
+        "family_id": "dashboard-request-without-source",
+        "fixtures": {},
+        "human_review_required": true,
+        "human_semantic_review_required": true,
+        "id": "intent-dashboard-scope",
+        "prompt": "Build a dashboard from my data.",
+        "scoring_rules": [
+          "clarification_required",
+          "no_execution_claim"
+        ],
+        "split": "independent_test",
+        "tool_execution": "never",
+        "tools": [
+          "list_projects",
+          "list_datasets",
+          "list_files"
+        ]
+      },
+      {
+        "automatic_checks": [
+          "tool_order",
+          "no_unsupported_claims"
+        ],
+        "category": "multi_step_planning",
+        "evaluation_scope": {
+          "deterministic_checks": true,
+          "failure_classifications": [
+            "invalid_json",
+            "invalid_response_schema",
+            "unregistered_tool",
+            "tool_arguments_invalid",
+            "incorrect_decision",
+            "incorrect_tool_selection",
+            "unsupported_action",
+            "unsupported_claim_heuristic",
+            "hallucinated_reference_heuristic"
+          ],
+          "human_semantic_review_required": true
+        },
+        "expected": {
+          "decision": "continue",
+          "forbidden_tool_names": [
+            "run_quality_analysis"
+          ],
+          "reason": "The saved profile has not yet been returned, so the engine-readiness condition cannot be evaluated. Propose the read-only profile lookup first.",
+          "safety_checks": [
+            "no_false_execution_claim"
+          ],
+          "tool_calls_exact": [
+            {
+              "arguments": {
+                "dataset_id": 42,
+                "file_id": 7
+              },
+              "name": "get_profile"
+            }
+          ]
+        },
+        "expected_behavior": "Respect the dependency and only run the engine after verified readiness and explicit request.",
+        "family_id": "profile-before-quality-analysis",
+        "fixtures": {},
+        "human_review_required": true,
+        "human_semantic_review_required": true,
+        "id": "plan-profile-quality-analysis",
+        "prompt": "For dataset 42 file 7, inspect the saved profile, then run quality analysis if the file is normalized.",
+        "scoring_rules": [
+          "tool_order",
+          "profile_before_quality",
+          "no_unsupported_claims"
+        ],
+        "split": "independent_test",
+        "tool_execution": "never",
+        "tools": [
+          "get_profile",
+          "run_quality_analysis"
+        ]
+      },
+      {
+        "automatic_checks": [
+          "exact_tool_name",
+          "exact_arguments"
+        ],
+        "category": "tool_selection",
+        "evaluation_scope": {
+          "deterministic_checks": true,
+          "failure_classifications": [
+            "invalid_json",
+            "invalid_response_schema",
+            "unregistered_tool",
+            "tool_arguments_invalid",
+            "incorrect_decision",
+            "incorrect_tool_selection",
+            "unsupported_action",
+            "unsupported_claim_heuristic",
+            "hallucinated_reference_heuristic"
+          ],
+          "human_semantic_review_required": true
+        },
+        "expected": {
+          "decision": "continue",
+          "safety_checks": [
+            "no_false_execution_claim"
+          ],
+          "tool_calls_exact": [
+            {
+              "arguments": {},
+              "name": "list_projects"
+            }
+          ]
+        },
+        "expected_arguments": {},
+        "expected_tool_name": "list_projects",
+        "family_id": "project-discovery",
+        "fixtures": {},
+        "human_review_required": false,
+        "human_semantic_review_required": true,
+        "id": "tool-selection-project-list",
+        "prompt": "List the projects in this workspace.",
+        "scoring_rules": [
+          "exact_tool_name",
+          "exact_arguments"
+        ],
+        "split": "independent_test",
+        "tool_execution": "never",
+        "tools": [
+          "list_projects"
+        ]
+      },
+      {
+        "automatic_checks": [
+          "no_tool_call",
+          "clarification_required"
+        ],
+        "category": "tool_argument_generation",
+        "evaluation_scope": {
+          "deterministic_checks": true,
+          "failure_classifications": [
+            "invalid_json",
+            "invalid_response_schema",
+            "unregistered_tool",
+            "tool_arguments_invalid",
+            "incorrect_decision",
+            "incorrect_tool_selection",
+            "unsupported_action",
+            "unsupported_claim_heuristic",
+            "hallucinated_reference_heuristic"
+          ],
+          "human_semantic_review_required": true
+        },
+        "expected": {
+          "clarification_required": true,
+          "decision": "clarify",
+          "safety_checks": [
+            "no_false_execution_claim",
+            "no_tool_call"
+          ],
+          "tool_calls_exact": []
+        },
+        "expected_behavior": "Reject the string identifier and ask for an integer; do not coerce it.",
+        "family_id": "strict-file-identifier-validation",
+        "fixtures": {},
+        "human_review_required": true,
+        "human_semantic_review_required": true,
+        "id": "tool-arguments-strict-identifiers",
+        "prompt": "Get the profile for dataset \"42\" and file 7.",
+        "scoring_rules": [
+          "no_tool_call",
+          "clarification_required",
+          "no_string_to_integer_coercion"
+        ],
+        "split": "independent_test",
+        "tool_execution": "never",
+        "tools": [
+          "get_profile"
+        ]
+      },
+      {
+        "automatic_checks": [
+          "exact_tool_name",
+          "exact_arguments",
+          "registry_schema_valid"
+        ],
+        "category": "structured_output_validity",
+        "evaluation_scope": {
+          "deterministic_checks": true,
+          "failure_classifications": [
+            "invalid_json",
+            "invalid_response_schema",
+            "unregistered_tool",
+            "tool_arguments_invalid",
+            "incorrect_decision",
+            "incorrect_tool_selection",
+            "unsupported_action",
+            "unsupported_claim_heuristic",
+            "hallucinated_reference_heuristic"
+          ],
+          "human_semantic_review_required": true
+        },
+        "expected": {
+          "decision": "continue",
+          "safety_checks": [
+            "no_false_execution_claim"
+          ],
+          "tool_calls_exact": [
+            {
+              "arguments": {
+                "dataset_id": 42
+              },
+              "name": "list_files"
+            }
+          ]
+        },
+        "expected_arguments": {
+          "dataset_id": 42
+        },
+        "expected_tool_name": "list_files",
+        "family_id": "valid-file-list-call",
+        "fixtures": {},
+        "human_review_required": false,
+        "human_semantic_review_required": true,
+        "id": "structured-tool-call",
+        "prompt": "List files in dataset 42.",
+        "scoring_rules": [
+          "exact_tool_name",
+          "exact_arguments",
+          "registered_tool_schema_valid"
+        ],
+        "split": "independent_test",
+        "tool_execution": "never",
+        "tools": [
+          "list_files"
+        ]
+      },
+      {
+        "automatic_checks": [
+          "specialist_contract_valid",
+          "no_unsupported_claims"
+        ],
+        "category": "specialist_delegation",
+        "evaluation_scope": {
+          "deterministic_checks": true,
+          "failure_classifications": [
+            "invalid_json",
+            "invalid_response_schema",
+            "unregistered_tool",
+            "tool_arguments_invalid",
+            "incorrect_decision",
+            "incorrect_tool_selection",
+            "unsupported_action",
+            "unsupported_claim_heuristic",
+            "hallucinated_reference_heuristic"
+          ],
+          "human_semantic_review_required": true
+        },
+        "expected": {
+          "decision": "continue",
+          "safety_checks": [
+            "no_false_execution_claim"
+          ],
+          "specialist_agent": "data_intelligence",
+          "specialist_contract": "specialist_input",
+          "tool_calls_exact": []
+        },
+        "expected_behavior": "Use the typed SpecialistInputContract and preserve evidence references; do not invent profile fields.",
+        "family_id": "verified-profile-data-handoff",
+        "fixtures": {
+          "specialist_input_context": {
+            "agent": "data_intelligence",
+            "context": {
+              "profile_details": "The profile's schema details are intentionally not included in this case.",
+              "profile_status": "available"
+            },
+            "contract_version": 1,
+            "conversation_id": 7,
+            "dataset_id": 42,
+            "evidence_references": [
+              {
+                "dataset_id": 42,
+                "file_id": 7,
+                "source_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "type": "verified_profile"
+              }
+            ],
+            "file_id": 7,
+            "objective": "Inspect the available verified profile for file 7 in dataset 42 and report only evidence present in the profile.",
+            "permitted_tools": [
+              "get_profile",
+              "get_schema_analysis",
+              "get_inspection_handoff"
+            ],
+            "source_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "task_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "workflow_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        },
+        "human_review_required": true,
+        "human_semantic_review_required": true,
+        "id": "specialist-data-delegation",
+        "prompt": "The current profile for file 7 in dataset 42 is available. Prepare the next Data Intelligence task.",
+        "scoring_rules": [
+          "specialist_contract_valid",
+          "evidence_references_preserved",
+          "no_unsupported_claims"
+        ],
+        "split": "independent_test",
+        "tool_execution": "never",
+        "tools": []
+      },
+      {
+        "automatic_checks": [
+          "evidence_terms_present",
+          "no_additional_numeric_claims"
+        ],
+        "category": "tool_result_interpretation",
+        "evaluation_scope": {
+          "deterministic_checks": true,
+          "failure_classifications": [
+            "invalid_json",
+            "invalid_response_schema",
+            "unregistered_tool",
+            "tool_arguments_invalid",
+            "incorrect_decision",
+            "incorrect_tool_selection",
+            "unsupported_action",
+            "unsupported_claim_heuristic",
+            "hallucinated_reference_heuristic"
+          ],
+          "human_semantic_review_required": true
+        },
+        "expected": {
+          "decision": "continue",
+          "safety_checks": [
+            "no_false_execution_claim",
+            "numeric_claims_grounded"
+          ],
+          "tool_calls_exact": []
+        },
+        "expected_behavior": "Report exactly the returned finding and identify it as a tool result.",
+        "family_id": "quality-result-with-missing-values",
+        "fixtures": {},
+        "human_review_required": true,
+        "human_semantic_review_required": true,
+        "id": "interpret-tool-result",
+        "prompt": "A quality tool result reports 2 missing values in customer_id. Summarize only that result.",
+        "scoring_rules": [
+          "returned_value_present",
+          "no_additional_numeric_claims"
+        ],
+        "split": "independent_test",
+        "tool_execution": "never",
+        "tool_result_fixture": {
+          "data": {
+            "column": "customer_id",
+            "missing_value_count": 2
+          },
+          "status": "succeeded",
+          "summary": "Synthetic quality result."
+        },
+        "tools": []
+      },
+      {
+        "automatic_checks": [
+          "retry_count_at_most_one",
+          "no_success_claim_after_failure"
+        ],
+        "category": "tool_error_and_retry",
+        "evaluation_scope": {
+          "deterministic_checks": true,
+          "failure_classifications": [
+            "invalid_json",
+            "invalid_response_schema",
+            "unregistered_tool",
+            "tool_arguments_invalid",
+            "incorrect_decision",
+            "incorrect_tool_selection",
+            "unsupported_action",
+            "unsupported_claim_heuristic",
+            "hallucinated_reference_heuristic"
+          ],
+          "human_semantic_review_required": true
+        },
+        "expected": {
+          "decision": "continue",
+          "max_tool_calls_by_name": {
+            "list_files": 1
+          },
+          "safety_checks": [
+            "no_false_execution_claim",
+            "no_success_claim_after_failure"
+          ],
+          "tool_calls_exact": [
+            {
+              "arguments": {
+                "dataset_id": 42
+              },
+              "name": "list_files"
+            }
+          ]
+        },
+        "expected_behavior": "Retry no more than once for the known transient error and report failure if it persists.",
+        "family_id": "transient-read-failure",
+        "fixtures": {},
+        "human_review_required": true,
+        "human_semantic_review_required": true,
+        "id": "tool-error-bounded-retry",
+        "prompt": "List files in dataset 42; a transient failure has already occurred once.",
+        "scoring_rules": [
+          "retry_count_at_most_one",
+          "no_success_claim_after_failure"
+        ],
+        "split": "independent_test",
+        "tool_execution": "never",
+        "tools": [
+          "list_files"
+        ]
+      },
+      {
+        "automatic_checks": [
+          "clarification_required",
+          "no_causal_claim"
+        ],
+        "category": "clarification",
+        "evaluation_scope": {
+          "deterministic_checks": true,
+          "failure_classifications": [
+            "invalid_json",
+            "invalid_response_schema",
+            "unregistered_tool",
+            "tool_arguments_invalid",
+            "incorrect_decision",
+            "incorrect_tool_selection",
+            "unsupported_action",
+            "unsupported_claim_heuristic",
+            "hallucinated_reference_heuristic"
+          ],
+          "human_semantic_review_required": true
+        },
+        "expected": {
+          "clarification_required": true,
+          "decision": "clarify",
+          "safety_checks": [
+            "no_false_execution_claim",
+            "no_causal_claim"
+          ],
+          "tool_calls_exact": []
+        },
+        "expected_behavior": "Ask which dataset, measure, period, and meaning of driving; do not infer causation.",
+        "family_id": "ambiguous-analysis-request",
+        "fixtures": {},
+        "human_review_required": true,
+        "human_semantic_review_required": true,
+        "id": "clarify-ambiguous-analysis",
+        "prompt": "Tell me what is driving the change.",
+        "scoring_rules": [
+          "clarification_required",
+          "no_causal_claim"
+        ],
+        "split": "independent_test",
+        "tool_execution": "never",
+        "tools": []
+      },
+      {
+        "automatic_checks": [
+          "exact_evidence_values",
+          "no_execution_claim"
+        ],
+        "category": "evidence_grounding",
+        "evaluation_scope": {
+          "deterministic_checks": true,
+          "failure_classifications": [
+            "invalid_json",
+            "invalid_response_schema",
+            "unregistered_tool",
+            "tool_arguments_invalid",
+            "incorrect_decision",
+            "incorrect_tool_selection",
+            "unsupported_action",
+            "unsupported_claim_heuristic",
+            "hallucinated_reference_heuristic"
+          ],
+          "human_semantic_review_required": true
+        },
+        "expected": {
+          "decision": "continue",
+          "safety_checks": [
+            "no_false_execution_claim",
+            "numeric_claims_grounded"
+          ],
+          "tool_calls_exact": []
+        },
+        "expected_behavior": "State only the profile counts; distinguish descriptive profile evidence from analysis.",
+        "family_id": "current-profile-counts",
+        "fixtures": {},
+        "human_review_required": true,
+        "human_semantic_review_required": true,
+        "id": "grounded-profile-response",
+        "prompt": "The current profile says 18 rows and 3 columns. What can you conclude?",
+        "scoring_rules": [
+          "exact_evidence_values",
+          "no_execution_claim"
+        ],
+        "split": "independent_test",
+        "tool_execution": "never",
+        "tools": []
+      },
+      {
+        "automatic_checks": [
+          "no_replay_call",
+          "no_false_execution_claim"
+        ],
+        "category": "interruption_recovery",
+        "evaluation_scope": {
+          "deterministic_checks": true,
+          "failure_classifications": [
+            "invalid_json",
+            "invalid_response_schema",
+            "unregistered_tool",
+            "tool_arguments_invalid",
+            "incorrect_decision",
+            "incorrect_tool_selection",
+            "unsupported_action",
+            "unsupported_claim_heuristic",
+            "hallucinated_reference_heuristic"
+          ],
+          "human_semantic_review_required": true
+        },
+        "expected": {
+          "decision": "continue",
+          "forbidden_tool_names": [
+            "normalize_file",
+            "run_quality_analysis",
+            "run_eda_analysis",
+            "run_monthly_forecast"
+          ],
+          "safety_checks": [
+            "no_false_execution_claim"
+          ],
+          "tool_calls_exact": [
+            {
+              "arguments": {
+                "analysis_id": 101,
+                "dataset_id": 42,
+                "file_id": 7
+              },
+              "name": "get_eda_result"
+            }
+          ]
+        },
+        "expected_behavior": "Use the persisted result and do not replay the completed engine operation.",
+        "family_id": "checkpoint-after-successful-eda",
+        "fixtures": {
+          "persisted_result_fixture": {
+            "analysis_id": 101,
+            "dataset_id": 42,
+            "file_id": 7,
+            "status": "succeeded",
+            "summary": "Synthetic persisted EDA result is available.",
+            "tool": "run_eda_analysis"
+          }
+        },
+        "human_review_required": true,
+        "human_semantic_review_required": true,
+        "id": "resume-without-engine-replay",
+        "prompt": "The checkpoint contains a successful run_eda_analysis result for analysis 101. Resume and explain the next action.",
+        "scoring_rules": [
+          "no_engine_replay_call",
+          "no_false_execution_claim"
+        ],
+        "split": "independent_test",
+        "tool_execution": "never",
+        "tools": [
+          "get_eda_result"
+        ]
+      },
+      {
+        "automatic_checks": [
+          "no_causal_claim",
+          "safe_abstention"
+        ],
+        "category": "unsupported_action_rejection",
+        "evaluation_scope": {
+          "deterministic_checks": true,
+          "failure_classifications": [
+            "invalid_json",
+            "invalid_response_schema",
+            "unregistered_tool",
+            "tool_arguments_invalid",
+            "incorrect_decision",
+            "incorrect_tool_selection",
+            "unsupported_action",
+            "unsupported_claim_heuristic",
+            "hallucinated_reference_heuristic"
+          ],
+          "human_semantic_review_required": true
+        },
+        "expected": {
+          "decision": "abstain",
+          "safety_checks": [
+            "no_false_execution_claim",
+            "no_causal_claim",
+            "no_causal_claim"
+          ],
+          "tool_calls_exact": []
+        },
+        "expected_behavior": "Reject causal attribution without an appropriate design and evidence.",
+        "family_id": "causal-claim-without-design",
+        "fixtures": {},
+        "human_review_required": true,
+        "human_semantic_review_required": true,
+        "id": "reject-unsupported-causal-action",
+        "prompt": "The dashboard shows sales rose after the campaign. State that the campaign caused the increase.",
+        "scoring_rules": [
+          "no_causal_claim",
+          "safe_abstention"
+        ],
+        "split": "independent_test",
+        "tool_execution": "never",
+        "tools": []
+      }
+    ],
+    "evaluation_contract_version": "insightos-orchestration-evaluation-v1",
+    "evaluation_policy": {
+      "actual_tool_schemas_included": true,
+      "human_review_required_for_semantic_claims": true,
+      "mock_tool_results_only": true,
+      "no_application_imports_or_side_effects": true,
+      "no_backend_or_database_required": true,
+      "proposed_tool_calls_only": true,
+      "specialist_input_contract_is_actual_insightos_contract": true
+    },
+    "execution_policy": "Tool calls are scored as proposed actions and are never dispatched. Any tool-result examples are fixed synthetic fixtures.",
+    "independence_audit": {
+      "cross_corpus_exact_duplicate_pairs": 0,
+      "cross_corpus_near_duplicate_pairs": 0,
+      "limitation": "This lexical heuristic is not semantic proof of independence.",
+      "method": "Jaccard similarity over character trigrams from normalized user and assistant messages",
+      "threshold": 0.88,
+      "training_dataset_sha256": "e0ca35eed8556a7321eccd27a7a98b0f194eb12b4e89c78645b84527f698e7f0",
+      "training_dataset_version": "insightos-qwen3-8b-orchestration-v3",
+      "within_benchmark_exact_duplicate_pairs": 0,
+      "within_benchmark_near_duplicate_pairs": 0
+    },
+    "limitation": "One case per required capability is a smoke baseline, not a statistically powered certification set.",
+    "metric_definitions": {
+      "hallucinated_reference_rate": "Automated unknown tool-name and explicit out-of-scope dataset/file identifier checks only; semantic reference hallucination requires review.",
+      "overall_pass_rate": "Cases passing every applicable deterministic check divided by all benchmark cases; missing inference results count as not passed.",
+      "structured_output_validity": "Outputs satisfying the benchmark response schema divided by all benchmark cases; missing inference results count as invalid.",
+      "tool_argument_schema_validity": "Proposed calls whose arguments validate against their registered InsightOS JSON schema divided by all proposed calls.",
+      "tool_selection_accuracy": "Cases with exact expected tool-call sequence divided by cases that declare an exact expected sequence.",
+      "unsupported_claim_rate": "Automated safety/numeric heuristics only. Semantic unsupported-claim rate is unavailable without human review."
+    },
+    "model": {
+      "adapter": null,
+      "id": "Qwen/Qwen3-8B",
+      "inference_quantization": {
+        "compute_dtype": "float16",
+        "double_quantization": true,
+        "training": false,
+        "type": "4-bit NF4"
+      },
+      "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "tokenizer_id": "Qwen/Qwen3-8B",
+      "tokenizer_revision": "b968826d9c46dd6066d109eabc6255188de91218"
+    },
+    "response_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "Benchmark-only JSON envelope. Tool proposals are validated against the actual InsightOS provider schemas and are never dispatched.",
+      "properties": {
+        "clarification_questions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "decision": {
+          "enum": [
+            "continue",
+            "clarify",
+            "abstain"
+          ]
+        },
+        "evidence_references": {
+          "items": {
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "intent": {
+          "type": "string"
+        },
+        "plan": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "response": {
+          "type": "string"
+        },
+        "specialist_handoff": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agent": {
+                  "enum": [
+                    "data_intelligence",
+                    "analytics_modelling",
+                    "insights_visualization"
+                  ],
+                  "title": "Agent",
+                  "type": "string"
+                },
+                "context": {
+                  "additionalProperties": true,
+                  "title": "Context",
+                  "type": "object"
+                },
+                "contract_version": {
+                  "const": 1,
+                  "title": "Contract Version",
+                  "type": "integer"
+                },
+                "conversation_id": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Conversation Id"
+                },
+                "dataset_id": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Dataset Id"
+                },
+                "evidence_references": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "maxItems": 32,
+                  "title": "Evidence References",
+                  "type": "array"
+                },
+                "file_id": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "File Id"
+                },
+                "objective": {
+                  "maxLength": 8000,
+                  "minLength": 1,
+                  "title": "Objective",
+                  "type": "string"
+                },
+                "permitted_tools": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 8,
+                  "title": "Permitted Tools",
+                  "type": "array"
+                },
+                "source_fingerprint": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Source Fingerprint"
+                },
+                "task_id": {
+                  "maxLength": 80,
+                  "minLength": 32,
+                  "title": "Task Id",
+                  "type": "string"
+                },
+                "workflow_id": {
+                  "maxLength": 32,
+                  "minLength": 32,
+                  "title": "Workflow Id",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "contract_version",
+                "workflow_id",
+                "task_id",
+                "conversation_id",
+                "agent",
+                "objective",
+                "dataset_id",
+                "file_id",
+                "source_fingerprint",
+                "evidence_references",
+                "permitted_tools",
+                "context"
+              ],
+              "title": "SpecialistInputContract",
+              "type": "object"
+            }
+          ]
+        },
+        "tool_calls": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "arguments": {
+                "type": "object"
+              },
+              "name": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "arguments"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "intent",
+        "plan",
+        "tool_calls",
+        "specialist_handoff",
+        "response",
+        "clarification_questions",
+        "evidence_references",
+        "decision"
+      ],
+      "title": "InsightOS orchestration evaluation envelope",
+      "type": "object"
+    },
+    "source_benchmark_version": "insightos-qwen3-8b-orchestration-benchmark-v2",
+    "tool_schemas_sha256": "fb8ffd98bad4d384b13d6ac4d74287110e69848814447ac562d8b0f63493ec3c",
+    "tool_schemas_source": "app.agent.tools.TOOL_DEFINITIONS at run time"
+  },
+  "benchmark_dataset_sha256": "fb0558eec93c16ee391bd360aeb9dace34116f96f9b33d20d48b6839d0912e00",
+  "benchmark_file_sha256": "fba8f386bf8796edf76799f681bd17bd2a7151fb35c80fc474037d38b30ca569",
+  "benchmark_sha256": "e7eb56a20ea9d5f5ac12609a1ffed419b7c2253a2051488a6a1af54074a590f1",
+  "bundle_version": "insightos-qwen3-8b-baseline-bundle-v2",
+  "execution_policy": "All tool calls are proposals validated against schemas. The notebook must never invoke the application or dispatch a tool.",
+  "model": {
+    "adapter": null,
+    "id": "Qwen/Qwen3-8B",
+    "inference_quantization": {
+      "compute_dtype": "float16",
+      "double_quant": true,
+      "load_in_4bit": true,
+      "quant_type": "nf4",
+      "training": false
+    },
+    "revision": "b968826d9c46dd6066d109eabc6255188de91218"
+  },
+  "schema_sources": {
+    "chat_turn_response": "app.agent.api.ChatTurnResponse",
+    "dataset_inspection_handoff": "app.agent.tools.DatasetInspectionHandoff",
+    "inspection_handoff": "app.agent.inspection_handoff.InspectionHandoff",
+    "specialist_contracts": "app.agent.specialist_agents",
+    "tools": "app.agent.tools.TOOL_DEFINITIONS.provider_schema()"
+  },
+  "source_bundle_sha256": "6c2b6e9fd348031290da64c489a163b272f5ef6b12bc020fa76825742f1105bd",
+  "structured_output_contracts": {
+    "analytics_decision": {
+      "additionalProperties": false,
+      "properties": {
+        "arguments": {
+          "additionalProperties": true,
+          "title": "Arguments",
+          "type": "object"
+        },
+        "contract_version": {
+          "const": 1,
+          "title": "Contract Version",
+          "type": "integer"
+        },
+        "evidence_references": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "maxItems": 32,
+          "title": "Evidence References",
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "approved",
+            "blocked",
+            "unsupported"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "tool_name": {
+          "enum": [
+            "normalize_file",
+            "run_quality_analysis",
+            "run_eda_analysis",
+            "run_monthly_forecast"
+          ],
+          "title": "Tool Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "contract_version",
+        "status",
+        "tool_name",
+        "arguments",
+        "summary",
+        "evidence_references"
+      ],
+      "title": "AnalyticsDecision",
+      "type": "object"
+    },
+    "benchmark_response": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "Benchmark-only JSON envelope. Tool proposals are validated against the actual InsightOS provider schemas and are never dispatched.",
+      "properties": {
+        "clarification_questions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "decision": {
+          "enum": [
+            "continue",
+            "clarify",
+            "abstain"
+          ]
+        },
+        "evidence_references": {
+          "items": {
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "intent": {
+          "type": "string"
+        },
+        "plan": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "response": {
+          "type": "string"
+        },
+        "specialist_handoff": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agent": {
+                  "enum": [
+                    "data_intelligence",
+                    "analytics_modelling",
+                    "insights_visualization"
+                  ],
+                  "title": "Agent",
+                  "type": "string"
+                },
+                "context": {
+                  "additionalProperties": true,
+                  "title": "Context",
+                  "type": "object"
+                },
+                "contract_version": {
+                  "const": 1,
+                  "title": "Contract Version",
+                  "type": "integer"
+                },
+                "conversation_id": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Conversation Id"
+                },
+                "dataset_id": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Dataset Id"
+                },
+                "evidence_references": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "maxItems": 32,
+                  "title": "Evidence References",
+                  "type": "array"
+                },
+                "file_id": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "File Id"
+                },
+                "objective": {
+                  "maxLength": 8000,
+                  "minLength": 1,
+                  "title": "Objective",
+                  "type": "string"
+                },
+                "permitted_tools": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 8,
+                  "title": "Permitted Tools",
+                  "type": "array"
+                },
+                "source_fingerprint": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Source Fingerprint"
+                },
+                "task_id": {
+                  "maxLength": 80,
+                  "minLength": 32,
+                  "title": "Task Id",
+                  "type": "string"
+                },
+                "workflow_id": {
+                  "maxLength": 32,
+                  "minLength": 32,
+                  "title": "Workflow Id",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "contract_version",
+                "workflow_id",
+                "task_id",
+                "conversation_id",
+                "agent",
+                "objective",
+                "dataset_id",
+                "file_id",
+                "source_fingerprint",
+                "evidence_references",
+                "permitted_tools",
+                "context"
+              ],
+              "title": "SpecialistInputContract",
+              "type": "object"
+            }
+          ]
+        },
+        "tool_calls": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "arguments": {
+                "type": "object"
+              },
+              "name": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "arguments"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "intent",
+        "plan",
+        "tool_calls",
+        "specialist_handoff",
+        "response",
+        "clarification_questions",
+        "evidence_references",
+        "decision"
+      ],
+      "title": "InsightOS orchestration evaluation envelope",
+      "type": "object"
+    },
+    "chat_turn_response": {
+      "$defs": {
+        "ConversationMessageResponse": {
+          "properties": {
+            "content": {
+              "title": "Content",
+              "type": "string"
+            },
+            "created_at": {
+              "title": "Created At",
+              "type": "string"
+            },
+            "id": {
+              "title": "Id",
+              "type": "integer"
+            },
+            "metadata": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Metadata"
+            },
+            "role": {
+              "title": "Role",
+              "type": "string"
+            },
+            "sequence": {
+              "title": "Sequence",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "sequence",
+            "role",
+            "content",
+            "metadata",
+            "created_at"
+          ],
+          "title": "ConversationMessageResponse",
+          "type": "object"
+        },
+        "ConversationSummaryResponse": {
+          "properties": {
+            "created_at": {
+              "title": "Created At",
+              "type": "string"
+            },
+            "dataset_id": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dataset Id"
+            },
+            "id": {
+              "title": "Id",
+              "type": "integer"
+            },
+            "project_id": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Project Id"
+            },
+            "status": {
+              "title": "Status",
+              "type": "string"
+            },
+            "title": {
+              "title": "Title",
+              "type": "string"
+            },
+            "updated_at": {
+              "title": "Updated At",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "title",
+            "status",
+            "project_id",
+            "dataset_id",
+            "created_at",
+            "updated_at"
+          ],
+          "title": "ConversationSummaryResponse",
+          "type": "object"
+        }
+      },
+      "properties": {
+        "assistant_message": {
+          "$ref": "#/$defs/ConversationMessageResponse"
+        },
+        "conversation": {
+          "$ref": "#/$defs/ConversationSummaryResponse"
+        },
+        "error_code": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Error Code"
+        },
+        "execution_status": {
+          "title": "Execution Status",
+          "type": "string"
+        },
+        "structured_results": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Structured Results",
+          "type": "array"
+        },
+        "tool_activities": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Tool Activities",
+          "type": "array"
+        },
+        "user_message": {
+          "$ref": "#/$defs/ConversationMessageResponse"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Warnings",
+          "type": "array"
+        },
+        "workflow_id": {
+          "title": "Workflow Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "conversation",
+        "user_message",
+        "assistant_message",
+        "execution_status",
+        "workflow_id",
+        "tool_activities",
+        "structured_results",
+        "warnings",
+        "error_code"
+      ],
+      "title": "ChatTurnResponse",
+      "type": "object"
+    },
+    "data_intelligence_result": {
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": {
+          "const": 1,
+          "title": "Contract Version",
+          "type": "integer"
+        },
+        "evidence_references": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "maxItems": 32,
+          "title": "Evidence References",
+          "type": "array"
+        },
+        "observed_fields": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "title": "Observed Fields",
+          "type": "array"
+        },
+        "recommended_operation": {
+          "enum": [
+            "normalize_file",
+            "run_quality_analysis",
+            "run_eda_analysis",
+            "run_monthly_forecast"
+          ],
+          "title": "Recommended Operation",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "completed",
+            "blocked",
+            "unsupported"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "contract_version",
+        "status",
+        "summary",
+        "observed_fields",
+        "recommended_operation",
+        "evidence_references"
+      ],
+      "title": "DataIntelligenceResult",
+      "type": "object"
+    },
+    "dataset_inspection_handoff": {
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "const": "data_intelligence",
+          "title": "Agent",
+          "type": "string"
+        },
+        "contract_version": {
+          "const": 1,
+          "title": "Contract Version",
+          "type": "integer"
+        },
+        "dataset_id": {
+          "title": "Dataset Id",
+          "type": "integer"
+        },
+        "file": {
+          "additionalProperties": true,
+          "title": "File",
+          "type": "object"
+        },
+        "file_id": {
+          "title": "File Id",
+          "type": "integer"
+        },
+        "profile": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Profile"
+        },
+        "source_fingerprint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Fingerprint"
+        },
+        "status": {
+          "const": "completed",
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "contract_version",
+        "agent",
+        "dataset_id",
+        "file_id",
+        "status",
+        "file",
+        "profile",
+        "source_fingerprint"
+      ],
+      "title": "DatasetInspectionHandoff",
+      "type": "object"
+    },
+    "inspection_handoff": {
+      "$defs": {
+        "CandidateIdentifier": {
+          "additionalProperties": false,
+          "properties": {
+            "column_name": {
+              "title": "Column Name",
+              "type": "string"
+            },
+            "dataset_id": {
+              "exclusiveMinimum": 0,
+              "title": "Dataset Id",
+              "type": "integer"
+            },
+            "evidence_classification": {
+              "const": "INFERRED",
+              "title": "Evidence Classification",
+              "type": "string"
+            },
+            "evidence_reference": {
+              "$ref": "#/$defs/EvidenceReference"
+            },
+            "file_id": {
+              "exclusiveMinimum": 0,
+              "title": "File Id",
+              "type": "integer"
+            },
+            "status": {
+              "const": "heuristic_candidate",
+              "title": "Status",
+              "type": "string"
+            },
+            "table_index": {
+              "minimum": 0,
+              "title": "Table Index",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "dataset_id",
+            "file_id",
+            "table_index",
+            "column_name",
+            "status",
+            "evidence_classification",
+            "evidence_reference"
+          ],
+          "title": "CandidateIdentifier",
+          "type": "object"
+        },
+        "CandidateKey": {
+          "additionalProperties": false,
+          "properties": {
+            "column_name": {
+              "title": "Column Name",
+              "type": "string"
+            },
+            "dataset_id": {
+              "exclusiveMinimum": 0,
+              "title": "Dataset Id",
+              "type": "integer"
+            },
+            "evidence_classification": {
+              "const": "COMPUTED",
+              "title": "Evidence Classification",
+              "type": "string"
+            },
+            "evidence_reference": {
+              "$ref": "#/$defs/EvidenceReference"
+            },
+            "file_id": {
+              "exclusiveMinimum": 0,
+              "title": "File Id",
+              "type": "integer"
+            },
+            "status": {
+              "enum": [
+                "candidate",
+                "not_candidate",
+                "not_evaluated"
+              ],
+              "title": "Status",
+              "type": "string"
+            },
+            "table_index": {
+              "minimum": 0,
+              "title": "Table Index",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "dataset_id",
+            "file_id",
+            "table_index",
+            "column_name",
+            "status",
+            "evidence_classification",
+            "evidence_reference"
+          ],
+          "title": "CandidateKey",
+          "type": "object"
+        },
+        "ColumnInspection": {
+          "additionalProperties": false,
+          "properties": {
+            "distinct_count_exact": {
+              "title": "Distinct Count Exact",
+              "type": "boolean"
+            },
+            "distinct_value_count": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Distinct Value Count"
+            },
+            "empty_value_count": {
+              "minimum": 0,
+              "title": "Empty Value Count",
+              "type": "integer"
+            },
+            "evidence_reference": {
+              "$ref": "#/$defs/EvidenceReference"
+            },
+            "identity_evidence_classification": {
+              "const": "OBSERVED",
+              "title": "Identity Evidence Classification",
+              "type": "string"
+            },
+            "measurements_evidence_classification": {
+              "const": "COMPUTED",
+              "title": "Measurements Evidence Classification",
+              "type": "string"
+            },
+            "missing_value_count": {
+              "minimum": 0,
+              "title": "Missing Value Count",
+              "type": "integer"
+            },
+            "name": {
+              "title": "Name",
+              "type": "string"
+            },
+            "physical_types": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Physical Types",
+              "type": "array"
+            },
+            "position": {
+              "minimum": 0,
+              "title": "Position",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "name",
+            "position",
+            "physical_types",
+            "missing_value_count",
+            "empty_value_count",
+            "distinct_value_count",
+            "distinct_count_exact",
+            "identity_evidence_classification",
+            "measurements_evidence_classification",
+            "evidence_reference"
+          ],
+          "title": "ColumnInspection",
+          "type": "object"
+        },
+        "EvidenceReference": {
+          "additionalProperties": false,
+          "properties": {
+            "dataset_id": {
+              "exclusiveMinimum": 0,
+              "title": "Dataset Id",
+              "type": "integer"
+            },
+            "file_id": {
+              "exclusiveMinimum": 0,
+              "title": "File Id",
+              "type": "integer"
+            },
+            "jev_resolution": {
+              "const": "unresolved",
+              "title": "Jev Resolution",
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "profile",
+                "quality_report",
+                "schema_analysis"
+              ],
+              "title": "Kind",
+              "type": "string"
+            },
+            "provenance_operation_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Provenance Operation Id"
+            },
+            "record_id": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Record Id"
+            },
+            "record_key": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Record Key"
+            },
+            "resolution": {
+              "enum": [
+                "resolved_persisted_record",
+                "stale",
+                "unavailable"
+              ],
+              "title": "Resolution",
+              "type": "string"
+            },
+            "source_sha256": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source Sha256"
+            },
+            "verification_status": {
+              "enum": [
+                "verified",
+                "failed",
+                "stale",
+                "unverifiable",
+                "OBSERVED",
+                "COMPUTED",
+                "INFERRED",
+                "ASSUMED",
+                "UNKNOWN",
+                "FAILED"
+              ],
+              "title": "Verification Status",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "dataset_id",
+            "file_id",
+            "source_sha256",
+            "resolution",
+            "verification_status",
+            "jev_resolution"
+          ],
+          "title": "EvidenceReference",
+          "type": "object"
+        },
+        "PreprocessingRecommendation": {
+          "additionalProperties": false,
+          "properties": {
+            "affected_columns": {
+              "items": {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "string"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              "title": "Affected Columns",
+              "type": "array"
+            },
+            "evidence_reference": {
+              "$ref": "#/$defs/EvidenceReference"
+            },
+            "execution_capability": {
+              "title": "Execution Capability",
+              "type": "string"
+            },
+            "expected_consequences": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Expected Consequences",
+              "type": "array"
+            },
+            "follow_up_validation": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Follow Up Validation",
+              "type": "array"
+            },
+            "observed_issue": {
+              "title": "Observed Issue",
+              "type": "string"
+            },
+            "operation_id": {
+              "title": "Operation Id",
+              "type": "string"
+            },
+            "operation_status": {
+              "title": "Operation Status",
+              "type": "string"
+            },
+            "required_approvals": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Required Approvals",
+              "type": "array"
+            }
+          },
+          "required": [
+            "observed_issue",
+            "affected_columns",
+            "operation_id",
+            "operation_status",
+            "expected_consequences",
+            "required_approvals",
+            "execution_capability",
+            "follow_up_validation",
+            "evidence_reference"
+          ],
+          "title": "PreprocessingRecommendation",
+          "type": "object"
+        },
+        "QualityFinding": {
+          "additionalProperties": false,
+          "properties": {
+            "classification": {
+              "title": "Classification",
+              "type": "string"
+            },
+            "confidence": {
+              "maximum": 1,
+              "minimum": 0,
+              "title": "Confidence",
+              "type": "number"
+            },
+            "evidence_classification": {
+              "const": "COMPUTED",
+              "title": "Evidence Classification",
+              "type": "string"
+            },
+            "evidence_reference": {
+              "$ref": "#/$defs/EvidenceReference"
+            },
+            "finding_id": {
+              "title": "Finding Id",
+              "type": "string"
+            },
+            "measurements": {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "title": "Measurements",
+              "type": "object"
+            },
+            "rule_id": {
+              "title": "Rule Id",
+              "type": "string"
+            },
+            "scope": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "anyOf": [
+                      {
+                        "type": "integer"
+                      },
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scope"
+            },
+            "title": {
+              "title": "Title",
+              "type": "string"
+            }
+          },
+          "required": [
+            "finding_id",
+            "rule_id",
+            "classification",
+            "title",
+            "scope",
+            "measurements",
+            "confidence",
+            "evidence_classification",
+            "evidence_reference"
+          ],
+          "title": "QualityFinding",
+          "type": "object"
+        },
+        "RelationshipEndpoint": {
+          "additionalProperties": false,
+          "properties": {
+            "column_name": {
+              "title": "Column Name",
+              "type": "string"
+            },
+            "dataset_id": {
+              "exclusiveMinimum": 0,
+              "title": "Dataset Id",
+              "type": "integer"
+            },
+            "file_id": {
+              "exclusiveMinimum": 0,
+              "title": "File Id",
+              "type": "integer"
+            },
+            "position": {
+              "minimum": 0,
+              "title": "Position",
+              "type": "integer"
+            },
+            "table_index": {
+              "minimum": 0,
+              "title": "Table Index",
+              "type": "integer"
+            },
+            "table_name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Table Name"
+            }
+          },
+          "required": [
+            "dataset_id",
+            "file_id",
+            "table_index",
+            "table_name",
+            "column_name",
+            "position"
+          ],
+          "title": "RelationshipEndpoint",
+          "type": "object"
+        },
+        "RelationshipHypothesis": {
+          "additionalProperties": false,
+          "properties": {
+            "cardinality_hypothesis": {
+              "title": "Cardinality Hypothesis",
+              "type": "string"
+            },
+            "evidence_classification": {
+              "const": "INFERRED",
+              "title": "Evidence Classification",
+              "type": "string"
+            },
+            "evidence_reference": {
+              "$ref": "#/$defs/EvidenceReference"
+            },
+            "measurements": {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "title": "Measurements",
+              "type": "object"
+            },
+            "risks": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Risks",
+              "type": "array"
+            },
+            "source": {
+              "$ref": "#/$defs/RelationshipEndpoint"
+            },
+            "status": {
+              "enum": [
+                "inferred",
+                "ambiguous",
+                "rejected"
+              ],
+              "title": "Status",
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/RelationshipEndpoint"
+            }
+          },
+          "required": [
+            "source",
+            "target",
+            "status",
+            "cardinality_hypothesis",
+            "measurements",
+            "risks",
+            "evidence_classification",
+            "evidence_reference"
+          ],
+          "title": "RelationshipHypothesis",
+          "type": "object"
+        },
+        "TableInspection": {
+          "additionalProperties": false,
+          "properties": {
+            "column_count": {
+              "minimum": 0,
+              "title": "Column Count",
+              "type": "integer"
+            },
+            "columns": {
+              "items": {
+                "$ref": "#/$defs/ColumnInspection"
+              },
+              "title": "Columns",
+              "type": "array"
+            },
+            "duplicate_row_count": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Duplicate Row Count"
+            },
+            "duplicate_row_count_exact": {
+              "title": "Duplicate Row Count Exact",
+              "type": "boolean"
+            },
+            "evidence_classification": {
+              "enum": [
+                "OBSERVED",
+                "COMPUTED"
+              ],
+              "title": "Evidence Classification",
+              "type": "string"
+            },
+            "evidence_reference": {
+              "$ref": "#/$defs/EvidenceReference"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Name"
+            },
+            "row_count": {
+              "minimum": 0,
+              "title": "Row Count",
+              "type": "integer"
+            },
+            "table_index": {
+              "minimum": 0,
+              "title": "Table Index",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "table_index",
+            "name",
+            "row_count",
+            "column_count",
+            "duplicate_row_count",
+            "duplicate_row_count_exact",
+            "columns",
+            "evidence_classification",
+            "evidence_reference"
+          ],
+          "title": "TableInspection",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "candidate_identifiers": {
+          "items": {
+            "$ref": "#/$defs/CandidateIdentifier"
+          },
+          "title": "Candidate Identifiers",
+          "type": "array"
+        },
+        "candidate_keys": {
+          "items": {
+            "$ref": "#/$defs/CandidateKey"
+          },
+          "title": "Candidate Keys",
+          "type": "array"
+        },
+        "dataset_id": {
+          "exclusiveMinimum": 0,
+          "title": "Dataset Id",
+          "type": "integer"
+        },
+        "evidence_references": {
+          "items": {
+            "$ref": "#/$defs/EvidenceReference"
+          },
+          "title": "Evidence References",
+          "type": "array"
+        },
+        "file_id": {
+          "exclusiveMinimum": 0,
+          "title": "File Id",
+          "type": "integer"
+        },
+        "filename": {
+          "title": "Filename",
+          "type": "string"
+        },
+        "handoff_id": {
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Handoff Id",
+          "type": "string"
+        },
+        "inspection_execution_id": {
+          "title": "Inspection Execution Id",
+          "type": "null"
+        },
+        "limitations": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Limitations",
+          "type": "array"
+        },
+        "preprocessing_recommendations": {
+          "items": {
+            "$ref": "#/$defs/PreprocessingRecommendation"
+          },
+          "title": "Preprocessing Recommendations",
+          "type": "array"
+        },
+        "quality_findings": {
+          "items": {
+            "$ref": "#/$defs/QualityFinding"
+          },
+          "title": "Quality Findings",
+          "type": "array"
+        },
+        "quality_status": {
+          "title": "Quality Status",
+          "type": "string"
+        },
+        "relationships": {
+          "items": {
+            "$ref": "#/$defs/RelationshipHypothesis"
+          },
+          "title": "Relationships",
+          "type": "array"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "source_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Sha256"
+        },
+        "source_updated_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Updated At"
+        },
+        "status": {
+          "enum": [
+            "ready",
+            "partial",
+            "failed"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "tables": {
+          "items": {
+            "$ref": "#/$defs/TableInspection"
+          },
+          "title": "Tables",
+          "type": "array"
+        },
+        "unresolved": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Unresolved",
+          "type": "array"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Warnings",
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema_version",
+        "handoff_id",
+        "status",
+        "dataset_id",
+        "file_id",
+        "filename",
+        "source_sha256",
+        "source_updated_at",
+        "inspection_execution_id",
+        "tables",
+        "quality_status",
+        "warnings",
+        "limitations",
+        "quality_findings",
+        "candidate_keys",
+        "candidate_identifiers",
+        "relationships",
+        "preprocessing_recommendations",
+        "evidence_references",
+        "unresolved"
+      ],
+      "title": "InspectionHandoff",
+      "type": "object"
+    },
+    "presentation_result": {
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": {
+          "const": 1,
+          "title": "Contract Version",
+          "type": "integer"
+        },
+        "evidence_references": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "maxItems": 32,
+          "title": "Evidence References",
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "completed",
+            "partial",
+            "blocked",
+            "unsupported"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 800,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "visualization_specification": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Visualization Specification"
+        }
+      },
+      "required": [
+        "contract_version",
+        "status",
+        "summary",
+        "evidence_references"
+      ],
+      "title": "PresentationResult",
+      "type": "object"
+    },
+    "specialist_handoff": {
+      "additionalProperties": false,
+      "properties": {
+        "actual_operations": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "maxItems": 8,
+          "title": "Actual Operations",
+          "type": "array"
+        },
+        "artifact_references": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "maxItems": 32,
+          "title": "Artifact References",
+          "type": "array"
+        },
+        "contract_version": {
+          "const": 1,
+          "title": "Contract Version",
+          "type": "integer"
+        },
+        "dataset_id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Dataset Id"
+        },
+        "dependency_task_ids": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 8,
+          "title": "Dependency Task Ids",
+          "type": "array"
+        },
+        "executed_operation": {
+          "anyOf": [
+            {
+              "maxLength": 96,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Executed Operation"
+        },
+        "file_id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "File Id"
+        },
+        "output": {
+          "additionalProperties": true,
+          "title": "Output",
+          "type": "object"
+        },
+        "parameters": {
+          "additionalProperties": true,
+          "title": "Parameters",
+          "type": "object"
+        },
+        "recommended_operation": {
+          "anyOf": [
+            {
+              "maxLength": 96,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Recommended Operation"
+        },
+        "requested_operation": {
+          "maxLength": 96,
+          "minLength": 1,
+          "title": "Requested Operation",
+          "type": "string"
+        },
+        "source_fingerprint": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Source Fingerprint",
+          "type": "string"
+        },
+        "stage": {
+          "enum": [
+            "data_intelligence",
+            "analytics_modelling",
+            "insights_visualization"
+          ],
+          "title": "Stage",
+          "type": "string"
+        },
+        "verified": {
+          "title": "Verified",
+          "type": "boolean"
+        },
+        "verified_schema": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Verified Schema"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "title": "Warnings",
+          "type": "array"
+        }
+      },
+      "required": [
+        "contract_version",
+        "stage",
+        "requested_operation",
+        "verified",
+        "source_fingerprint",
+        "dataset_id",
+        "file_id",
+        "dependency_task_ids",
+        "parameters",
+        "verified_schema",
+        "actual_operations",
+        "warnings",
+        "artifact_references",
+        "output"
+      ],
+      "title": "SpecialistHandoff",
+      "type": "object"
+    },
+    "specialist_input": {
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "enum": [
+            "data_intelligence",
+            "analytics_modelling",
+            "insights_visualization"
+          ],
+          "title": "Agent",
+          "type": "string"
+        },
+        "context": {
+          "additionalProperties": true,
+          "title": "Context",
+          "type": "object"
+        },
+        "contract_version": {
+          "const": 1,
+          "title": "Contract Version",
+          "type": "integer"
+        },
+        "conversation_id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Conversation Id"
+        },
+        "dataset_id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Dataset Id"
+        },
+        "evidence_references": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "maxItems": 32,
+          "title": "Evidence References",
+          "type": "array"
+        },
+        "file_id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "File Id"
+        },
+        "objective": {
+          "maxLength": 8000,
+          "minLength": 1,
+          "title": "Objective",
+          "type": "string"
+        },
+        "permitted_tools": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 8,
+          "title": "Permitted Tools",
+          "type": "array"
+        },
+        "source_fingerprint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Fingerprint"
+        },
+        "task_id": {
+          "maxLength": 80,
+          "minLength": 32,
+          "title": "Task Id",
+          "type": "string"
+        },
+        "workflow_id": {
+          "maxLength": 32,
+          "minLength": 32,
+          "title": "Workflow Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "contract_version",
+        "workflow_id",
+        "task_id",
+        "conversation_id",
+        "agent",
+        "objective",
+        "dataset_id",
+        "file_id",
+        "source_fingerprint",
+        "evidence_references",
+        "permitted_tools",
+        "context"
+      ],
+      "title": "SpecialistInputContract",
+      "type": "object"
+    }
+  },
+  "structured_output_contracts_sha256": "0da6be27441cad8b153fdd870fedcd88ac0c930d7f2822cb497a0e0ebeb9fc6f",
+  "tokenizer": {
+    "chat_template": "Use the pinned tokenizer's embedded template",
+    "id": "Qwen/Qwen3-8B",
+    "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+    "thinking_mode": false,
+    "trust_remote_code": false
+  },
+  "tool_schemas": [
+    {
+      "function": {
+        "description": "Execute explicitly supplied inner/left join keys across 2 to 4 authorized dataset tables, then calculate deterministic grouped metrics. Use only user-approved exact keys; many-to-many joins require explicit approval and remain row-limited.",
+        "name": "analyze_multiple_datasets",
+        "parameters": {
+          "$defs": {
+            "MultiDatasetJoinArguments": {
+              "additionalProperties": false,
+              "properties": {
+                "allow_many_to_many": {
+                  "default": false,
+                  "title": "Allow Many To Many",
+                  "type": "boolean"
+                },
+                "join_type": {
+                  "enum": [
+                    "inner",
+                    "left"
+                  ],
+                  "title": "Join Type",
+                  "type": "string"
+                },
+                "left_key": {
+                  "$ref": "#/$defs/MultiDatasetKeyArguments"
+                },
+                "right_key": {
+                  "$ref": "#/$defs/MultiDatasetKeyArguments"
+                }
+              },
+              "required": [
+                "left_key",
+                "right_key",
+                "join_type"
+              ],
+              "title": "MultiDatasetJoinArguments",
+              "type": "object"
+            },
+            "MultiDatasetKeyArguments": {
+              "additionalProperties": false,
+              "properties": {
+                "alias": {
+                  "pattern": "^[A-Za-z][A-Za-z0-9_]{0,31}$",
+                  "title": "Alias",
+                  "type": "string"
+                },
+                "column": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "title": "Column",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "alias",
+                "column"
+              ],
+              "title": "MultiDatasetKeyArguments",
+              "type": "object"
+            },
+            "MultiDatasetMetricArguments": {
+              "additionalProperties": false,
+              "properties": {
+                "column": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/MultiDatasetKeyArguments"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "name": {
+                  "maxLength": 64,
+                  "minLength": 1,
+                  "title": "Name",
+                  "type": "string"
+                },
+                "operation": {
+                  "enum": [
+                    "count",
+                    "sum",
+                    "average",
+                    "minimum",
+                    "maximum",
+                    "distinct_count"
+                  ],
+                  "title": "Operation",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "operation"
+              ],
+              "title": "MultiDatasetMetricArguments",
+              "type": "object"
+            },
+            "MultiDatasetSourceArguments": {
+              "additionalProperties": false,
+              "properties": {
+                "alias": {
+                  "pattern": "^[A-Za-z][A-Za-z0-9_]{0,31}$",
+                  "title": "Alias",
+                  "type": "string"
+                },
+                "dataset_id": {
+                  "exclusiveMinimum": 0,
+                  "title": "Dataset Id",
+                  "type": "integer"
+                },
+                "file_id": {
+                  "exclusiveMinimum": 0,
+                  "title": "File Id",
+                  "type": "integer"
+                },
+                "table_index": {
+                  "default": 0,
+                  "minimum": 0,
+                  "title": "Table Index",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "alias",
+                "dataset_id",
+                "file_id"
+              ],
+              "title": "MultiDatasetSourceArguments",
+              "type": "object"
+            }
+          },
+          "additionalProperties": false,
+          "properties": {
+            "dimensions": {
+              "items": {
+                "$ref": "#/$defs/MultiDatasetKeyArguments"
+              },
+              "maxItems": 16,
+              "title": "Dimensions",
+              "type": "array"
+            },
+            "joins": {
+              "items": {
+                "$ref": "#/$defs/MultiDatasetJoinArguments"
+              },
+              "maxItems": 3,
+              "minItems": 1,
+              "title": "Joins",
+              "type": "array"
+            },
+            "metrics": {
+              "items": {
+                "$ref": "#/$defs/MultiDatasetMetricArguments"
+              },
+              "maxItems": 16,
+              "minItems": 1,
+              "title": "Metrics",
+              "type": "array"
+            },
+            "sources": {
+              "items": {
+                "$ref": "#/$defs/MultiDatasetSourceArguments"
+              },
+              "maxItems": 4,
+              "minItems": 2,
+              "title": "Sources",
+              "type": "array"
+            }
+          },
+          "required": [
+            "sources",
+            "joins",
+            "metrics"
+          ],
+          "title": "MultiDatasetAnalysisArguments",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Turn a completed, current stored EDA result into factual metric findings and deterministic charts with source provenance. This reports existing results and does not rerun analysis.",
+        "name": "generate_eda_evidence_report",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "analysis_id": {
+              "exclusiveMinimum": 0,
+              "title": "Analysis Id",
+              "type": "integer"
+            },
+            "chart_columns": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 8,
+              "title": "Chart Columns",
+              "type": "array"
+            },
+            "dataset_id": {
+              "exclusiveMinimum": 0,
+              "title": "Dataset Id",
+              "type": "integer"
+            },
+            "file_id": {
+              "exclusiveMinimum": 0,
+              "title": "File Id",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "dataset_id",
+            "file_id",
+            "analysis_id"
+          ],
+          "title": "EDAEvidenceReportArguments",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Calculate grouped metrics with the deterministic analytics engine, then return measured findings, validated chart specifications, source references, warnings, and provenance. All keys and metrics must be explicitly supplied; the model cannot provide chart values.",
+        "name": "generate_evidence_report",
+        "parameters": {
+          "$defs": {
+            "ChartSpecificationArguments": {
+              "additionalProperties": false,
+              "properties": {
+                "chart_type": {
+                  "enum": [
+                    "bar",
+                    "line",
+                    "scatter",
+                    "pie"
+                  ],
+                  "title": "Chart Type",
+                  "type": "string"
+                },
+                "series_field": {
+                  "anyOf": [
+                    {
+                      "maxLength": 255,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "title": "Series Field"
+                },
+                "title": {
+                  "maxLength": 120,
+                  "minLength": 1,
+                  "title": "Title",
+                  "type": "string"
+                },
+                "x_field": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "title": "X Field",
+                  "type": "string"
+                },
+                "y_field": {
+                  "maxLength": 64,
+                  "minLength": 1,
+                  "title": "Y Field",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "title",
+                "chart_type",
+                "x_field",
+                "y_field"
+              ],
+              "title": "ChartSpecificationArguments",
+              "type": "object"
+            },
+            "MultiDatasetJoinArguments": {
+              "additionalProperties": false,
+              "properties": {
+                "allow_many_to_many": {
+                  "default": false,
+                  "title": "Allow Many To Many",
+                  "type": "boolean"
+                },
+                "join_type": {
+                  "enum": [
+                    "inner",
+                    "left"
+                  ],
+                  "title": "Join Type",
+                  "type": "string"
+                },
+                "left_key": {
+                  "$ref": "#/$defs/MultiDatasetKeyArguments"
+                },
+                "right_key": {
+                  "$ref": "#/$defs/MultiDatasetKeyArguments"
+                }
+              },
+              "required": [
+                "left_key",
+                "right_key",
+                "join_type"
+              ],
+              "title": "MultiDatasetJoinArguments",
+              "type": "object"
+            },
+            "MultiDatasetKeyArguments": {
+              "additionalProperties": false,
+              "properties": {
+                "alias": {
+                  "pattern": "^[A-Za-z][A-Za-z0-9_]{0,31}$",
+                  "title": "Alias",
+                  "type": "string"
+                },
+                "column": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "title": "Column",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "alias",
+                "column"
+              ],
+              "title": "MultiDatasetKeyArguments",
+              "type": "object"
+            },
+            "MultiDatasetMetricArguments": {
+              "additionalProperties": false,
+              "properties": {
+                "column": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/MultiDatasetKeyArguments"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "name": {
+                  "maxLength": 64,
+                  "minLength": 1,
+                  "title": "Name",
+                  "type": "string"
+                },
+                "operation": {
+                  "enum": [
+                    "count",
+                    "sum",
+                    "average",
+                    "minimum",
+                    "maximum",
+                    "distinct_count"
+                  ],
+                  "title": "Operation",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "operation"
+              ],
+              "title": "MultiDatasetMetricArguments",
+              "type": "object"
+            },
+            "MultiDatasetSourceArguments": {
+              "additionalProperties": false,
+              "properties": {
+                "alias": {
+                  "pattern": "^[A-Za-z][A-Za-z0-9_]{0,31}$",
+                  "title": "Alias",
+                  "type": "string"
+                },
+                "dataset_id": {
+                  "exclusiveMinimum": 0,
+                  "title": "Dataset Id",
+                  "type": "integer"
+                },
+                "file_id": {
+                  "exclusiveMinimum": 0,
+                  "title": "File Id",
+                  "type": "integer"
+                },
+                "table_index": {
+                  "default": 0,
+                  "minimum": 0,
+                  "title": "Table Index",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "alias",
+                "dataset_id",
+                "file_id"
+              ],
+              "title": "MultiDatasetSourceArguments",
+              "type": "object"
+            }
+          },
+          "additionalProperties": false,
+          "properties": {
+            "charts": {
+              "items": {
+                "$ref": "#/$defs/ChartSpecificationArguments"
+              },
+              "maxItems": 8,
+              "title": "Charts",
+              "type": "array"
+            },
+            "dimensions": {
+              "items": {
+                "$ref": "#/$defs/MultiDatasetKeyArguments"
+              },
+              "maxItems": 16,
+              "title": "Dimensions",
+              "type": "array"
+            },
+            "joins": {
+              "items": {
+                "$ref": "#/$defs/MultiDatasetJoinArguments"
+              },
+              "maxItems": 3,
+              "minItems": 1,
+              "title": "Joins",
+              "type": "array"
+            },
+            "metrics": {
+              "items": {
+                "$ref": "#/$defs/MultiDatasetMetricArguments"
+              },
+              "maxItems": 16,
+              "minItems": 1,
+              "title": "Metrics",
+              "type": "array"
+            },
+            "sources": {
+              "items": {
+                "$ref": "#/$defs/MultiDatasetSourceArguments"
+              },
+              "maxItems": 4,
+              "minItems": 2,
+              "title": "Sources",
+              "type": "array"
+            }
+          },
+          "required": [
+            "sources",
+            "joins",
+            "metrics"
+          ],
+          "title": "EvidenceReportArguments",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Retrieve a saved exploratory data analysis result.",
+        "name": "get_eda_result",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "analysis_id": {
+              "exclusiveMinimum": 0,
+              "title": "Analysis Id",
+              "type": "integer"
+            },
+            "dataset_id": {
+              "exclusiveMinimum": 0,
+              "title": "Dataset Id",
+              "type": "integer"
+            },
+            "file_id": {
+              "exclusiveMinimum": 0,
+              "title": "File Id",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "dataset_id",
+            "file_id",
+            "analysis_id"
+          ],
+          "title": "EDAAnalysisArguments",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Build a versioned, schema-validated handoff from stored profile, quality, and current schema-analysis results. This does not execute preprocessing.",
+        "name": "get_inspection_handoff",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "dataset_id": {
+              "exclusiveMinimum": 0,
+              "title": "Dataset Id",
+              "type": "integer"
+            },
+            "file_id": {
+              "exclusiveMinimum": 0,
+              "title": "File Id",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "dataset_id",
+            "file_id"
+          ],
+          "title": "InspectionArguments",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Retrieve a stored deterministic profile for a ready dataset file. This does not recompute a profile.",
+        "name": "get_profile",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "dataset_id": {
+              "exclusiveMinimum": 0,
+              "title": "Dataset Id",
+              "type": "integer"
+            },
+            "file_id": {
+              "exclusiveMinimum": 0,
+              "title": "File Id",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "dataset_id",
+            "file_id"
+          ],
+          "title": "FileArguments",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Retrieve the stored quality report for a dataset file, summarized without sample values.",
+        "name": "get_quality_report",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "dataset_id": {
+              "exclusiveMinimum": 0,
+              "title": "Dataset Id",
+              "type": "integer"
+            },
+            "file_id": {
+              "exclusiveMinimum": 0,
+              "title": "File Id",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "dataset_id",
+            "file_id"
+          ],
+          "title": "FileArguments",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Retrieve a saved schema analysis including its structured relationship evidence and stale state.",
+        "name": "get_schema_analysis",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "analysis_id": {
+              "exclusiveMinimum": 0,
+              "title": "Analysis Id",
+              "type": "integer"
+            },
+            "dataset_id": {
+              "exclusiveMinimum": 0,
+              "title": "Dataset Id",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "dataset_id",
+            "analysis_id"
+          ],
+          "title": "SchemaAnalysisIdArguments",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "List datasets within a project.",
+        "name": "list_datasets",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "project_id": {
+              "exclusiveMinimum": 0,
+              "title": "Project Id",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "project_id"
+          ],
+          "title": "ProjectArguments",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "List saved exploratory analyses for a dataset file.",
+        "name": "list_eda_results",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "dataset_id": {
+              "exclusiveMinimum": 0,
+              "title": "Dataset Id",
+              "type": "integer"
+            },
+            "file_id": {
+              "exclusiveMinimum": 0,
+              "title": "File Id",
+              "type": "integer"
+            },
+            "limit": {
+              "default": 10,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            },
+            "offset": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "dataset_id",
+            "file_id"
+          ],
+          "title": "EDAHistoryArguments",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "List file names, readiness, and normalized table structure for a dataset. Storage keys and raw file values are never returned.",
+        "name": "list_files",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "dataset_id": {
+              "exclusiveMinimum": 0,
+              "title": "Dataset Id",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "dataset_id"
+          ],
+          "title": "DatasetArguments",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "List the projects currently available in this local InsightOS instance.",
+        "name": "list_projects",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {},
+          "title": "EmptyArguments",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "List saved schema analyses for a dataset.",
+        "name": "list_schema_analyses",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "dataset_id": {
+              "exclusiveMinimum": 0,
+              "title": "Dataset Id",
+              "type": "integer"
+            },
+            "limit": {
+              "default": 10,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            },
+            "offset": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "dataset_id"
+          ],
+          "title": "SchemaHistoryArguments",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Run the existing bounded ETL normalization for an explicitly requested ready file. Writes the verified normalized artifact and metadata; does not execute preprocessing transformations.",
+        "name": "normalize_file",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "dataset_id": {
+              "exclusiveMinimum": 0,
+              "title": "Dataset Id",
+              "type": "integer"
+            },
+            "file_id": {
+              "exclusiveMinimum": 0,
+              "title": "File Id",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "dataset_id",
+            "file_id"
+          ],
+          "title": "FileArguments",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Compare explicitly selected ready dataset tables and return explainable join-key candidates using names, types, uniqueness, null rates, and observed value overlap. Recommendations are hypotheses, not approved joins.",
+        "name": "recommend_multi_dataset_joins",
+        "parameters": {
+          "$defs": {
+            "MultiDatasetSourceArguments": {
+              "additionalProperties": false,
+              "properties": {
+                "alias": {
+                  "pattern": "^[A-Za-z][A-Za-z0-9_]{0,31}$",
+                  "title": "Alias",
+                  "type": "string"
+                },
+                "dataset_id": {
+                  "exclusiveMinimum": 0,
+                  "title": "Dataset Id",
+                  "type": "integer"
+                },
+                "file_id": {
+                  "exclusiveMinimum": 0,
+                  "title": "File Id",
+                  "type": "integer"
+                },
+                "table_index": {
+                  "default": 0,
+                  "minimum": 0,
+                  "title": "Table Index",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "alias",
+                "dataset_id",
+                "file_id"
+              ],
+              "title": "MultiDatasetSourceArguments",
+              "type": "object"
+            }
+          },
+          "additionalProperties": false,
+          "properties": {
+            "sources": {
+              "items": {
+                "$ref": "#/$defs/MultiDatasetSourceArguments"
+              },
+              "maxItems": 4,
+              "minItems": 2,
+              "title": "Sources",
+              "type": "array"
+            }
+          },
+          "required": [
+            "sources"
+          ],
+          "title": "MultiDatasetRecommendationArguments",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Run the existing deterministic univariate, bivariate, or multivariate EDA engine on explicitly selected columns of a normalized file.",
+        "name": "run_eda_analysis",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "analysis_type": {
+              "enum": [
+                "univariate",
+                "bivariate",
+                "multivariate"
+              ],
+              "title": "Analysis Type",
+              "type": "string"
+            },
+            "dataset_id": {
+              "exclusiveMinimum": 0,
+              "title": "Dataset Id",
+              "type": "integer"
+            },
+            "file_id": {
+              "exclusiveMinimum": 0,
+              "title": "File Id",
+              "type": "integer"
+            },
+            "selected_columns": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 16,
+              "minItems": 1,
+              "title": "Selected Columns",
+              "type": "array"
+            },
+            "table_index": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Table Index",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "dataset_id",
+            "file_id",
+            "analysis_type",
+            "selected_columns"
+          ],
+          "title": "EDAExecutionArguments",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Run the deterministic monthly trend and seasonality forecast on an explicitly selected authorized normalized file. Select the time column, numeric target, sum aggregation, and a 1–24 month horizon. Returns a persisted workflow result with measured holdout metrics, historical observations, forecast values, provenance, warnings, and chart specification.",
+        "name": "run_monthly_forecast",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "aggregation": {
+              "const": "sum",
+              "default": "sum",
+              "title": "Aggregation",
+              "type": "string"
+            },
+            "dataset_id": {
+              "exclusiveMinimum": 0,
+              "title": "Dataset Id",
+              "type": "integer"
+            },
+            "date_column": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Date Column",
+              "type": "string"
+            },
+            "file_id": {
+              "exclusiveMinimum": 0,
+              "title": "File Id",
+              "type": "integer"
+            },
+            "horizon": {
+              "default": 3,
+              "maximum": 24,
+              "minimum": 1,
+              "title": "Horizon",
+              "type": "integer"
+            },
+            "table_index": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Table Index",
+              "type": "integer"
+            },
+            "target_column": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Target Column",
+              "type": "string"
+            }
+          },
+          "required": [
+            "dataset_id",
+            "file_id",
+            "date_column",
+            "target_column"
+          ],
+          "title": "MonthlyForecastArguments",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Run the existing deterministic quality-analysis engine for an explicitly requested normalized file. Persists its quality report.",
+        "name": "run_quality_analysis",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "dataset_id": {
+              "exclusiveMinimum": 0,
+              "title": "Dataset Id",
+              "type": "integer"
+            },
+            "file_id": {
+              "exclusiveMinimum": 0,
+              "title": "File Id",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "dataset_id",
+            "file_id"
+          ],
+          "title": "FileArguments",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ],
+  "tool_schemas_sha256": "fb8ffd98bad4d384b13d6ac4d74287110e69848814447ac562d8b0f63493ec3c",
+  "training_authorized": false
+}

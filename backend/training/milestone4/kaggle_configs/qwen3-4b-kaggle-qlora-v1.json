@@ -1,0 +1,68 @@
+{
+  "approval_gates": {
+    "dataset_level_human_validation_is_provenance_only": true,
+    "require_independent_baseline_before_training": true,
+    "require_record_level_approval_before_training": true,
+    "training_authorized": false
+  },
+  "base_method": "QLoRA",
+  "blockers": [
+    "Kaggle QLoRA compatibility has not been executed or verified.",
+    "Dataset-level provenance does not approve examples individually.",
+    "The held-out domain split is narrow and requires human evaluation."
+  ],
+  "config_version": "insightos-kaggle-qlora-preparation-v1",
+  "dataset_path": "backend/training/reference_eda/dataset_v3/",
+  "dataset_sha256": "d06a74eaea6b417ffdb08bb47303b6b58e88a203ef1b49080d5c3617850dede5",
+  "dataset_version": "insightos-reference-eda-v3",
+  "kaggle_candidate_environment": {
+    "compatibility_status": "unverified_without Kaggle execution evidence",
+    "do_not_infer_from_backend_or_reference_eda_environment": true,
+    "notebook_runtime": "Kaggle-provided Linux/CUDA; exact versions recorded at run",
+    "package_versions_observed": null,
+    "reference_notebook_method": "Unsloth FastLanguageModel QLoRA"
+  },
+  "load_in_4bit": true,
+  "lora": {
+    "alpha": 16,
+    "dropout": 0.05,
+    "rank": 8,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ]
+  },
+  "model_id": "Qwen/Qwen3-4B",
+  "model_revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+  "quantization": {
+    "compute_dtype": "float16",
+    "double_quantization": true,
+    "type": "NF4"
+  },
+  "runtime_capture_required": [
+    "python",
+    "torch",
+    "transformers",
+    "accelerate",
+    "bitsandbytes",
+    "peft",
+    "trl",
+    "unsloth",
+    "cuda",
+    "gpu_name_and_vram"
+  ],
+  "sequence_length": 2048,
+  "status": "preparation_only",
+  "training_parameters": {
+    "gradient_accumulation_steps": 8,
+    "gradient_checkpointing": true,
+    "num_train_epochs": 1,
+    "per_device_batch_size": 1
+  },
+  "training_started": false
+}

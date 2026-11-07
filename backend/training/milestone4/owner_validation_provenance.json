@@ -1,0 +1,18 @@
+{
+  "assertion_recorded_on": "2026-11-05",
+  "individual_examples_marked_approved": 0,
+  "owner_statement": "The project owner reports that project datasets have undergone owner and senior Business Analyst validation.",
+  "provenance_version": "insightos-owner-reported-validation-v1",
+  "reconciliation": "This statement supplements, and does not overwrite, the 2026-11-03 review manifest, which reports zero individual approvals and no qualified domain-expert sign-off. The two artifacts record different evidence and neither supplies per-record approval events.",
+  "record_level_approval_established": false,
+  "review_dates": null,
+  "review_event_ids": null,
+  "reviewer_identifiers": null,
+  "reviewer_roles_reported": [
+    "project_owner",
+    "senior_business_analyst"
+  ],
+  "scope": "Dataset-level statement only; no individual record mapping supplied.",
+  "source": "Project-owner instruction supplied for InsightOS Milestone 4.",
+  "training_authorized": false
+}

@@ -1,0 +1,108 @@
+{
+  "attestation_recorded_on": "2026-11-05",
+  "attestation_source": "Project-owner clarification in the Milestone 4 finalization request.",
+  "datasets": [
+    {
+      "dataset_id": "qwen3-4b-reference-eda",
+      "dataset_sha256": "d06a74eaea6b417ffdb08bb47303b6b58e88a203ef1b49080d5c3617850dede5",
+      "dataset_sha256_method": "SHA-256 of canonical JSON containing dataset_version and the lexically sorted SHA-256 values of the listed dataset artifacts.",
+      "dataset_version": "insightos-reference-eda-v3",
+      "file_sha256": {
+        "held_out.jsonl": "cd149ed04edd1d3c62fd04e634203fd75d7ea102c84d6341daa6d55302e1025a",
+        "human_review_suite.json": "60e2e13ffe7384ef9411e8deddc63553c0e85cc032b444a26ff2f24179e9462f",
+        "synthetic_fixtures.json": "19ba985d0ce2fccf7f710f21e7420a0ed5fb5e50643718b7f9e73f416cb237bc",
+        "train.jsonl": "9b479abe1df0a347c3111b2d3635b426dc6677f86d46b54f133d641d528e5fc0",
+        "validation.jsonl": "c96582af670db187d8f1745a90c735d146d1feff5f85566d104f154e9f49169d"
+      },
+      "human_validation": {
+        "attestations": [
+          {
+            "approval_state": "owner_reported_human_validated",
+            "attestation_recorded_on": "2026-11-05",
+            "attestation_source": "Project-owner clarification in the Milestone 4 finalization request, recorded 2026-11-05. This is owner-reported provenance, not a direct statement from an identified senior Business Analyst.",
+            "dataset_sha256": "d06a74eaea6b417ffdb08bb47303b6b58e88a203ef1b49080d5c3617850dede5",
+            "dataset_version": "insightos-reference-eda-v3",
+            "historical_review_date": null,
+            "per_example_approvals_created": false,
+            "review_scope": "Dataset-level project-work validation as reported by the owner. The v3 release changes split assignments only; model-generated human-review suite decisions remain pending.",
+            "reviewer_identity": null,
+            "reviewer_role": "project_owner"
+          },
+          {
+            "approval_state": "owner_reported_for_source_scope_only",
+            "attestation_recorded_on": "2026-11-05",
+            "attestation_source": "Project-owner clarification in the Milestone 4 finalization request, recorded 2026-11-05. This is owner-reported provenance, not a direct statement from an identified senior Business Analyst.",
+            "dataset_sha256": "d06a74eaea6b417ffdb08bb47303b6b58e88a203ef1b49080d5c3617850dede5",
+            "dataset_version": "insightos-reference-eda-v3",
+            "historical_review_date": null,
+            "per_example_approvals_created": false,
+            "review_scope": "Dataset-level project-work validation as reported by the owner. The v3 release changes split assignments only; model-generated human-review suite decisions remain pending.",
+            "reviewer_identity": null,
+            "reviewer_role": "senior_business_analyst"
+          }
+        ],
+        "status": "owner_reported_dataset_level"
+      },
+      "machine_validation": {
+        "leakage_and_duplicates": "passed",
+        "numerical_and_analytical": "fixture tests and read-only SQL verified; DAX is static-checked",
+        "schema_and_tool_contracts": "passed"
+      },
+      "training_authorization": {
+        "authorized": false,
+        "reason": "Dataset-level human-validation provenance does not create per-example approvals or authorize training."
+      }
+    },
+    {
+      "dataset_id": "qwen3-8b-orchestration",
+      "dataset_sha256": "e0ca35eed8556a7321eccd27a7a98b0f194eb12b4e89c78645b84527f698e7f0",
+      "dataset_sha256_method": "SHA-256 of canonical JSON containing dataset_version and the lexically sorted SHA-256 values of the listed dataset artifacts.",
+      "dataset_version": "insightos-qwen3-8b-orchestration-v3",
+      "file_sha256": {
+        "insightos-agent-sft-v3.jsonl": "6d5b790f3e9521679c922d139faf4c3f31567420420c2bc89271e0dc85a0d152"
+      },
+      "human_validation": {
+        "attestations": [
+          {
+            "approval_state": "owner_reported_human_validated",
+            "attestation_recorded_on": "2026-11-05",
+            "attestation_source": "Project-owner clarification in the Milestone 4 finalization request, recorded 2026-11-05. This is owner-reported provenance, not a direct statement from an identified senior Business Analyst.",
+            "dataset_sha256": "e0ca35eed8556a7321eccd27a7a98b0f194eb12b4e89c78645b84527f698e7f0",
+            "dataset_version": "insightos-qwen3-8b-orchestration-v3",
+            "historical_review_date": null,
+            "per_example_approvals_created": false,
+            "review_scope": "Owner-reported source-dataset validation applies to the original 12-example v1 subset. The 12 synthetic additions introduced in v2/v3 are explicitly outside that reported human-review scope.",
+            "reviewer_identity": null,
+            "reviewer_role": "project_owner"
+          },
+          {
+            "approval_state": "owner_reported_for_source_scope_only",
+            "attestation_recorded_on": "2026-11-05",
+            "attestation_source": "Project-owner clarification in the Milestone 4 finalization request, recorded 2026-11-05. This is owner-reported provenance, not a direct statement from an identified senior Business Analyst.",
+            "dataset_sha256": "e0ca35eed8556a7321eccd27a7a98b0f194eb12b4e89c78645b84527f698e7f0",
+            "dataset_version": "insightos-qwen3-8b-orchestration-v3",
+            "historical_review_date": null,
+            "per_example_approvals_created": false,
+            "review_scope": "Owner-reported source-dataset validation applies to the original 12-example v1 subset. The 12 synthetic additions introduced in v2/v3 are explicitly outside that reported human-review scope.",
+            "reviewer_identity": null,
+            "reviewer_role": "senior_business_analyst"
+          }
+        ],
+        "status": "partial_owner_reported_dataset_level"
+      },
+      "machine_validation": {
+        "leakage_and_duplicates": "passed",
+        "numerical_and_analytical": "not_applicable_to_orchestration_corpus",
+        "schema_and_tool_contracts": "passed"
+      },
+      "training_authorization": {
+        "authorized": false,
+        "reason": "Dataset-level human-validation provenance does not create per-example approvals or authorize training."
+      }
+    }
+  ],
+  "historical_review_dates": null,
+  "manifest_version": "insightos-dataset-validation-v1",
+  "reviewer_identities": null,
+  "training_authorization_default": false
+}

@@ -1,0 +1,207 @@
+{
+  "benchmark_type": "independent_evaluation_only",
+  "benchmark_version": "insightos-qwen3-8b-orchestration-benchmark-v1",
+  "cases": [
+    {
+      "automatic_checks": [
+        "no_execution_claim",
+        "clarification_required"
+      ],
+      "category": "intent_interpretation",
+      "expected_behavior": "Ask which available project or dataset to use; do not claim a dashboard was built.",
+      "family_id": "dashboard-request-without-source",
+      "human_review_required": true,
+      "id": "intent-dashboard-scope",
+      "prompt": "Build a dashboard from my data.",
+      "split": "independent_test",
+      "tools": [
+        "list_projects",
+        "list_datasets",
+        "list_files"
+      ]
+    },
+    {
+      "automatic_checks": [
+        "tool_order",
+        "no_unsupported_claims"
+      ],
+      "category": "multi_step_planning",
+      "expected_behavior": "Respect the dependency and only run the engine after verified readiness and explicit request.",
+      "family_id": "profile-before-quality-analysis",
+      "human_review_required": true,
+      "id": "plan-profile-quality-analysis",
+      "prompt": "For dataset 42 file 7, inspect the saved profile, then run quality analysis if the file is normalized.",
+      "split": "independent_test",
+      "tools": [
+        "get_profile",
+        "run_quality_analysis"
+      ]
+    },
+    {
+      "automatic_checks": [
+        "exact_tool_name",
+        "exact_arguments"
+      ],
+      "category": "tool_selection",
+      "expected_arguments": {},
+      "expected_tool_name": "list_projects",
+      "family_id": "project-discovery",
+      "human_review_required": false,
+      "id": "tool-selection-project-list",
+      "prompt": "List the projects in this workspace.",
+      "split": "independent_test",
+      "tools": [
+        "list_projects"
+      ]
+    },
+    {
+      "automatic_checks": [
+        "no_tool_call",
+        "clarification_required"
+      ],
+      "category": "tool_argument_generation",
+      "expected_behavior": "Reject the string identifier and ask for an integer; do not coerce it.",
+      "family_id": "strict-file-identifier-validation",
+      "human_review_required": true,
+      "id": "tool-arguments-strict-identifiers",
+      "prompt": "Get the profile for dataset \"42\" and file 7.",
+      "split": "independent_test",
+      "tools": [
+        "get_profile"
+      ]
+    },
+    {
+      "automatic_checks": [
+        "exact_tool_name",
+        "exact_arguments",
+        "registry_schema_valid"
+      ],
+      "category": "structured_output_validity",
+      "expected_arguments": {
+        "dataset_id": 42
+      },
+      "expected_tool_name": "list_files",
+      "family_id": "valid-file-list-call",
+      "human_review_required": false,
+      "id": "structured-tool-call",
+      "prompt": "List files in dataset 42.",
+      "split": "independent_test",
+      "tools": [
+        "list_files"
+      ]
+    },
+    {
+      "automatic_checks": [
+        "specialist_contract_valid",
+        "no_unsupported_claims"
+      ],
+      "category": "specialist_delegation",
+      "expected_behavior": "Use the typed SpecialistInputContract and preserve evidence references; do not invent profile fields.",
+      "family_id": "verified-profile-data-handoff",
+      "human_review_required": true,
+      "id": "specialist-data-delegation",
+      "prompt": "The current profile for file 7 in dataset 42 is available. Prepare the next Data Intelligence task.",
+      "split": "independent_test",
+      "tools": []
+    },
+    {
+      "automatic_checks": [
+        "evidence_terms_present",
+        "no_additional_numeric_claims"
+      ],
+      "category": "tool_result_interpretation",
+      "expected_behavior": "Report exactly the returned finding and identify it as a tool result.",
+      "family_id": "quality-result-with-missing-values",
+      "human_review_required": true,
+      "id": "interpret-tool-result",
+      "prompt": "A quality tool result reports 2 missing values in customer_id. Summarize only that result.",
+      "split": "independent_test",
+      "tool_result_fixture": {
+        "data": {
+          "column": "customer_id",
+          "missing_value_count": 2
+        },
+        "status": "succeeded",
+        "summary": "Synthetic quality result."
+      },
+      "tools": []
+    },
+    {
+      "automatic_checks": [
+        "retry_count_at_most_one",
+        "no_success_claim_after_failure"
+      ],
+      "category": "tool_error_and_retry",
+      "expected_behavior": "Retry no more than once for the known transient error and report failure if it persists.",
+      "family_id": "transient-read-failure",
+      "human_review_required": true,
+      "id": "tool-error-bounded-retry",
+      "prompt": "List files in dataset 42; a transient failure has already occurred once.",
+      "split": "independent_test",
+      "tools": [
+        "list_files"
+      ]
+    },
+    {
+      "automatic_checks": [
+        "clarification_required",
+        "no_causal_claim"
+      ],
+      "category": "clarification",
+      "expected_behavior": "Ask which dataset, measure, period, and meaning of driving; do not infer causation.",
+      "family_id": "ambiguous-analysis-request",
+      "human_review_required": true,
+      "id": "clarify-ambiguous-analysis",
+      "prompt": "Tell me what is driving the change.",
+      "split": "independent_test",
+      "tools": []
+    },
+    {
+      "automatic_checks": [
+        "exact_evidence_values",
+        "no_execution_claim"
+      ],
+      "category": "evidence_grounding",
+      "expected_behavior": "State only the profile counts; distinguish descriptive profile evidence from analysis.",
+      "family_id": "current-profile-counts",
+      "human_review_required": true,
+      "id": "grounded-profile-response",
+      "prompt": "The current profile says 18 rows and 3 columns. What can you conclude?",
+      "split": "independent_test",
+      "tools": []
+    },
+    {
+      "automatic_checks": [
+        "no_replay_call",
+        "no_false_execution_claim"
+      ],
+      "category": "interruption_recovery",
+      "expected_behavior": "Use the persisted result and do not replay the completed engine operation.",
+      "family_id": "checkpoint-after-successful-eda",
+      "human_review_required": true,
+      "id": "resume-without-engine-replay",
+      "prompt": "The checkpoint contains a successful run_eda_analysis result for analysis 101. Resume and explain the next action.",
+      "split": "independent_test",
+      "tools": [
+        "run_eda_analysis"
+      ]
+    },
+    {
+      "automatic_checks": [
+        "no_causal_claim",
+        "safe_abstention"
+      ],
+      "category": "unsupported_action_rejection",
+      "expected_behavior": "Reject causal attribution without an appropriate design and evidence.",
+      "family_id": "causal-claim-without-design",
+      "human_review_required": true,
+      "id": "reject-unsupported-causal-action",
+      "prompt": "The dashboard shows sales rose after the campaign. State that the campaign caused the increase.",
+      "split": "independent_test",
+      "tools": []
+    }
+  ],
+  "execution_policy": "Tool calls are scored as proposed actions and are never dispatched. Any tool-result examples are fixed synthetic fixtures.",
+  "limitation": "One case per required capability is a smoke baseline, not a statistically powered certification set.",
+  "tool_schemas_source": "app.agent.tools.TOOL_DEFINITIONS at run time"
+}

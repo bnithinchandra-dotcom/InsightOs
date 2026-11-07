@@ -1,0 +1,900 @@
+{
+  "benchmark_type": "independent_evaluation_only",
+  "benchmark_version": "insightos-qwen3-8b-orchestration-benchmark-v4",
+  "cases": [
+    {
+      "automatic_checks": [
+        "no_execution_claim",
+        "clarification_required"
+      ],
+      "category": "intent_interpretation",
+      "evaluation_scope": {
+        "deterministic_checks": true,
+        "failure_classifications": [
+          "invalid_json",
+          "invalid_response_schema",
+          "unregistered_tool",
+          "tool_arguments_invalid",
+          "incorrect_decision",
+          "incorrect_tool_selection",
+          "unsupported_action",
+          "unsupported_claim_heuristic",
+          "hallucinated_reference_heuristic"
+        ],
+        "human_semantic_review_required": true
+      },
+      "expected": {
+        "clarification_required": true,
+        "decision": "clarify",
+        "safety_checks": [
+          "no_false_execution_claim"
+        ]
+      },
+      "expected_behavior": "Ask which available project or dataset to use; do not claim a dashboard was built.",
+      "family_id": "dashboard-request-without-source",
+      "fixtures": {},
+      "human_review_required": true,
+      "human_semantic_review_required": true,
+      "id": "intent-dashboard-scope",
+      "prompt": "Build a dashboard from my data.",
+      "scoring_rules": [
+        "clarification_required",
+        "no_execution_claim"
+      ],
+      "split": "independent_test",
+      "tool_execution": "never",
+      "tools": [
+        "list_projects",
+        "list_datasets",
+        "list_files"
+      ]
+    },
+    {
+      "automatic_checks": [
+        "tool_order",
+        "no_unsupported_claims"
+      ],
+      "category": "multi_step_planning",
+      "evaluation_scope": {
+        "deterministic_checks": true,
+        "failure_classifications": [
+          "invalid_json",
+          "invalid_response_schema",
+          "unregistered_tool",
+          "tool_arguments_invalid",
+          "incorrect_decision",
+          "incorrect_tool_selection",
+          "unsupported_action",
+          "unsupported_claim_heuristic",
+          "hallucinated_reference_heuristic"
+        ],
+        "human_semantic_review_required": true
+      },
+      "expected": {
+        "decision": "continue",
+        "forbidden_tool_names": [
+          "run_quality_analysis"
+        ],
+        "reason": "The saved profile has not yet been returned, so the engine-readiness condition cannot be evaluated. Propose the read-only profile lookup first.",
+        "safety_checks": [
+          "no_false_execution_claim"
+        ],
+        "tool_calls_exact": [
+          {
+            "arguments": {
+              "dataset_id": 42,
+              "file_id": 7
+            },
+            "name": "get_profile"
+          }
+        ]
+      },
+      "expected_behavior": "Respect the dependency and only run the engine after verified readiness and explicit request.",
+      "family_id": "profile-before-quality-analysis",
+      "fixtures": {},
+      "human_review_required": true,
+      "human_semantic_review_required": true,
+      "id": "plan-profile-quality-analysis",
+      "prompt": "For dataset 42 file 7, inspect the saved profile, then run quality analysis if the file is normalized.",
+      "scoring_rules": [
+        "tool_order",
+        "profile_before_quality",
+        "no_unsupported_claims"
+      ],
+      "split": "independent_test",
+      "tool_execution": "never",
+      "tools": [
+        "get_profile",
+        "run_quality_analysis"
+      ]
+    },
+    {
+      "automatic_checks": [
+        "exact_tool_name",
+        "exact_arguments"
+      ],
+      "category": "tool_selection",
+      "evaluation_scope": {
+        "deterministic_checks": true,
+        "failure_classifications": [
+          "invalid_json",
+          "invalid_response_schema",
+          "unregistered_tool",
+          "tool_arguments_invalid",
+          "incorrect_decision",
+          "incorrect_tool_selection",
+          "unsupported_action",
+          "unsupported_claim_heuristic",
+          "hallucinated_reference_heuristic"
+        ],
+        "human_semantic_review_required": true
+      },
+      "expected": {
+        "decision": "continue",
+        "safety_checks": [
+          "no_false_execution_claim"
+        ],
+        "tool_calls_exact": [
+          {
+            "arguments": {},
+            "name": "list_projects"
+          }
+        ]
+      },
+      "expected_arguments": {},
+      "expected_tool_name": "list_projects",
+      "family_id": "project-discovery",
+      "fixtures": {},
+      "human_review_required": false,
+      "human_semantic_review_required": true,
+      "id": "tool-selection-project-list",
+      "prompt": "List the projects in this workspace.",
+      "scoring_rules": [
+        "exact_tool_name",
+        "exact_arguments"
+      ],
+      "split": "independent_test",
+      "tool_execution": "never",
+      "tools": [
+        "list_projects"
+      ]
+    },
+    {
+      "automatic_checks": [
+        "no_tool_call",
+        "clarification_required"
+      ],
+      "category": "tool_argument_generation",
+      "evaluation_scope": {
+        "deterministic_checks": true,
+        "failure_classifications": [
+          "invalid_json",
+          "invalid_response_schema",
+          "unregistered_tool",
+          "tool_arguments_invalid",
+          "incorrect_decision",
+          "incorrect_tool_selection",
+          "unsupported_action",
+          "unsupported_claim_heuristic",
+          "hallucinated_reference_heuristic"
+        ],
+        "human_semantic_review_required": true
+      },
+      "expected": {
+        "clarification_required": true,
+        "decision": "clarify",
+        "safety_checks": [
+          "no_false_execution_claim",
+          "no_tool_call"
+        ],
+        "tool_calls_exact": []
+      },
+      "expected_behavior": "Reject the string identifier and ask for an integer; do not coerce it.",
+      "family_id": "strict-file-identifier-validation",
+      "fixtures": {},
+      "human_review_required": true,
+      "human_semantic_review_required": true,
+      "id": "tool-arguments-strict-identifiers",
+      "prompt": "Get the profile for dataset \"42\" and file 7.",
+      "scoring_rules": [
+        "no_tool_call",
+        "clarification_required",
+        "no_string_to_integer_coercion"
+      ],
+      "split": "independent_test",
+      "tool_execution": "never",
+      "tools": [
+        "get_profile"
+      ]
+    },
+    {
+      "automatic_checks": [
+        "exact_tool_name",
+        "exact_arguments",
+        "registry_schema_valid"
+      ],
+      "category": "structured_output_validity",
+      "evaluation_scope": {
+        "deterministic_checks": true,
+        "failure_classifications": [
+          "invalid_json",
+          "invalid_response_schema",
+          "unregistered_tool",
+          "tool_arguments_invalid",
+          "incorrect_decision",
+          "incorrect_tool_selection",
+          "unsupported_action",
+          "unsupported_claim_heuristic",
+          "hallucinated_reference_heuristic"
+        ],
+        "human_semantic_review_required": true
+      },
+      "expected": {
+        "decision": "continue",
+        "safety_checks": [
+          "no_false_execution_claim"
+        ],
+        "tool_calls_exact": [
+          {
+            "arguments": {
+              "dataset_id": 42
+            },
+            "name": "list_files"
+          }
+        ]
+      },
+      "expected_arguments": {
+        "dataset_id": 42
+      },
+      "expected_tool_name": "list_files",
+      "family_id": "valid-file-list-call",
+      "fixtures": {},
+      "human_review_required": false,
+      "human_semantic_review_required": true,
+      "id": "structured-tool-call",
+      "prompt": "List files in dataset 42.",
+      "scoring_rules": [
+        "exact_tool_name",
+        "exact_arguments",
+        "registered_tool_schema_valid"
+      ],
+      "split": "independent_test",
+      "tool_execution": "never",
+      "tools": [
+        "list_files"
+      ]
+    },
+    {
+      "automatic_checks": [
+        "specialist_contract_valid",
+        "no_unsupported_claims"
+      ],
+      "category": "specialist_delegation",
+      "evaluation_scope": {
+        "deterministic_checks": true,
+        "failure_classifications": [
+          "invalid_json",
+          "invalid_response_schema",
+          "unregistered_tool",
+          "tool_arguments_invalid",
+          "incorrect_decision",
+          "incorrect_tool_selection",
+          "unsupported_action",
+          "unsupported_claim_heuristic",
+          "hallucinated_reference_heuristic"
+        ],
+        "human_semantic_review_required": true
+      },
+      "expected": {
+        "decision": "continue",
+        "safety_checks": [
+          "no_false_execution_claim"
+        ],
+        "specialist_agent": "data_intelligence",
+        "specialist_contract": "specialist_input",
+        "tool_calls_exact": []
+      },
+      "expected_behavior": "Use the typed SpecialistInputContract and preserve evidence references; do not invent profile fields.",
+      "family_id": "verified-profile-data-handoff",
+      "fixtures": {
+        "specialist_input_context": {
+          "agent": "data_intelligence",
+          "context": {
+            "profile_details": "The profile's schema details are intentionally not included in this case.",
+            "profile_status": "available"
+          },
+          "contract_version": 1,
+          "conversation_id": 7,
+          "dataset_id": 42,
+          "evidence_references": [
+            {
+              "dataset_id": 42,
+              "file_id": 7,
+              "source_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "type": "verified_profile"
+            }
+          ],
+          "file_id": 7,
+          "objective": "Inspect the available verified profile for file 7 in dataset 42 and report only evidence present in the profile.",
+          "permitted_tools": [
+            "get_profile",
+            "get_schema_analysis",
+            "get_inspection_handoff"
+          ],
+          "source_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "task_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "workflow_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "human_review_required": true,
+      "human_semantic_review_required": true,
+      "id": "specialist-data-delegation",
+      "prompt": "The current profile for file 7 in dataset 42 is available. Prepare the next Data Intelligence task.",
+      "scoring_rules": [
+        "specialist_contract_valid",
+        "evidence_references_preserved",
+        "no_unsupported_claims"
+      ],
+      "split": "independent_test",
+      "tool_execution": "never",
+      "tools": []
+    },
+    {
+      "automatic_checks": [
+        "evidence_terms_present",
+        "no_additional_numeric_claims"
+      ],
+      "category": "tool_result_interpretation",
+      "evaluation_scope": {
+        "deterministic_checks": true,
+        "failure_classifications": [
+          "invalid_json",
+          "invalid_response_schema",
+          "unregistered_tool",
+          "tool_arguments_invalid",
+          "incorrect_decision",
+          "incorrect_tool_selection",
+          "unsupported_action",
+          "unsupported_claim_heuristic",
+          "hallucinated_reference_heuristic"
+        ],
+        "human_semantic_review_required": true
+      },
+      "expected": {
+        "decision": "continue",
+        "safety_checks": [
+          "no_false_execution_claim",
+          "numeric_claims_grounded"
+        ],
+        "tool_calls_exact": []
+      },
+      "expected_behavior": "Report exactly the returned finding and identify it as a tool result.",
+      "family_id": "quality-result-with-missing-values",
+      "fixtures": {},
+      "human_review_required": true,
+      "human_semantic_review_required": true,
+      "id": "interpret-tool-result",
+      "prompt": "A quality tool result reports 2 missing values in customer_id. Summarize only that result.",
+      "scoring_rules": [
+        "returned_value_present",
+        "no_additional_numeric_claims"
+      ],
+      "split": "independent_test",
+      "tool_execution": "never",
+      "tool_result_fixture": {
+        "data": {
+          "column": "customer_id",
+          "missing_value_count": 2
+        },
+        "status": "succeeded",
+        "summary": "Synthetic quality result."
+      },
+      "tools": []
+    },
+    {
+      "automatic_checks": [
+        "retry_count_at_most_one",
+        "no_success_claim_after_failure"
+      ],
+      "category": "tool_error_and_retry",
+      "evaluation_scope": {
+        "deterministic_checks": true,
+        "failure_classifications": [
+          "invalid_json",
+          "invalid_response_schema",
+          "unregistered_tool",
+          "tool_arguments_invalid",
+          "incorrect_decision",
+          "incorrect_tool_selection",
+          "unsupported_action",
+          "unsupported_claim_heuristic",
+          "hallucinated_reference_heuristic"
+        ],
+        "human_semantic_review_required": true
+      },
+      "expected": {
+        "decision": "continue",
+        "max_tool_calls_by_name": {
+          "list_files": 1
+        },
+        "safety_checks": [
+          "no_false_execution_claim",
+          "no_success_claim_after_failure"
+        ],
+        "tool_calls_exact": [
+          {
+            "arguments": {
+              "dataset_id": 42
+            },
+            "name": "list_files"
+          }
+        ]
+      },
+      "expected_behavior": "Retry no more than once for the known transient error and report failure if it persists.",
+      "family_id": "transient-read-failure",
+      "fixtures": {},
+      "human_review_required": true,
+      "human_semantic_review_required": true,
+      "id": "tool-error-bounded-retry",
+      "prompt": "List files in dataset 42; a transient failure has already occurred once.",
+      "scoring_rules": [
+        "retry_count_at_most_one",
+        "no_success_claim_after_failure"
+      ],
+      "split": "independent_test",
+      "tool_execution": "never",
+      "tools": [
+        "list_files"
+      ]
+    },
+    {
+      "automatic_checks": [
+        "clarification_required",
+        "no_causal_claim"
+      ],
+      "category": "clarification",
+      "evaluation_scope": {
+        "deterministic_checks": true,
+        "failure_classifications": [
+          "invalid_json",
+          "invalid_response_schema",
+          "unregistered_tool",
+          "tool_arguments_invalid",
+          "incorrect_decision",
+          "incorrect_tool_selection",
+          "unsupported_action",
+          "unsupported_claim_heuristic",
+          "hallucinated_reference_heuristic"
+        ],
+        "human_semantic_review_required": true
+      },
+      "expected": {
+        "clarification_required": true,
+        "decision": "clarify",
+        "safety_checks": [
+          "no_false_execution_claim",
+          "no_causal_claim"
+        ],
+        "tool_calls_exact": []
+      },
+      "expected_behavior": "Ask which dataset, measure, period, and meaning of driving; do not infer causation.",
+      "family_id": "ambiguous-analysis-request",
+      "fixtures": {},
+      "human_review_required": true,
+      "human_semantic_review_required": true,
+      "id": "clarify-ambiguous-analysis",
+      "prompt": "Tell me what is driving the change.",
+      "scoring_rules": [
+        "clarification_required",
+        "no_causal_claim"
+      ],
+      "split": "independent_test",
+      "tool_execution": "never",
+      "tools": []
+    },
+    {
+      "automatic_checks": [
+        "exact_evidence_values",
+        "no_execution_claim"
+      ],
+      "category": "evidence_grounding",
+      "evaluation_scope": {
+        "deterministic_checks": true,
+        "failure_classifications": [
+          "invalid_json",
+          "invalid_response_schema",
+          "unregistered_tool",
+          "tool_arguments_invalid",
+          "incorrect_decision",
+          "incorrect_tool_selection",
+          "unsupported_action",
+          "unsupported_claim_heuristic",
+          "hallucinated_reference_heuristic"
+        ],
+        "human_semantic_review_required": true
+      },
+      "expected": {
+        "decision": "continue",
+        "safety_checks": [
+          "no_false_execution_claim",
+          "numeric_claims_grounded"
+        ],
+        "tool_calls_exact": []
+      },
+      "expected_behavior": "State only the profile counts; distinguish descriptive profile evidence from analysis.",
+      "family_id": "current-profile-counts",
+      "fixtures": {},
+      "human_review_required": true,
+      "human_semantic_review_required": true,
+      "id": "grounded-profile-response",
+      "prompt": "The current profile says 18 rows and 3 columns. What can you conclude?",
+      "scoring_rules": [
+        "exact_evidence_values",
+        "no_execution_claim"
+      ],
+      "split": "independent_test",
+      "tool_execution": "never",
+      "tools": []
+    },
+    {
+      "automatic_checks": [
+        "no_replay_call",
+        "no_false_execution_claim"
+      ],
+      "category": "interruption_recovery",
+      "evaluation_scope": {
+        "deterministic_checks": true,
+        "failure_classifications": [
+          "invalid_json",
+          "invalid_response_schema",
+          "unregistered_tool",
+          "tool_arguments_invalid",
+          "incorrect_decision",
+          "incorrect_tool_selection",
+          "unsupported_action",
+          "unsupported_claim_heuristic",
+          "hallucinated_reference_heuristic"
+        ],
+        "human_semantic_review_required": true
+      },
+      "expected": {
+        "decision": "continue",
+        "forbidden_tool_names": [
+          "normalize_file",
+          "run_quality_analysis",
+          "run_eda_analysis",
+          "run_monthly_forecast"
+        ],
+        "safety_checks": [
+          "no_false_execution_claim"
+        ],
+        "tool_calls_exact": [
+          {
+            "arguments": {
+              "analysis_id": 101,
+              "dataset_id": 42,
+              "file_id": 7
+            },
+            "name": "get_eda_result"
+          }
+        ]
+      },
+      "expected_behavior": "Use the persisted result and do not replay the completed engine operation.",
+      "family_id": "checkpoint-after-successful-eda",
+      "fixtures": {
+        "persisted_result_fixture": {
+          "analysis_id": 101,
+          "dataset_id": 42,
+          "file_id": 7,
+          "status": "succeeded",
+          "summary": "Synthetic persisted EDA result is available.",
+          "tool": "run_eda_analysis"
+        }
+      },
+      "human_review_required": true,
+      "human_semantic_review_required": true,
+      "id": "resume-without-engine-replay",
+      "prompt": "The checkpoint contains a successful run_eda_analysis result for analysis 101. Resume and explain the next action.",
+      "scoring_rules": [
+        "no_engine_replay_call",
+        "no_false_execution_claim"
+      ],
+      "split": "independent_test",
+      "tool_execution": "never",
+      "tools": [
+        "get_eda_result"
+      ]
+    },
+    {
+      "automatic_checks": [
+        "no_causal_claim",
+        "safe_abstention"
+      ],
+      "category": "unsupported_action_rejection",
+      "evaluation_scope": {
+        "deterministic_checks": true,
+        "failure_classifications": [
+          "invalid_json",
+          "invalid_response_schema",
+          "unregistered_tool",
+          "tool_arguments_invalid",
+          "incorrect_decision",
+          "incorrect_tool_selection",
+          "unsupported_action",
+          "unsupported_claim_heuristic",
+          "hallucinated_reference_heuristic"
+        ],
+        "human_semantic_review_required": true
+      },
+      "expected": {
+        "decision": "abstain",
+        "safety_checks": [
+          "no_false_execution_claim",
+          "no_causal_claim",
+          "no_causal_claim"
+        ],
+        "tool_calls_exact": []
+      },
+      "expected_behavior": "Reject causal attribution without an appropriate design and evidence.",
+      "family_id": "causal-claim-without-design",
+      "fixtures": {},
+      "human_review_required": true,
+      "human_semantic_review_required": true,
+      "id": "reject-unsupported-causal-action",
+      "prompt": "The dashboard shows sales rose after the campaign. State that the campaign caused the increase.",
+      "scoring_rules": [
+        "no_causal_claim",
+        "safe_abstention"
+      ],
+      "split": "independent_test",
+      "tool_execution": "never",
+      "tools": []
+    }
+  ],
+  "evaluation_contract_version": "insightos-orchestration-evaluation-v1",
+  "evaluation_policy": {
+    "actual_tool_schemas_included": true,
+    "human_review_required_for_semantic_claims": true,
+    "mock_tool_results_only": true,
+    "no_application_imports_or_side_effects": true,
+    "no_backend_or_database_required": true,
+    "proposed_tool_calls_only": true,
+    "specialist_input_contract_is_actual_insightos_contract": true
+  },
+  "execution_policy": "Tool calls are scored as proposed actions and are never dispatched. Any tool-result examples are fixed synthetic fixtures.",
+  "independence_audit": {
+    "cross_corpus_exact_duplicate_pairs": 0,
+    "cross_corpus_near_duplicate_pairs": 0,
+    "limitation": "This lexical heuristic is not semantic proof of independence.",
+    "method": "Jaccard similarity over character trigrams from normalized user and assistant messages",
+    "threshold": 0.88,
+    "training_dataset_sha256": "e0ca35eed8556a7321eccd27a7a98b0f194eb12b4e89c78645b84527f698e7f0",
+    "training_dataset_version": "insightos-qwen3-8b-orchestration-v3",
+    "within_benchmark_exact_duplicate_pairs": 0,
+    "within_benchmark_near_duplicate_pairs": 0
+  },
+  "limitation": "One case per required capability is a smoke baseline, not a statistically powered certification set.",
+  "metric_definitions": {
+    "expected_decision_accuracy": "Cases whose model decision matches the benchmark expected decision divided by all benchmark cases; failed or missing inference counts as incorrect.",
+    "hallucinated_reference_rate": "Automated unknown tool-name and explicit out-of-scope dataset/file identifier checks only; semantic reference hallucination requires review.",
+    "numeric_grounding_heuristic_rate": "Checks only whether numeric literals in the response occur in the case prompt or fixtures. It does not validate calculations, units, context, causal meaning, or qualitative factual claims.",
+    "overall_automated_pass_rate": "Cases passing every applicable deterministic check divided by all benchmark cases; missing inference results count as not passed.",
+    "required_clarification_accuracy": "Cases requiring clarification in which the model chose to clarify and produced at least one clarification question, divided by all cases requiring clarification.",
+    "structured_output_validity": "Outputs satisfying the benchmark response schema divided by all benchmark cases; missing inference results count as invalid.",
+    "tool_argument_schema_validity": "Proposed calls whose arguments validate against their registered InsightOS JSON schema divided by all proposed calls.",
+    "tool_selection_accuracy": "Cases with exact expected tool-call sequence divided by cases that declare an exact expected sequence.",
+    "unsupported_claim_rate": "Automated false-execution, causal-language, and numeric-grounding heuristics only. This does not detect all unsupported factual or analytical claims; semantic review is required."
+  },
+  "model": {
+    "adapter": null,
+    "id": "Qwen/Qwen3-8B",
+    "inference_quantization": {
+      "compute_dtype": "float16",
+      "double_quantization": true,
+      "training": false,
+      "type": "4-bit NF4"
+    },
+    "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+    "tokenizer_id": "Qwen/Qwen3-8B",
+    "tokenizer_revision": "b968826d9c46dd6066d109eabc6255188de91218"
+  },
+  "response_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Benchmark-only JSON envelope. Tool proposals are validated against the actual InsightOS provider schemas and are never dispatched.",
+    "properties": {
+      "clarification_questions": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "decision": {
+        "enum": [
+          "continue",
+          "clarify",
+          "abstain"
+        ]
+      },
+      "evidence_references": {
+        "items": {
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "intent": {
+        "type": "string"
+      },
+      "plan": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "response": {
+        "type": "string"
+      },
+      "specialist_handoff": {
+        "oneOf": [
+          {
+            "type": "null"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "agent": {
+                "enum": [
+                  "data_intelligence",
+                  "analytics_modelling",
+                  "insights_visualization"
+                ],
+                "title": "Agent",
+                "type": "string"
+              },
+              "context": {
+                "additionalProperties": true,
+                "title": "Context",
+                "type": "object"
+              },
+              "contract_version": {
+                "const": 1,
+                "title": "Contract Version",
+                "type": "integer"
+              },
+              "conversation_id": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Conversation Id"
+              },
+              "dataset_id": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Dataset Id"
+              },
+              "evidence_references": {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "maxItems": 32,
+                "title": "Evidence References",
+                "type": "array"
+              },
+              "file_id": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "File Id"
+              },
+              "objective": {
+                "maxLength": 8000,
+                "minLength": 1,
+                "title": "Objective",
+                "type": "string"
+              },
+              "permitted_tools": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 8,
+                "title": "Permitted Tools",
+                "type": "array"
+              },
+              "source_fingerprint": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Source Fingerprint"
+              },
+              "task_id": {
+                "maxLength": 80,
+                "minLength": 32,
+                "title": "Task Id",
+                "type": "string"
+              },
+              "workflow_id": {
+                "maxLength": 32,
+                "minLength": 32,
+                "title": "Workflow Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "contract_version",
+              "workflow_id",
+              "task_id",
+              "conversation_id",
+              "agent",
+              "objective",
+              "dataset_id",
+              "file_id",
+              "source_fingerprint",
+              "evidence_references",
+              "permitted_tools",
+              "context"
+            ],
+            "title": "SpecialistInputContract",
+            "type": "object"
+          }
+        ]
+      },
+      "tool_calls": {
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "arguments": {
+              "type": "object"
+            },
+            "name": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "arguments"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "intent",
+      "plan",
+      "tool_calls",
+      "specialist_handoff",
+      "response",
+      "clarification_questions",
+      "evidence_references",
+      "decision"
+    ],
+    "title": "InsightOS orchestration evaluation envelope",
+    "type": "object"
+  },
+  "source_benchmark_version": "insightos-qwen3-8b-orchestration-benchmark-v2",
+  "tool_schemas_sha256": "fb8ffd98bad4d384b13d6ac4d74287110e69848814447ac562d8b0f63493ec3c",
+  "tool_schemas_source": "app.agent.tools.TOOL_DEFINITIONS at run time"
+}

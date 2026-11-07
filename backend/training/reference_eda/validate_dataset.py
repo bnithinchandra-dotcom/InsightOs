@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
 import argparse
+import hashlib
+import json
 import re
 import sys
 import tempfile
@@ -42,12 +43,51 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return examples
 
 
+def _dataset_version(dataset_dir: Path) -> str | None:
+    report_path = dataset_dir / "dataset_report.json"
+    if not report_path.is_file():
+        return None
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    return report.get("dataset_version") if isinstance(report, dict) else None
+
+
+def _validate_release_manifest(dataset_dir: Path) -> bool:
+    manifest_path = dataset_dir / "release_manifest.json"
+    if not manifest_path.is_file():
+        return False
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("dataset_version") != _dataset_version(dataset_dir):
+        raise ValueError("Release manifest dataset version does not match the report")
+    file_hashes = manifest.get("release_file_sha256", manifest.get("file_sha256"))
+    if not isinstance(file_hashes, dict) or not file_hashes:
+        raise ValueError("Release manifest must contain file SHA-256 values")
+    for filename, expected_hash in file_hashes.items():
+        if (
+            not isinstance(filename, str)
+            or Path(filename).name != filename
+            or "/" in filename
+            or "\\" in filename
+            or filename in {".", ".."}
+            or not isinstance(expected_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)
+        ):
+            raise ValueError("Release manifest contains an invalid file hash entry")
+        artifact = dataset_dir / filename
+        if not artifact.is_file() or artifact.is_symlink():
+            raise ValueError(f"Release artifact is missing or unsafe: {filename}")
+        actual_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        if actual_hash != expected_hash:
+            raise ValueError(f"Release artifact failed integrity check: {filename}")
+    return True
+
+
 def validate_dataset(
     dataset_dir: Path,
     *,
     require_approved: bool = False,
     require_evaluation_review: bool = False,
 ) -> dict[str, Any]:
+    release_manifest_validated = _validate_release_manifest(dataset_dir)
     examples_by_split: dict[str, list[dict[str, Any]]] = {}
     for split, filename in SPLIT_FILENAMES.items():
         examples = _read_jsonl(dataset_dir / filename)
@@ -69,14 +109,13 @@ def validate_dataset(
     if len(set(ids)) != len(ids):
         raise ValueError("Example IDs must be unique across all splits")
     expected_scenarios = {scenario.key for scenario in SCENARIOS}
-    for split, split_examples in examples_by_split.items():
-        represented_scenarios = {
-            example["id"].split("-")[1] for example in split_examples
-        }
-        if represented_scenarios != expected_scenarios:
-            raise ValueError(
-                f"Split {split!r} does not represent every approved scenario"
-            )
+    represented_scenarios = {
+        example["id"].split("-")[1]
+        for split_examples in examples_by_split.values()
+        for example in split_examples
+    }
+    if represented_scenarios != expected_scenarios:
+        raise ValueError("Dataset does not represent every approved scenario")
 
     with tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", suffix=".jsonl", delete=False
@@ -190,20 +229,34 @@ def validate_dataset(
             "Evaluation cases require the approved weighted and scenario-specific rubric"
         )
     approval_manifest_path = dataset_dir / "approval_manifest.json"
-    manifest_path = dataset_dir.parent / "review_manifest.json"
+    local_manifest_path = dataset_dir / "review_manifest.json"
+    manifest_path = (
+        local_manifest_path
+        if local_manifest_path.is_file()
+        else dataset_dir.parent / "review_manifest.json"
+    )
     if manifest_path.exists() and not approval_manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         decisions = manifest.get("decisions")
-        if (
-            manifest.get("training_ready") is not False
-            or manifest.get("fine_tuning_run_authorized") is not False
-            or manifest.get("human_record_approval_count") != 0
-            or not isinstance(decisions, list)
-            or len(decisions) != 5
-            or decisions[4].get("status")
-            != "fail_closed_policy_accepted_product_coverage_incomplete"
-            or counts["approved_examples"] != 0
-        ):
+        legacy_manifest_valid = (
+            manifest.get("training_ready") is False
+            and manifest.get("fine_tuning_run_authorized") is False
+            and manifest.get("human_record_approval_count") == 0
+            and isinstance(decisions, list)
+            and len(decisions) == 5
+            and decisions[4].get("status")
+            == "fail_closed_policy_accepted_product_coverage_incomplete"
+        )
+        versioned_manifest_valid = (
+            manifest.get("manifest_version")
+            == "insightos-reference-eda-review-v2"
+            and manifest.get("dataset_version")
+            == _dataset_version(dataset_dir)
+            and manifest.get("training_ready") is False
+            and manifest.get("fine_tuning_run_authorized") is False
+            and manifest.get("human_record_approval_count") == 0
+        )
+        if not (legacy_manifest_valid or versioned_manifest_valid) or counts["approved_examples"] != 0:
             raise ValueError(
                 "Review manifest conflicts with the fail-closed, draft-only gate"
             )
@@ -254,6 +307,8 @@ def validate_dataset(
             for split, split_examples in examples_by_split.items()
         },
         "review_manifest_validated": manifest_path.exists(),
+        "review_manifest_path": manifest_path.name if manifest_path.exists() else None,
+        "release_manifest_validated": release_manifest_validated,
         "all_examples_remain_drafts": counts["draft_examples"] == counts["examples"],
     }
 

@@ -1,0 +1,26 @@
+{
+  "counts": {
+    "examples": 24,
+    "human_approved_training_examples": 0,
+    "scenario_groups": 24,
+    "split_counts": {
+      "test": 6,
+      "train": 13,
+      "validation": 5
+    }
+  },
+  "dataset_file": "insightos-agent-sft-v3.jsonl",
+  "dataset_file_sha256": "6d5b790f3e9521679c922d139faf4c3f31567420420c2bc89271e0dc85a0d152",
+  "dataset_sha256": "e0ca35eed8556a7321eccd27a7a98b0f194eb12b4e89c78645b84527f698e7f0",
+  "dataset_sha256_method": "Canonical version plus sorted artifact SHA-256 map.",
+  "dataset_version": "insightos-qwen3-8b-orchestration-v3",
+  "manifest_version": "insightos-sft-release-v1",
+  "near_duplicate_method": "Jaccard similarity over character trigrams from normalized user and assistant messages",
+  "near_duplicate_threshold": 0.88,
+  "record_content_changed": false,
+  "schema_contract_version": "insightos-agent-sft-v1",
+  "source_dataset_sha256": "6d5b790f3e9521679c922d139faf4c3f31567420420c2bc89271e0dc85a0d152",
+  "source_dataset_version": "insightos-qwen3-8b-orchestration-v2",
+  "source_file": "backend/training/qwen3-8b/insightos-agent-sft-v2.jsonl",
+  "training_authorized": false
+}

@@ -1,0 +1,183 @@
+{
+  "approved_record_count": 0,
+  "corrected_dataset_version": "insightos-reference-eda-v3",
+  "corrected_group_leakage": [],
+  "corrected_near_duplicate_analysis": {
+    "cross_split_near_duplicate_pair_count": 0,
+    "cross_split_pair_sample": [],
+    "exact_duplicate_pair_count": 0,
+    "limitation": "This lexical heuristic is not semantic proof of independence.",
+    "method": "Jaccard similarity over character trigrams from normalized user and assistant messages",
+    "near_duplicate_pair_count": 959,
+    "threshold": 0.88
+  },
+  "corrected_scenario_coverage_by_split": {
+    "test": [
+      "healthcare"
+    ],
+    "train": [
+      "ecommerce",
+      "maintenance",
+      "marketing"
+    ],
+    "validation": [
+      "fraud"
+    ]
+  },
+  "corrected_split_counts": {
+    "test": 50,
+    "train": 150,
+    "validation": 50
+  },
+  "evaluation_case_count": 40,
+  "evaluation_record_review_ready": false,
+  "human_validation_provenance": "Owner-reported at dataset scope; reviewer identifiers, dates, and record-level mappings are not present.",
+  "release_manifest_sha256": "4278d869df74916d96618b2b85c795ac998dfb8aa8b760b4ce9a9783c6e9b7e6",
+  "report_version": "insightos-qwen3-4b-quality-report-v3",
+  "source_dataset_version": "insightos-reference-eda-v2",
+  "source_group_leakage": [],
+  "source_near_duplicate_analysis": {
+    "cross_split_near_duplicate_pair_count": 364,
+    "cross_split_pair_sample": [
+      {
+        "left_id": "eda-marketing-qualified-leads-schema",
+        "right_id": "eda-marketing-date-coverage-schema",
+        "same_split": false,
+        "similarity": 0.9176
+      },
+      {
+        "left_id": "eda-marketing-qualified-leads-schema",
+        "right_id": "eda-marketing-zero-qualified-leads-schema",
+        "same_split": false,
+        "similarity": 0.9456
+      },
+      {
+        "left_id": "eda-marketing-qualified-leads-plan",
+        "right_id": "eda-marketing-date-coverage-plan",
+        "same_split": false,
+        "similarity": 0.9263
+      },
+      {
+        "left_id": "eda-marketing-qualified-leads-plan",
+        "right_id": "eda-marketing-zero-qualified-leads-plan",
+        "same_split": false,
+        "similarity": 0.9511
+      },
+      {
+        "left_id": "eda-marketing-qualified-leads-tool",
+        "right_id": "eda-marketing-date-coverage-tool",
+        "same_split": false,
+        "similarity": 0.9146
+      },
+      {
+        "left_id": "eda-marketing-qualified-leads-tool",
+        "right_id": "eda-marketing-zero-qualified-leads-tool",
+        "same_split": false,
+        "similarity": 0.9242
+      },
+      {
+        "left_id": "eda-marketing-qualified-leads-results",
+        "right_id": "eda-marketing-date-coverage-results",
+        "same_split": false,
+        "similarity": 0.936
+      },
+      {
+        "left_id": "eda-marketing-qualified-leads-results",
+        "right_id": "eda-marketing-zero-qualified-leads-results",
+        "same_split": false,
+        "similarity": 0.948
+      },
+      {
+        "left_id": "eda-marketing-qualified-leads-code",
+        "right_id": "eda-marketing-zero-qualified-leads-code",
+        "same_split": false,
+        "similarity": 0.958
+      },
+      {
+        "left_id": "eda-marketing-qualified-cpa-schema",
+        "right_id": "eda-marketing-date-coverage-schema",
+        "same_split": false,
+        "similarity": 0.9186
+      },
+      {
+        "left_id": "eda-marketing-qualified-cpa-schema",
+        "right_id": "eda-marketing-zero-qualified-leads-schema",
+        "same_split": false,
+        "similarity": 0.934
+      },
+      {
+        "left_id": "eda-marketing-qualified-cpa-plan",
+        "right_id": "eda-marketing-date-coverage-plan",
+        "same_split": false,
+        "similarity": 0.9272
+      },
+      {
+        "left_id": "eda-marketing-qualified-cpa-plan",
+        "right_id": "eda-marketing-zero-qualified-leads-plan",
+        "same_split": false,
+        "similarity": 0.9411
+      },
+      {
+        "left_id": "eda-marketing-qualified-cpa-tool",
+        "right_id": "eda-marketing-date-coverage-tool",
+        "same_split": false,
+        "similarity": 0.9152
+      },
+      {
+        "left_id": "eda-marketing-qualified-cpa-tool",
+        "right_id": "eda-marketing-zero-qualified-leads-tool",
+        "same_split": false,
+        "similarity": 0.9286
+      },
+      {
+        "left_id": "eda-marketing-qualified-cpa-results",
+        "right_id": "eda-marketing-date-coverage-results",
+        "same_split": false,
+        "similarity": 0.9311
+      },
+      {
+        "left_id": "eda-marketing-qualified-cpa-results",
+        "right_id": "eda-marketing-zero-qualified-leads-results",
+        "same_split": false,
+        "similarity": 0.9447
+      },
+      {
+        "left_id": "eda-marketing-attributed-roas-schema",
+        "right_id": "eda-marketing-date-coverage-schema",
+        "same_split": false,
+        "similarity": 0.9295
+      },
+      {
+        "left_id": "eda-marketing-attributed-roas-schema",
+        "right_id": "eda-marketing-zero-qualified-leads-schema",
+        "same_split": false,
+        "similarity": 0.949
+      },
+      {
+        "left_id": "eda-marketing-attributed-roas-plan",
+        "right_id": "eda-marketing-date-coverage-plan",
+        "same_split": false,
+        "similarity": 0.9374
+      }
+    ],
+    "exact_duplicate_pair_count": 0,
+    "limitation": "This lexical heuristic is not semantic proof of independence.",
+    "method": "Jaccard similarity over character trigrams from normalized user and assistant messages",
+    "near_duplicate_pair_count": 959,
+    "threshold": 0.88
+  },
+  "source_scenario_groups": 50,
+  "source_split_counts": {
+    "test": 25,
+    "train": 200,
+    "validation": 25
+  },
+  "tool_schema_and_result_validation": "passed",
+  "training_blockers": [
+    "Individual training and evaluation records still require review events.",
+    "The 4B corpus remains synthetic and is not sufficient evidence of performance on real project data.",
+    "The held-out split contains one domain only; report this domain-generalization limitation."
+  ],
+  "training_ready": false,
+  "validated_sql_python_dax_examples": 50
+}

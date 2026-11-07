@@ -1,0 +1,99 @@
+{
+  "attestation_manifest": "dataset_validation_attestations_v1.json",
+  "attestation_manifest_sha256": "c26a61a74ae3143c6d8a45ee6e6276fe442af6ae2185b669c037a1e836bbe941",
+  "automated_validation": {
+    "numerical_and_analytical_validation": {
+      "evidence": "Reference EDA tests assert fixture-derived expected summaries and representative SQL query outputs.",
+      "state": "deterministic_fixture_tests_required_and_run_separately"
+    },
+    "release_hashes": "passed",
+    "sft_schema_and_actual_tool_argument_validation": "passed",
+    "sql_python_dax_examples": {
+      "scope": "SQL SELECT examples execute against read-only SQLite fixtures; Python examples compile; DAX examples are checked for required table and field tokens, not executed.",
+      "validated_count": 50
+    },
+    "tool_result_contract_validation": "passed"
+  },
+  "counts": {
+    "approved_examples": 0,
+    "draft_examples": 250,
+    "examples": 250,
+    "scenario_groups": 50,
+    "test": 50,
+    "train": 150,
+    "validation": 50
+  },
+  "dataset_file_sha256": {
+    "held_out.jsonl": "cd149ed04edd1d3c62fd04e634203fd75d7ea102c84d6341daa6d55302e1025a",
+    "human_review_suite.json": "60e2e13ffe7384ef9411e8deddc63553c0e85cc032b444a26ff2f24179e9462f",
+    "synthetic_fixtures.json": "19ba985d0ce2fccf7f710f21e7420a0ed5fb5e50643718b7f9e73f416cb237bc",
+    "train.jsonl": "9b479abe1df0a347c3111b2d3635b426dc6677f86d46b54f133d641d528e5fc0",
+    "validation.jsonl": "c96582af670db187d8f1745a90c735d146d1feff5f85566d104f154e9f49169d"
+  },
+  "dataset_sha256": "d06a74eaea6b417ffdb08bb47303b6b58e88a203ef1b49080d5c3617850dede5",
+  "dataset_sha256_method": "SHA-256 of canonical JSON containing dataset_version and the lexically sorted SHA-256 values of the five listed dataset artifacts.",
+  "dataset_version": "insightos-reference-eda-v3",
+  "generalization_limitation": "Training spans three domains; validation and test each contain one held-out domain. Report domain-specific results and do not claim broad cross-domain generalization.",
+  "human_validation": {
+    "attestations": [
+      {
+        "approval_state": "owner_reported_human_validated",
+        "attestation_recorded_on": "2026-11-05",
+        "attestation_source": "Project-owner clarification in the Milestone 4 finalization request, recorded 2026-11-05. This is owner-reported provenance, not a direct statement from an identified senior Business Analyst.",
+        "dataset_sha256": "d06a74eaea6b417ffdb08bb47303b6b58e88a203ef1b49080d5c3617850dede5",
+        "dataset_version": "insightos-reference-eda-v3",
+        "historical_review_date": null,
+        "per_example_approvals_created": false,
+        "review_scope": "Dataset-level project-work validation as reported by the owner. The v3 release changes split assignments only; model-generated human-review suite decisions remain pending.",
+        "reviewer_identity": null,
+        "reviewer_role": "project_owner"
+      },
+      {
+        "approval_state": "owner_reported_for_source_scope_only",
+        "attestation_recorded_on": "2026-11-05",
+        "attestation_source": "Project-owner clarification in the Milestone 4 finalization request, recorded 2026-11-05. This is owner-reported provenance, not a direct statement from an identified senior Business Analyst.",
+        "dataset_sha256": "d06a74eaea6b417ffdb08bb47303b6b58e88a203ef1b49080d5c3617850dede5",
+        "dataset_version": "insightos-reference-eda-v3",
+        "historical_review_date": null,
+        "per_example_approvals_created": false,
+        "review_scope": "Dataset-level project-work validation as reported by the owner. The v3 release changes split assignments only; model-generated human-review suite decisions remain pending.",
+        "reviewer_identity": null,
+        "reviewer_role": "senior_business_analyst"
+      }
+    ],
+    "status": "owner_reported_dataset_level"
+  },
+  "leakage_and_duplicate_validation": {
+    "cross_split_near_duplicate_pairs": 0,
+    "exact_duplicate_pairs": 0,
+    "limitation": "This lexical heuristic is not semantic proof of independence.",
+    "method": "Jaccard similarity over character trigrams from normalized user and assistant messages",
+    "near_duplicate_pairs_total": 959,
+    "scenario_group_leakage": [],
+    "threshold": 0.88
+  },
+  "quality_review_status": false,
+  "release_manifest_sha256": "4278d869df74916d96618b2b85c795ac998dfb8aa8b760b4ce9a9783c6e9b7e6",
+  "report_version": "insightos-qwen3-4b-final-dataset-report-v3",
+  "scenario_coverage_by_split": {
+    "test": [
+      "healthcare"
+    ],
+    "train": [
+      "ecommerce",
+      "maintenance",
+      "marketing"
+    ],
+    "validation": [
+      "fraud"
+    ]
+  },
+  "source_versions": {
+    "dataset_v1": "insightos-reference-eda-v1",
+    "dataset_v2": "insightos-reference-eda-v2"
+  },
+  "training_authorization": {
+    "authorized": false,
+    "reason": "Record-level approval and independent evaluation review remain separate gates."
+  }
+}

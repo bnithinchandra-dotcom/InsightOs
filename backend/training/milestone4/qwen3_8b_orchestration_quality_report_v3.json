@@ -1,0 +1,194 @@
+{
+  "attestation_manifest": "dataset_validation_attestations_v1.json",
+  "attestation_manifest_sha256": "c26a61a74ae3143c6d8a45ee6e6276fe442af6ae2185b669c037a1e836bbe941",
+  "automated_schema_validation": "passed",
+  "baseline_bundle_sha256": "6c2b6e9fd348031290da64c489a163b272f5ef6b12bc020fa76825742f1105bd",
+  "baseline_status": "pending_kaggle_execution",
+  "benchmark_sha256": "e751cfe031ce017e0cabe12227a468d2a8d0f431c88d66eb85298d7fa419351b",
+  "benchmark_version": "insightos-qwen3-8b-orchestration-benchmark-v2",
+  "capability_counts": {
+    "capability_categories": 12,
+    "human_review_required_cases": 12,
+    "independent_benchmark_cases": 12
+  },
+  "capability_coverage": {
+    "clarification": {
+      "example_ids": [
+        "missing-dataset-prerequisite",
+        "clarify-forecast-prerequisites",
+        "clarify-ambiguous-analysis"
+      ],
+      "status": "examples_present"
+    },
+    "error_handling_and_bounded_retries": {
+      "example_ids": [
+        "false-success-claim",
+        "bounded-tool-retry",
+        "bounded-retry-reports-persistent-tool-failure",
+        "tool-error-bounded-retry"
+      ],
+      "status": "examples_present"
+    },
+    "evidence_grounding": {
+      "example_ids": [
+        "observation-hypothesis-unknown",
+        "saved-eda-result-interpretation",
+        "stale-evidence-abstention",
+        "grounded-profile-response"
+      ],
+      "status": "examples_present"
+    },
+    "intent_understanding": {
+      "example_ids": [
+        "missing-dataset-prerequisite",
+        "project-inventory-before-dataset-selection",
+        "intent-dashboard-scope"
+      ],
+      "status": "examples_present"
+    },
+    "interruption_and_recovery": {
+      "example_ids": [
+        "engine-operation-not-replayed-after-resume",
+        "resume-without-engine-replay"
+      ],
+      "status": "examples_present"
+    },
+    "multi_step_workflow_planning": {
+      "example_ids": [
+        "handoff-prerequisites",
+        "engine-operation-not-replayed-after-resume",
+        "plan-profile-quality-analysis"
+      ],
+      "status": "examples_present"
+    },
+    "specialist_delegation": {
+      "example_ids": [
+        "inspection-handoff-contract",
+        "typed-data-intelligence-handoff",
+        "specialist-data-delegation"
+      ],
+      "status": "examples_present"
+    },
+    "tool_result_interpretation": {
+      "example_ids": [
+        "saved-eda-result-interpretation",
+        "stored-profile-is-not-recomputed",
+        "interpret-tool-result"
+      ],
+      "status": "examples_present"
+    },
+    "tool_selection_and_arguments": {
+      "example_ids": [
+        "routing-list-files",
+        "invalid-tool-arguments",
+        "explicit-quality-engine-request",
+        "tool-selection-project-list",
+        "structured-tool-call"
+      ],
+      "status": "examples_present"
+    },
+    "unsupported_action_rejection": {
+      "example_ids": [
+        "unsupported-new-analytics",
+        "join-recommendation-is-not-approval",
+        "reject-unsupported-causal-action"
+      ],
+      "status": "examples_present"
+    }
+  },
+  "category_counts_by_split": {
+    "test": {
+      "business_reasoning": 2,
+      "grounding_safety": 3,
+      "tool_selection": 1
+    },
+    "train": {
+      "business_reasoning": 1,
+      "grounding_safety": 1,
+      "schema_interpretation": 2,
+      "structured_output": 3,
+      "tool_selection": 6
+    },
+    "validation": {
+      "business_reasoning": 2,
+      "grounding_safety": 3
+    }
+  },
+  "counts": {
+    "approved_training_examples": 0,
+    "examples": 24,
+    "scenario_groups": 24,
+    "status_by_record": {
+      "draft": 24
+    },
+    "test": 6,
+    "train": 13,
+    "validation": 5
+  },
+  "dataset_file_sha256": {
+    "insightos-agent-sft-v3.jsonl": "6d5b790f3e9521679c922d139faf4c3f31567420420c2bc89271e0dc85a0d152"
+  },
+  "dataset_sha256": "e0ca35eed8556a7321eccd27a7a98b0f194eb12b4e89c78645b84527f698e7f0",
+  "dataset_version": "insightos-qwen3-8b-orchestration-v3",
+  "duplicates": {
+    "cross_split_near_duplicate_pairs": 0,
+    "exact_duplicate_pairs": 0,
+    "limitation": "This lexical heuristic is not semantic proof of independence.",
+    "method": "Jaccard similarity over character trigrams from normalized user and assistant messages",
+    "near_duplicate_pairs": 0,
+    "scenario_group_leakage": [],
+    "threshold": 0.88
+  },
+  "human_validation": {
+    "attestations": [
+      {
+        "approval_state": "owner_reported_human_validated",
+        "attestation_recorded_on": "2026-11-05",
+        "attestation_source": "Project-owner clarification in the Milestone 4 finalization request, recorded 2026-11-05. This is owner-reported provenance, not a direct statement from an identified senior Business Analyst.",
+        "dataset_sha256": "e0ca35eed8556a7321eccd27a7a98b0f194eb12b4e89c78645b84527f698e7f0",
+        "dataset_version": "insightos-qwen3-8b-orchestration-v3",
+        "historical_review_date": null,
+        "per_example_approvals_created": false,
+        "review_scope": "Owner-reported source-dataset validation applies to the original 12-example v1 subset. The 12 synthetic additions introduced in v2/v3 are explicitly outside that reported human-review scope.",
+        "reviewer_identity": null,
+        "reviewer_role": "project_owner"
+      },
+      {
+        "approval_state": "owner_reported_for_source_scope_only",
+        "attestation_recorded_on": "2026-11-05",
+        "attestation_source": "Project-owner clarification in the Milestone 4 finalization request, recorded 2026-11-05. This is owner-reported provenance, not a direct statement from an identified senior Business Analyst.",
+        "dataset_sha256": "e0ca35eed8556a7321eccd27a7a98b0f194eb12b4e89c78645b84527f698e7f0",
+        "dataset_version": "insightos-qwen3-8b-orchestration-v3",
+        "historical_review_date": null,
+        "per_example_approvals_created": false,
+        "review_scope": "Owner-reported source-dataset validation applies to the original 12-example v1 subset. The 12 synthetic additions introduced in v2/v3 are explicitly outside that reported human-review scope.",
+        "reviewer_identity": null,
+        "reviewer_role": "senior_business_analyst"
+      }
+    ],
+    "status": "partial_owner_reported_dataset_level"
+  },
+  "original_dataset_sha256": "37d0eee60302dbd0611ab20a8dc3c84f07ed63885b6b0c348653c20a5349a489",
+  "original_dataset_version": "insightos-agent-sft-v1",
+  "record_content_changed_from_v2": false,
+  "release_manifest_sha256": "b216ead0b0f0edd0ba540e9fd4f6a1748f9d2fb2d36f4ad4cc6e156fc7c5b9b9",
+  "report_version": "insightos-qwen3-8b-orchestration-quality-report-v3",
+  "sft_schema_contract": "backend/training/qwen3-0.6b/insightos-sft.schema.json",
+  "source_dataset_sha256": "6d5b790f3e9521679c922d139faf4c3f31567420420c2bc89271e0dc85a0d152",
+  "source_dataset_version": "insightos-qwen3-8b-orchestration-v2",
+  "tool_call_counts": {
+    "get_eda_result": 1,
+    "get_inspection_handoff": 3,
+    "get_profile": 1,
+    "get_schema_analysis": 1,
+    "list_files": 6,
+    "list_projects": 1,
+    "recommend_multi_dataset_joins": 1,
+    "run_quality_analysis": 1
+  },
+  "tool_schemas_validated_against": "app.agent.tools.TOOL_DEFINITIONS",
+  "training_authorization": {
+    "authorized": false,
+    "reason": "All 24 examples remain draft; dataset-level provenance is not a substitute for the existing per-example training gate."
+  }
+}

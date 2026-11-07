@@ -1,0 +1,12 @@
+{
+  "dataset_version": "insightos-agent-sft-v1",
+  "examples": 24,
+  "human_approved_training_examples": 0,
+  "scenario_groups": 24,
+  "split_counts": {
+    "test": 6,
+    "train": 13,
+    "validation": 5
+  },
+  "training_ready": false
+}

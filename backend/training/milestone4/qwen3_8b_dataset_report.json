@@ -1,0 +1,43 @@
+{
+  "approval_provenance": "The owner-reported validation statement is dataset-level only. All newly added examples are draft pending record-level review.",
+  "benchmark_sha256": "0c65a296b6780f65a90474c93e550c754b1cb8863e3030b842c7c11abe3a10f8",
+  "coverage": [
+    "Intent clarification and source discovery",
+    "Planning and tool dependencies",
+    "Exact registered tool selection and arguments",
+    "Typed specialist handoff",
+    "Tool result grounding and stale evidence",
+    "Tool failure and bounded retry",
+    "Checkpoint continuation without replay",
+    "Unsupported causal-claim rejection"
+  ],
+  "dataset_sha256": "6d5b790f3e9521679c922d139faf4c3f31567420420c2bc89271e0dc85a0d152",
+  "dataset_version": "insightos-qwen3-8b-orchestration-v2",
+  "duplicate_analysis": {
+    "cross_split_near_duplicate_pairs": [],
+    "exact_duplicate_pairs": [],
+    "limitation": "This lexical heuristic is not semantic proof of independence.",
+    "method": "Jaccard similarity over character trigrams from normalized user and assistant messages",
+    "near_duplicate_pairs": [],
+    "threshold": 0.88
+  },
+  "example_count": 24,
+  "human_approved_training_examples": 0,
+  "report_version": "insightos-qwen3-8b-dataset-report-v1",
+  "scenario_group_count": 24,
+  "scenario_groups_by_split": {
+    "test": 6,
+    "train": 13,
+    "validation": 5
+  },
+  "schema_contract_version": "insightos-agent-sft-v1",
+  "source_dataset_sha256": "37d0eee60302dbd0611ab20a8dc3c84f07ed63885b6b0c348653c20a5349a489",
+  "source_dataset_version": "insightos-agent-sft-v1",
+  "split_counts": {
+    "test": 6,
+    "train": 13,
+    "validation": 5
+  },
+  "tool_schema_validation": "passed",
+  "training_ready": false
+}

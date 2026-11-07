@@ -1,0 +1,38 @@
+{
+  "changed_fields": [
+    "split"
+  ],
+  "dataset_version": "insightos-reference-eda-v3",
+  "release_directory": "backend/training/reference_eda/dataset_v3",
+  "release_file_sha256": {
+    "dataset_report.json": "f11b75de4482b78f7fab1e47d354d3fe8e2b14aff3ec0347d3209dc25f9e2c3e",
+    "held_out.jsonl": "cd149ed04edd1d3c62fd04e634203fd75d7ea102c84d6341daa6d55302e1025a",
+    "human_review_suite.json": "60e2e13ffe7384ef9411e8deddc63553c0e85cc032b444a26ff2f24179e9462f",
+    "review_manifest.json": "8498cf4542d490c2de60278e9bb11a75063b6073ed67799a8fbdfc01b3a12a16",
+    "synthetic_fixtures.json": "19ba985d0ce2fccf7f710f21e7420a0ed5fb5e50643718b7f9e73f416cb237bc",
+    "train.jsonl": "9b479abe1df0a347c3111b2d3635b426dc6677f86d46b54f133d641d528e5fc0",
+    "validation.jsonl": "c96582af670db187d8f1745a90c735d146d1feff5f85566d104f154e9f49169d"
+  },
+  "release_policy": "scenario-domain group split to prevent observed template leakage",
+  "source_dataset_report_sha256": "e35cff1b03478533361b62f675c02f19cb22810838c27a3dbe4ddb1cc8865d71",
+  "source_directory": "backend/training/reference_eda/dataset_v1",
+  "source_file_sha256": {
+    "held_out.jsonl": "a797a12448bf04de139f7bd136056f877165b6866d02b9ff65e4f7ce30f72631",
+    "train.jsonl": "b4698077200c7c4dd9e142f492b8f88cf5c54416fe747aaabeac278065f63816",
+    "validation.jsonl": "fccff47a49f8040fcab782a605ba087027414248fca76f1f20679a77532c70b3"
+  },
+  "source_review_manifest_sha256": "9990faf6ecac63fd420d610ed814cc872f4c5100766c938181701392e4ea3572",
+  "validation": {
+    "approved_examples": 0,
+    "evaluation_cases": 40,
+    "examples": 250,
+    "leaking_groups": [],
+    "scenario_groups": 50,
+    "split_counts": {
+      "test": 50,
+      "train": 150,
+      "validation": 50
+    },
+    "training_ready": false
+  }
+}

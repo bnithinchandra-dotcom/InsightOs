@@ -1,0 +1,54 @@
+{
+  "backend_runtime": "Python 3.14.3; unchanged and not used for training",
+  "blockers": [
+    "No Kaggle kernel was available for runtime inspection or model loading.",
+    "The tracked notebook contains no executed code-cell outputs.",
+    "The notebook's pip install is not version-pinned; reproducibility requires a pinned environment export.",
+    "The existing 0.6B smoke adapter is synthetic and is not evidence of 4B/8B compatibility.",
+    "Verify Qwen3 model/tokenizer revisions, chat template behavior, PEFT target modules, TRL masking, CUDA wheel, bitsandbytes kernels, and export format on the target Kaggle GPU before training."
+  ],
+  "existing_notebook": "backend\\training\\finetuning\\notebooks\\qwen3_0_6b_final_training.ipynb",
+  "existing_notebook_base_model": "unsloth/Qwen3-0.6B-unsloth-bnb-4bit",
+  "existing_workflow": {
+    "approval_gate": "requires an approved, hash-matched dataset manifest",
+    "dependency_install": "unversioned pip install in the tracked notebook",
+    "model_revision": "must be recorded before training",
+    "training_method": "Unsloth QLoRA"
+  },
+  "local_training_venv": {
+    "accelerate": null,
+    "bitsandbytes": null,
+    "datasets": null,
+    "jsonschema": "4.26.0",
+    "peft": null,
+    "python": "3.11.18",
+    "pyyaml": "6.0.3",
+    "safetensors": "0.8.0",
+    "torch": null,
+    "transformers": null,
+    "trl": null
+  },
+  "notebook_execution_evidence": {
+    "code_cell_count": 10,
+    "executed_code_cells": 0,
+    "stored_output_count": 0
+  },
+  "reference_eda_pinned_stack": {
+    "accelerate": "1.6.0",
+    "bitsandbytes": "0.45.5",
+    "datasets": "3.5.0",
+    "peft": "0.15.2",
+    "python": ">=3.10,<3.13",
+    "safetensors": "0.5.3",
+    "torch": "2.6.0 (CUDA 12.4 wheel)",
+    "transformers": "4.51.3",
+    "trl": "0.16.1"
+  },
+  "report_version": "insightos-kaggle-qlora-compatibility-v1",
+  "tested_kaggle_runtime": null,
+  "tested_model_runtime_matrix": {
+    "Qwen3-4B": "not verified in Kaggle during this milestone",
+    "Qwen3-8B": "not verified in Kaggle during this milestone"
+  },
+  "training_started": false
+}

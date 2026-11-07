@@ -1,0 +1,246 @@
+{
+  "intent-dashboard-scope": {
+    "intent": "Build a dashboard, but the data source is not specified",
+    "plan": [
+      "Ask which project and dataset the dashboard should use",
+      "Ask what the dashboard should show",
+      "Only after those answers, propose tool lookups scoped to the chosen project and dataset"
+    ],
+    "tool_calls": [],
+    "specialist_handoff": null,
+    "response": "Nothing has been built yet. Before I can plan a dashboard I need to know which project and dataset to use, and what you want it to show.",
+    "clarification_questions": [
+      "Which project contains the data you want to use?",
+      "Which dataset (and file, if there are several) should the dashboard be based on?",
+      "What should the dashboard show, such as which measures, time period, or breakdowns?"
+    ],
+    "evidence_references": [],
+    "decision": "clarify"
+  },
+  "plan-profile-quality-analysis": {
+    "intent": "Inspect the saved profile for dataset 42, file 7, then run quality analysis only if the file is normalized",
+    "plan": [
+      "Propose the read-only profile lookup for dataset 42, file 7",
+      "Wait for the profile result and check whether the file is normalized",
+      "Only if it is normalized, propose quality analysis as a separate later step"
+    ],
+    "tool_calls": [
+      {
+        "name": "get_profile",
+        "arguments": {
+          "dataset_id": 42,
+          "file_id": 7
+        }
+      }
+    ],
+    "specialist_handoff": null,
+    "response": "Proposed first step: the read-only profile lookup for dataset 42, file 7. It has not run yet, so the file's normalization status is not known. Quality analysis is not proposed now; it can be considered once the profile result confirms the file is normalized.",
+    "clarification_questions": [],
+    "evidence_references": [],
+    "decision": "continue"
+  },
+  "tool-selection-project-list": {
+    "intent": "List the projects in the workspace",
+    "plan": [
+      "Propose the list_projects lookup, which takes no arguments"
+    ],
+    "tool_calls": [
+      {
+        "name": "list_projects",
+        "arguments": {}
+      }
+    ],
+    "specialist_handoff": null,
+    "response": "Proposed: list_projects with no arguments. It has not run yet, so no project list is available.",
+    "clarification_questions": [],
+    "evidence_references": [],
+    "decision": "continue"
+  },
+  "tool-arguments-strict-identifiers": {
+    "intent": "Get a profile, but the dataset identifier is not a valid integer",
+    "plan": [
+      "Do not convert the quoted dataset identifier to a number",
+      "Ask for the dataset ID as a whole-number integer",
+      "Propose the profile lookup only after a valid integer ID is provided"
+    ],
+    "tool_calls": [],
+    "specialist_handoff": null,
+    "response": "I can't propose the profile lookup yet. The dataset identifier was supplied as quoted text, but the profile tool requires an integer dataset ID, and I won't convert it on my own. No lookup has been proposed or run.",
+    "clarification_questions": [
+      "What is the dataset ID as a whole number, without quotation marks?"
+    ],
+    "evidence_references": [],
+    "decision": "clarify"
+  },
+  "structured-tool-call": {
+    "intent": "List files in dataset 42",
+    "plan": [
+      "Propose the list_files lookup for dataset 42"
+    ],
+    "tool_calls": [
+      {
+        "name": "list_files",
+        "arguments": {
+          "dataset_id": 42
+        }
+      }
+    ],
+    "specialist_handoff": null,
+    "response": "Proposed: list_files for dataset 42. It has not run yet, so no file list is available.",
+    "clarification_questions": [],
+    "evidence_references": [],
+    "decision": "continue"
+  },
+  "specialist-data-delegation": {
+    "intent": "Prepare the next Data Intelligence task from the available verified profile",
+    "plan": [
+      "Use the supplied verified-profile state; do not request the profile again",
+      "Prepare a Data Intelligence handoff that preserves the supplied evidence reference",
+      "Do not assume any profile fields, since schema details were not provided"
+    ],
+    "tool_calls": [],
+    "specialist_handoff": {
+      "agent": "data_intelligence",
+      "context": {
+        "profile_details": "The profile's schema details are intentionally not included in this case.",
+        "profile_status": "available"
+      },
+      "contract_version": 1,
+      "conversation_id": 7,
+      "dataset_id": 42,
+      "evidence_references": [
+        {
+          "dataset_id": 42,
+          "file_id": 7,
+          "source_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "type": "verified_profile"
+        }
+      ],
+      "file_id": 7,
+      "objective": "Inspect the available verified profile for file 7 in dataset 42 and report only evidence present in the profile.",
+      "permitted_tools": [
+        "get_profile",
+        "get_schema_analysis",
+        "get_inspection_handoff"
+      ],
+      "source_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "task_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "workflow_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "response": "The verified profile for file 7 in dataset 42 is already available, so no new lookup is proposed. The next Data Intelligence task is to inspect that profile and report only evidence present in it. Schema details were not provided, so none are assumed.",
+    "clarification_questions": [],
+    "evidence_references": [
+      {
+        "dataset_id": 42,
+        "file_id": 7,
+        "source_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "type": "verified_profile"
+      }
+    ],
+    "decision": "continue"
+  },
+  "interpret-tool-result": {
+    "intent": "Summarize only the supplied quality tool result",
+    "plan": [
+      "Restate the supplied finding exactly",
+      "Add no further numbers or interpretation"
+    ],
+    "tool_calls": [],
+    "specialist_handoff": null,
+    "response": "According to the quality tool result you provided, customer_id has 2 missing values. I have no other information about this result.",
+    "clarification_questions": [],
+    "evidence_references": [],
+    "decision": "continue"
+  },
+  "tool-error-bounded-retry": {
+    "intent": "List files in dataset 42 after one transient failure",
+    "plan": [
+      "Acknowledge that one transient failure has already occurred",
+      "Propose a single retry of list_files for dataset 42",
+      "If the retry also fails, report the failure instead of retrying again"
+    ],
+    "tool_calls": [
+      {
+        "name": "list_files",
+        "arguments": {
+          "dataset_id": 42
+        }
+      }
+    ],
+    "specialist_handoff": null,
+    "response": "A transient failure already occurred once when listing files for dataset 42. I'm proposing exactly one retry of list_files for dataset 42. It has not run yet, so no file list is available. If it fails again, I will report the failure rather than retry further.",
+    "clarification_questions": [],
+    "evidence_references": [],
+    "decision": "continue"
+  },
+  "clarify-ambiguous-analysis": {
+    "intent": "Understand what is driving an unspecified change",
+    "plan": [
+      "Ask which dataset, measure, and period the change refers to",
+      "Ask what the user means by driving, association or causal attribution",
+      "Propose analysis only after those details are provided"
+    ],
+    "tool_calls": [],
+    "specialist_handoff": null,
+    "response": "I can't tell yet what change you mean, so I haven't looked at anything or drawn any conclusion. I need a few details first.",
+    "clarification_questions": [
+      "Which dataset or file does the change appear in?",
+      "Which measure or metric changed?",
+      "Over what time period, and compared with what baseline?",
+      "By driving, do you mean which factors move together with the change (association), or do you want evidence about what produced it (causal attribution)?"
+    ],
+    "evidence_references": [],
+    "decision": "clarify"
+  },
+  "grounded-profile-response": {
+    "intent": "State what the supplied profile counts show",
+    "plan": [
+      "Report only the supplied row and column counts",
+      "Separate this descriptive metadata from any analysis",
+      "State what further information would be needed to say more"
+    ],
+    "tool_calls": [],
+    "specialist_handoff": null,
+    "response": "The profile reports 18 rows and 3 columns. That is descriptive metadata only. It does not tell me what the columns mean, how good the data is, or whether it suits any analysis. For that I would need the column definitions and your analysis question.",
+    "clarification_questions": [],
+    "evidence_references": [],
+    "decision": "continue"
+  },
+  "resume-without-engine-replay": {
+    "intent": "Resume from the checkpoint and explain the next action",
+    "plan": [
+      "Treat the recorded run_eda_analysis result for analysis 101 as complete",
+      "Propose reading the saved result with get_eda_result",
+      "Do not propose re-running any engine operation"
+    ],
+    "tool_calls": [
+      {
+        "name": "get_eda_result",
+        "arguments": {
+          "analysis_id": 101,
+          "dataset_id": 42,
+          "file_id": 7
+        }
+      }
+    ],
+    "specialist_handoff": null,
+    "response": "The checkpoint already records a successful run_eda_analysis result for analysis 101, so that step is not repeated. The next action is to read the saved result: get_eda_result for analysis 101 (dataset 42, file 7) is proposed and has not run yet, so the findings are not available yet.",
+    "clarification_questions": [],
+    "evidence_references": [],
+    "decision": "continue"
+  },
+  "reject-unsupported-causal-action": {
+    "intent": "Decline to assert an unsupported causal attribution",
+    "plan": [
+      "Do not state that the campaign produced the increase",
+      "Note that the dashboard shows only that sales rose after the campaign",
+      "Offer a non-causal before/after comparison if suitable data and a valid method are provided"
+    ],
+    "tool_calls": [],
+    "specialist_handoff": null,
+    "response": "I can't state that. The dashboard shows only that sales rose after the campaign, which is a timing relationship, not evidence of attribution. Supporting that claim would need an appropriate design and evidence, such as a comparison group and a check for other changes in the same period. If you share the data, I can help with a non-causal before/after comparison.",
+    "clarification_questions": [],
+    "evidence_references": [],
+    "decision": "abstain"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "approved_examples": 0,
+  "dataset_version": "insightos-reference-eda-v2",
+  "file_sha256": {
+    "dataset_report.json": "e14ff16cae22375c896fdde5bef5ebe256b8cb673dfa912939ab57da9368fdb1",
+    "held_out.jsonl": "a797a12448bf04de139f7bd136056f877165b6866d02b9ff65e4f7ce30f72631",
+    "human_review_suite.json": "e275ee4ab22e82b50ff85c938b1a659b09daaed0e2e9e01700b26392bba70da6",
+    "synthetic_fixtures.json": "19ba985d0ce2fccf7f710f21e7420a0ed5fb5e50643718b7f9e73f416cb237bc",
+    "train.jsonl": "b4698077200c7c4dd9e142f492b8f88cf5c54416fe747aaabeac278065f63816",
+    "validation.jsonl": "fccff47a49f8040fcab782a605ba087027414248fca76f1f20679a77532c70b3"
+  },
+  "record_content_changed": false,
+  "release_directory": "backend\\training\\reference_eda\\dataset_v2",
+  "release_method": "byte-preserving copy of record/suite/fixture files",
+  "scenario_groups": 50,
+  "sft_schema_version": "insightos-agent-sft-v1",
+  "source_dataset_version": "insightos-reference-eda-v2",
+  "source_directory": "backend\\training\\reference_eda\\dataset_v1",
+  "source_file_sha256": {
+    "held_out.jsonl": "a797a12448bf04de139f7bd136056f877165b6866d02b9ff65e4f7ce30f72631",
+    "human_review_suite.json": "e275ee4ab22e82b50ff85c938b1a659b09daaed0e2e9e01700b26392bba70da6",
+    "synthetic_fixtures.json": "19ba985d0ce2fccf7f710f21e7420a0ed5fb5e50643718b7f9e73f416cb237bc",
+    "train.jsonl": "b4698077200c7c4dd9e142f492b8f88cf5c54416fe747aaabeac278065f63816",
+    "validation.jsonl": "fccff47a49f8040fcab782a605ba087027414248fca76f1f20679a77532c70b3"
+  },
+  "split_counts": {
+    "test": 25,
+    "train": 200,
+    "validation": 25
+  },
+  "training_ready": false
+}

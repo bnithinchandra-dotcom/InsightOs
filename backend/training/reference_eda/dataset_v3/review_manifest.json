@@ -1,0 +1,30 @@
+{
+  "dataset_version": "insightos-reference-eda-v3",
+  "fine_tuning_run_authorized": false,
+  "human_record_approval_count": 0,
+  "manifest_version": "insightos-reference-eda-review-v2",
+  "owner_reported_validation": {
+    "record_level_mapping": false,
+    "review_dates": null,
+    "reviewer_ids": null,
+    "source": "Milestone 4 project-owner instruction"
+  },
+  "review_status": "record_level_review_pending",
+  "source_dataset_version": "insightos-reference-eda-v2",
+  "source_review_manifest_sha256": "9990faf6ecac63fd420d610ed814cc872f4c5100766c938181701392e4ea3572",
+  "split_policy": "Keep each synthetic scenario domain wholly within one split because cross-domain records share prompt and target templates.",
+  "split_scenario_assignment": {
+    "test": [
+      "healthcare"
+    ],
+    "train": [
+      "marketing",
+      "maintenance",
+      "ecommerce"
+    ],
+    "validation": [
+      "fraud"
+    ]
+  },
+  "training_ready": false
+}

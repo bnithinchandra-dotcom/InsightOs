@@ -1,0 +1,57 @@
+{
+  "approved_examples": 0,
+  "dataset_version": "insightos-reference-eda-v3",
+  "draft_examples": 250,
+  "evaluation_cases": 40,
+  "examples": 250,
+  "file_sha256": {
+    "held_out.jsonl": "cd149ed04edd1d3c62fd04e634203fd75d7ea102c84d6341daa6d55302e1025a",
+    "human_review_suite.json": "60e2e13ffe7384ef9411e8deddc63553c0e85cc032b444a26ff2f24179e9462f",
+    "synthetic_fixtures.json": "19ba985d0ce2fccf7f710f21e7420a0ed5fb5e50643718b7f9e73f416cb237bc",
+    "train.jsonl": "9b479abe1df0a347c3111b2d3635b426dc6677f86d46b54f133d641d528e5fc0",
+    "validation.jsonl": "c96582af670db187d8f1745a90c735d146d1feff5f85566d104f154e9f49169d"
+  },
+  "generated_by": "training.milestone4.prepare_milestone4._generate_eda_v3",
+  "human_record_approval_count": 0,
+  "leaking_groups": [],
+  "record_content_change": "Only split assignments changed; prompts and targets are preserved.",
+  "review_manifest_sha256": "8498cf4542d490c2de60278e9bb11a75063b6073ed67799a8fbdfc01b3a12a16",
+  "scenario_counts": {
+    "ecommerce": 50,
+    "fraud": 50,
+    "healthcare": 50,
+    "maintenance": 50,
+    "marketing": 50
+  },
+  "scenario_coverage_by_split": {
+    "test": [
+      "healthcare"
+    ],
+    "train": [
+      "ecommerce",
+      "maintenance",
+      "marketing"
+    ],
+    "validation": [
+      "fraud"
+    ]
+  },
+  "scenario_groups": 50,
+  "schema_contract_version": "insightos-agent-sft-v1",
+  "source_dataset_version": "insightos-reference-eda-v2",
+  "split_counts": {
+    "test": 50,
+    "train": 150,
+    "validation": 50
+  },
+  "split_policy": "Keep each synthetic scenario domain wholly within one split because cross-domain records share prompt and target templates.",
+  "tool_call_counts": {
+    "get_inspection_handoff": 10,
+    "get_profile": 10,
+    "get_quality_report": 10,
+    "run_eda_analysis": 10,
+    "run_quality_analysis": 10
+  },
+  "training_ready": false,
+  "validated_sql_python_dax_examples": 50
+}

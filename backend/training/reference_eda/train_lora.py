@@ -147,16 +147,39 @@ def preflight(config_path: Path) -> dict[str, Any]:
         blockers.append("QLoRA configuration requires Linux x86_64")
 
     dataset_dir = (REPOSITORY_ROOT / config["dataset_directory"]).resolve()
+    version_match = re.fullmatch(
+        r"insightos-reference-eda-v([1-9][0-9]*)",
+        config.get("dataset_version", ""),
+    )
     expected_dataset_dir = (
-        REPOSITORY_ROOT / "backend" / "training" / "reference_eda" / "dataset_v1"
-    ).resolve()
-    if dataset_dir != expected_dataset_dir:
-        blockers.append("Training data must come from the versioned reference_eda dataset")
+        PACKAGE_DIR / f"dataset_v{version_match.group(1)}"
+        if version_match is not None
+        else None
+    )
+    if expected_dataset_dir is None or dataset_dir != expected_dataset_dir.resolve():
+        blockers.append(
+            "Training data path must match its versioned reference_eda dataset"
+        )
+    else:
+        report_path = dataset_dir / "dataset_report.json"
+        try:
+            dataset_report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            blockers.append(f"Dataset release report is unavailable or invalid: {error}")
+        else:
+            if dataset_report.get("dataset_version") != config["dataset_version"]:
+                blockers.append(
+                    "Configured dataset version does not match dataset_report.json"
+                )
     try:
         source_validation = validate_dataset(dataset_dir, require_approved=False)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         blockers.append(f"Dataset validation failed: {error}")
         source_validation = None
+    if source_validation is not None and not source_validation.get(
+        "release_manifest_validated"
+    ):
+        blockers.append("Dataset release manifest is missing or was not validated")
 
     approved_dataset_dir = dataset_dir / "approved_only"
     approved_validation: dict[str, Any] | None = None

@@ -1,0 +1,19 @@
+{
+  "benchmark_file_sha256": "8c68410f14336956051461b585980cf5cda905a9a2852321be842ef16ae04a42",
+  "benchmark_version": "insightos-qwen3-8b-orchestration-benchmark-v4",
+  "bundle_sha256": "3c4c24d4b040e1b8c4fd515ff0ecb8af8b9d8dd18dd2fd13179a5c7b463a9cf9",
+  "execution_artifact": null,
+  "kaggle_environment_sha256": "19499271661ba368a21e549de7138be65ff52228e914d25a361a75c6da6422f1",
+  "metrics": null,
+  "model_id": "Qwen/Qwen3-8B",
+  "model_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+  "reason": "No Kaggle execution artifact has been supplied or validated.",
+  "report_version": "insightos-qwen3-8b-baseline-report-v5",
+  "sft_dataset_sha256": "e0ca35eed8556a7321eccd27a7a98b0f194eb12b4e89c78645b84527f698e7f0",
+  "sft_dataset_version": "insightos-qwen3-8b-orchestration-v3",
+  "status": "pending",
+  "tokenizer_id": "Qwen/Qwen3-8B",
+  "tokenizer_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+  "training_authorized": false,
+  "training_readiness": "NOT READY — BASELINE INCOMPLETE"
+}

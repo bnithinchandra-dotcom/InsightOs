@@ -1,0 +1,34 @@
+{
+  "aggregate_metrics": null,
+  "available_host_memory_gib_at_preflight": 1.76,
+  "baseline_status": "not_executed_resource_preflight_blocked",
+  "benchmark_sha256": "0c65a296b6780f65a90474c93e550c754b1cb8863e3030b842c7c11abe3a10f8",
+  "benchmark_version": "insightos-qwen3-8b-orchestration-benchmark-v1",
+  "blocker": "Available host RAM was below the existing local benchmark's safe load estimate. Baseline inference was not attempted.",
+  "generation_configuration": {
+    "num_predict": 512,
+    "seed": 20261105,
+    "temperature": 0,
+    "think": false,
+    "top_p": 1
+  },
+  "model": {
+    "architecture": "qwen3",
+    "artifact_size_bytes": 5225388164,
+    "digest": "500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+    "is_base_model": true,
+    "license": "Apache-2.0",
+    "parameters": 8190735360,
+    "provider": "ollama",
+    "quantization": "Q4_K_M",
+    "tag": "qwen3:8b"
+  },
+  "model_was_loaded_or_called": false,
+  "next_supported_path": "Run the benchmark in an isolated Kaggle inference session or another GPU host with adequate memory, pin this exact Ollama model digest, and store one immutable report per run.",
+  "per_case_results": null,
+  "report_version": "insightos-qwen3-8b-baseline-preflight-v1",
+  "runtime": {
+    "ollama_version": "0.40.14"
+  },
+  "safe_load_estimate_gib": 7.0
+}

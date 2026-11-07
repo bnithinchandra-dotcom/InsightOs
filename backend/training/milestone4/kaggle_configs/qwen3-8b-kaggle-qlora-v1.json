@@ -1,0 +1,71 @@
+{
+  "approval_gates": {
+    "dataset_level_human_validation_is_provenance_only": true,
+    "require_independent_baseline_before_training": true,
+    "require_record_level_approval_before_training": true,
+    "training_authorized": false
+  },
+  "base_method": "QLoRA",
+  "benchmark_sha256": "e751cfe031ce017e0cabe12227a468d2a8d0f431c88d66eb85298d7fa419351b",
+  "benchmark_version": "insightos-qwen3-8b-orchestration-benchmark-v2",
+  "blockers": [
+    "Kaggle QLoRA compatibility has not been executed or verified.",
+    "12 generated supplement examples are outside the owner-reported review scope.",
+    "The independent base-model benchmark remains pending Kaggle execution.",
+    "No QLoRA run is authorized."
+  ],
+  "config_version": "insightos-kaggle-qlora-preparation-v1",
+  "dataset_path": "backend/training/qwen3-8b/releases/insightos-agent-sft-v3/insightos-agent-sft-v3.jsonl",
+  "dataset_sha256": "e0ca35eed8556a7321eccd27a7a98b0f194eb12b4e89c78645b84527f698e7f0",
+  "dataset_version": "insightos-qwen3-8b-orchestration-v3",
+  "kaggle_candidate_environment": {
+    "compatibility_status": "unverified_without Kaggle execution evidence",
+    "do_not_infer_from_backend_or_reference_eda_environment": true,
+    "notebook_runtime": "Kaggle-provided Linux/CUDA; exact versions recorded at run",
+    "package_versions_observed": null,
+    "reference_notebook_method": "Unsloth FastLanguageModel QLoRA"
+  },
+  "load_in_4bit": true,
+  "lora": {
+    "alpha": 16,
+    "dropout": 0.05,
+    "rank": 8,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ]
+  },
+  "model_id": "Qwen/Qwen3-8B",
+  "model_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+  "quantization": {
+    "compute_dtype": "float16",
+    "double_quantization": true,
+    "type": "NF4"
+  },
+  "runtime_capture_required": [
+    "python",
+    "torch",
+    "transformers",
+    "accelerate",
+    "bitsandbytes",
+    "peft",
+    "trl",
+    "unsloth",
+    "cuda",
+    "gpu_name_and_vram"
+  ],
+  "sequence_length": 1024,
+  "status": "preparation_only",
+  "training_parameters": {
+    "gradient_accumulation_steps": 8,
+    "gradient_checkpointing": true,
+    "num_train_epochs": 1,
+    "per_device_batch_size": 1
+  },
+  "training_started": false
+}

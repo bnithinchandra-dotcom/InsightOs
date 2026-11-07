@@ -315,7 +315,10 @@ def _evaluation_suite(examples: list[dict[str, Any]]) -> dict[str, Any]:
             "validation": "training configuration and overfitting monitoring",
             "test": "final generalization evaluation only; never use to tune training or rewrite examples",
             "grouping": "all examples from a scenario topic and synthetic fixture stay in one split",
-            "scenario_coverage": "all five industries occur in every split",
+            "scenario_coverage": (
+                "The versioned dataset split policy determines scenario coverage; "
+                "domain-held-out releases intentionally hold out domains."
+            ),
         },
         "cases": cases,
     }
