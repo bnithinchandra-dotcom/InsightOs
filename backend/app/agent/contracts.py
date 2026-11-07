@@ -39,7 +39,7 @@ class ModelRequest:
     messages: tuple[ProviderMessage, ...]
     tools: tuple[dict[str, Any], ...]
     max_output_tokens: int
-    response_format: Literal["json"] | None = None
+    response_format: Literal["json"] | dict[str, Any] | None = None
     task_category: str | None = None
     workflow_id: str | None = None
     timeout_seconds: float | None = None
@@ -196,6 +196,12 @@ class ToolResult:
     references: tuple[dict[str, Any], ...] = ()
     limitations: tuple[str, ...] = ()
     error_code: str | None = None
+    retryable: bool | None = None
+    scheduler_attempts: int | None = None
+    scheduler_max_retries: int | None = None
+    scheduler_task_id: str | None = None
+    scheduler_workflow_id: str | None = None
+    retry_identity: str | None = None
 
 
 @dataclass(frozen=True)

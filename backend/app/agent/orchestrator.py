@@ -30,6 +30,10 @@ _INSPECTION_TERMS = {
     "types": re.compile(r"\b(types?|schema|data\s+types?)\b", re.IGNORECASE),
     "duplicates": re.compile(r"\bduplicates?|duplicate\s+rows?\b", re.IGNORECASE),
 }
+_USER_SUPPLIED_PROFILE_COUNTS = re.compile(
+    r"(?=.*\bprofile\b)(?=.*\b\d+\s+rows?\b)(?=.*\b\d+\s+columns?\b)",
+    re.IGNORECASE | re.DOTALL,
+)
 _UNSUPPORTED_ANALYTICS = re.compile(
     r"\b(top\s+\d+|sum|total|highest|lowest|trend|forecast|predict|"
     r"prediction|correlation|average|mean|median|anomal(?:y|ies)|"
@@ -733,6 +737,12 @@ def execute_orchestrated_inspection(
         return None
     intent = _inspection_intent(user_message)
     if intent is None:
+        return None
+    if (
+        not intent.unsupported
+        and set(intent.requested_facts).issubset({"rows", "columns"})
+        and _USER_SUPPLIED_PROFILE_COUNTS.search(user_message)
+    ):
         return None
     registered_tools = {
         item.get("function", {}).get("name")

@@ -238,6 +238,7 @@ class WorkflowExecutionTests(unittest.TestCase):
                             WorkflowTaskExecutionError(
                                 "provider_timeout",
                                 "The specialist provider timed out.",
+                                retryable=True,
                             )
                         )
                     )
@@ -253,6 +254,7 @@ class WorkflowExecutionTests(unittest.TestCase):
                     "status": "failed",
                     "summary": "The specialist provider timed out.",
                     "error_code": "provider_timeout",
+                    "retryable": True,
                 },
             )
 

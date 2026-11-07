@@ -5,6 +5,7 @@ import json
 import logging
 from contextlib import ExitStack
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Annotated, Literal
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -21,6 +22,7 @@ from app.agent.config import (
     MAX_USER_MESSAGE_CHARS,
     get_agent_settings,
 )
+from app.agent.slim_orchestrator import tool_operation_identity
 from app.agent.checkpointer import get_initialized_postgres_checkpoint_saver
 from app.agent.contracts import (
     AgentOutcome,
@@ -802,6 +804,37 @@ def _workflow_tool_scheduler(
                 tool_name,
                 None,
             )
+        retry_identity: str | None = None
+
+        def with_scheduler_metadata(
+            result: ToolResult,
+            task: WorkflowTask | None = None,
+        ) -> ToolResult:
+            summary = task.result_summary if task is not None else None
+            attempts = (
+                task.retry_count + 1
+                if task is not None
+                and task.status in {"completed", "failed"}
+                and isinstance(summary, dict)
+                else None
+            )
+            retryable = result.retryable
+            if retryable is None and isinstance(summary, dict):
+                stored_retryable = summary.get("retryable")
+                if isinstance(stored_retryable, bool):
+                    retryable = stored_retryable
+            return replace(
+                result,
+                retryable=retryable,
+                scheduler_attempts=attempts,
+                scheduler_max_retries=(
+                    task.max_retries if task is not None else None
+                ),
+                scheduler_task_id=task.task_key if task is not None else None,
+                scheduler_workflow_id=workflow_id,
+                retry_identity=retry_identity,
+            )
+
         dataset_id = arguments.get("dataset_id", context.get("dataset_id"))
         if dataset_id is None and isinstance(arguments.get("sources"), list):
             first_source = next(
@@ -834,6 +867,18 @@ def _workflow_tool_scheduler(
                     dataset_id,
                     owner_user_id,
                 )
+                if (
+                    isinstance(source_identity, dict)
+                    and isinstance(source_identity.get("source_fingerprint"), str)
+                ):
+                    context["source_fingerprint"] = source_identity[
+                        "source_fingerprint"
+                    ]
+                retry_identity = tool_operation_identity(
+                    tool_name,
+                    arguments,
+                    context,
+                )
                 identity = json.dumps(
                     {
                         "tool": tool_name,
@@ -861,14 +906,7 @@ def _workflow_tool_scheduler(
                     if source_identity is not None
                     else None
                 )
-                task_key = (
-                    task_key
-                    or (
-                        f"tool:{tool_name}:{input_digest[:24]}"
-                        if idempotent
-                        else f"tool:{tool_name}:{uuid4().hex[:24]}"
-                    )
-                )
+                task_key = task_key or f"tool:{input_digest[:48]}"
                 dependencies = depends_on or []
                 plan_item = {
                     "task_id": task_key,
@@ -899,6 +937,19 @@ def _workflow_tool_scheduler(
                     "max_retries": max_retries if idempotent else 0,
                 }
                 task = persist_workflow_task(session, workflow, plan_item)
+                if (
+                    task.status == "failed"
+                    and task.idempotent
+                    and task.retry_count < task.max_retries
+                    and isinstance(task.result_summary, dict)
+                    and task.result_summary.get("retryable") is True
+                ):
+                    task.status = "pending"
+                    task.retry_count += 1
+                    task.result_summary = None
+                    task.output_references = []
+                    task.error_code = None
+                    task.completed_at = None
                 session.commit()
                 task_id = task.id
         except (SQLAlchemyError, WorkflowPlanError, LookupError) as error:
@@ -932,6 +983,7 @@ def _workflow_tool_scheduler(
                 raise WorkflowTaskExecutionError(
                     result.error_code or "task_execution_failed",
                     result.summary,
+                    retryable=result.retryable,
                 )
             return {
                 "status": result.status,
@@ -941,6 +993,7 @@ def _workflow_tool_scheduler(
                 "references": list(result.references),
                 "limitations": list(result.limitations),
                 "error_code": result.error_code,
+                "retryable": result.retryable,
                 "label": label,
             }
 
@@ -1004,10 +1057,17 @@ def _workflow_tool_scheduler(
                 ):
                     return (
                         "",
-                        ToolResult(
-                            status="failed",
-                            summary="The scheduled tool operation did not complete.",
-                            error_code=task.error_code if task else "workflow_task_missing",
+                        with_scheduler_metadata(
+                            ToolResult(
+                                status="failed",
+                                summary="The scheduled tool operation did not complete.",
+                                error_code=(
+                                    task.error_code
+                                    if task
+                                    else "workflow_task_missing"
+                                ),
+                            ),
+                            task,
                         ),
                         tool_name,
                         None,
@@ -1015,13 +1075,21 @@ def _workflow_tool_scheduler(
                 if task.status != "completed":
                     if last_execution and last_execution[-1][1].status == "failed":
                         raw_output, result, label = last_execution[-1]
-                        return raw_output, result, label, task.task_key
+                        return (
+                            raw_output,
+                            with_scheduler_metadata(result, task),
+                            label,
+                            task.task_key,
+                        )
                     return (
                         "",
-                        ToolResult(
-                            status="failed",
-                            summary="The scheduled tool operation did not complete.",
-                            error_code=task.error_code or "workflow_task_failed",
+                        with_scheduler_metadata(
+                            ToolResult(
+                                status="failed",
+                                summary="The scheduled tool operation did not complete.",
+                                error_code=task.error_code or "workflow_task_failed",
+                            ),
+                            task,
                         ),
                         tool_name,
                         task.task_key,
@@ -1034,14 +1102,22 @@ def _workflow_tool_scheduler(
                     )
                     if task_reference_output is not None:
                         raw_output = task_reference_output
-                    return raw_output, result, label, task.task_key
+                    return (
+                        raw_output,
+                        with_scheduler_metadata(result, task),
+                        label,
+                        task.task_key,
+                    )
                 if not isinstance(task.result_summary, dict):
                     return (
                         "",
-                        ToolResult(
-                            status="failed",
-                            summary="The completed tool output could not be recovered.",
-                            error_code="workflow_result_unavailable",
+                        with_scheduler_metadata(
+                            ToolResult(
+                                status="failed",
+                                summary="The completed tool output could not be recovered.",
+                                error_code="workflow_result_unavailable",
+                            ),
+                            task,
                         ),
                         tool_name,
                         task.task_key,
@@ -1055,6 +1131,11 @@ def _workflow_tool_scheduler(
                     references=tuple(stored.get("references", [])),
                     limitations=tuple(stored.get("limitations", [])),
                     error_code=stored.get("error_code"),
+                    retryable=(
+                        stored.get("retryable")
+                        if isinstance(stored.get("retryable"), bool)
+                        else None
+                    ),
                 )
                 task_reference_output, result = attach_analytics_task_reference(
                     result,
@@ -1076,7 +1157,12 @@ def _workflow_tool_scheduler(
                 )
                 if task_reference_output is not None:
                     raw_output = task_reference_output
-                return raw_output, result, stored.get("label", tool_name), task.task_key
+                return (
+                    raw_output,
+                    with_scheduler_metadata(result, task),
+                    stored.get("label", tool_name),
+                    task.task_key,
+                )
         except (SQLAlchemyError, WorkflowPlanError, LookupError) as error:
             logger.error(
                 "Workflow task execution failed for %s (%s)",
@@ -1090,10 +1176,12 @@ def _workflow_tool_scheduler(
             )
             return (
                 "",
-                ToolResult(
-                    status="failed",
-                    summary="The scheduled tool operation could not be completed.",
-                    error_code="workflow_task_execution_failed",
+                with_scheduler_metadata(
+                    ToolResult(
+                        status="failed",
+                        summary="The scheduled tool operation could not be completed.",
+                        error_code="workflow_task_execution_failed",
+                    )
                 ),
                 tool_name,
                 None,
@@ -1752,6 +1840,59 @@ def _conversation_summary(conversation: Conversation) -> dict[str, Any]:
     }
 
 
+def _pending_clarification_for_workflow(
+    workflow: WorkflowExecution,
+) -> dict[str, Any] | None:
+    source_scope = workflow.source_scope
+    pending = source_scope.get("pending_clarification") if isinstance(source_scope, dict) else None
+    if (
+        not isinstance(pending, dict)
+        or pending.get("state") != "pending"
+        or not isinstance(pending.get("questions"), list)
+        or not pending["questions"]
+        or len(pending["questions"]) > 8
+        or any(
+            not isinstance(question, str) or not question.strip()
+            for question in pending["questions"]
+        )
+    ):
+        return None
+    return {
+        "workflow_id": workflow.id,
+        "questions": [question[:2_000] for question in pending["questions"]],
+    }
+
+
+def _pending_clarification_from_results(
+    results: Any,
+    *,
+    workflow_id: str,
+) -> dict[str, Any] | None:
+    if not isinstance(results, (list, tuple)):
+        return None
+    for result in results:
+        if (
+            not isinstance(result, dict)
+            or result.get("type") != "pending_clarification"
+            or result.get("status") != "pending"
+            or result.get("workflow_id") != workflow_id
+        ):
+            continue
+        questions = result.get("questions")
+        if (
+            not isinstance(questions, list)
+            or not questions
+            or len(questions) > 8
+            or any(
+                not isinstance(question, str) or not question.strip()
+                for question in questions
+            )
+        ):
+            return None
+        return {"workflow_id": workflow_id, "questions": [q[:2_000] for q in questions]}
+    return None
+
+
 def _message_response(message: ConversationMessage) -> dict[str, Any]:
     return {
         "id": message.id,
@@ -2091,6 +2232,32 @@ def send_conversation_message(
                 }
                 for item in history_rows
             ]
+            pending_workflows = (
+                session.query(WorkflowExecution)
+                .filter(
+                    WorkflowExecution.conversation_id == conversation.id,
+                    WorkflowExecution.owner_user_id == owner.id,
+                )
+                .order_by(
+                    WorkflowExecution.created_at.desc(),
+                    WorkflowExecution.id.desc(),
+                )
+                .limit(MAX_MESSAGES_PER_CONVERSATION)
+                .all()
+            )
+            pending_clarification = next(
+                (
+                    pending_state
+                    for workflow_item in pending_workflows
+                    if (
+                        pending_state := _pending_clarification_for_workflow(
+                            workflow_item
+                        )
+                    )
+                    is not None
+                ),
+                None,
+            )
             next_sequence = (
                 session.query(func.max(ConversationMessage.sequence))
                 .filter(ConversationMessage.conversation_id == conversation_id)
@@ -2118,6 +2285,15 @@ def send_conversation_message(
                 source_scope={
                     "project_id": conversation.project_id,
                     "dataset_id": conversation.dataset_id,
+                    **(
+                        {
+                            "continuation_of_workflow_id": (
+                                pending_clarification["workflow_id"]
+                            )
+                        }
+                        if pending_clarification is not None
+                        else {}
+                    ),
                 },
                 started_at=now,
             )
@@ -2135,6 +2311,8 @@ def send_conversation_message(
                 "conversation_id": conversation.id,
                 "workflow_id": workflow_id,
                 "owner_user_id": owner.id,
+                "orchestration_contract_version": 1,
+                "pending_clarification": pending_clarification,
             }
             session.commit()
             session.refresh(user_message)
@@ -2181,6 +2359,10 @@ def send_conversation_message(
             error_code="agent_execution_failed",
         )
         metadata = public_outcome_metadata(outcome)
+    pending_clarification_result = _pending_clarification_from_results(
+        outcome.structured_results,
+        workflow_id=context["workflow_id"],
+    )
     try:
         assistant_size = len(outcome.assistant_text.encode("utf-8"))
         metadata_size = len(
@@ -2195,21 +2377,43 @@ def send_conversation_message(
         assistant_size = MAX_PERSISTED_MESSAGE_BYTES + 1
         metadata_size = MAX_PERSISTED_MESSAGE_BYTES + 1
     if assistant_size + metadata_size > MAX_PERSISTED_MESSAGE_BYTES:
-        outcome_text = (
-            "The request produced results that exceeded the safe conversation storage limit. "
-            "Please retry with a narrower request."
-        )
-        metadata = {
-            "execution_status": "partial",
-            "tool_activities": [],
-            "structured_results": [],
-            "warnings": ["The conversation response exceeded its storage limit."],
-            "error_code": "response_too_large",
-            "usage": {
-                "input_tokens": outcome.usage.input_tokens,
-                "output_tokens": outcome.usage.output_tokens,
-            },
-        }
+        if pending_clarification_result is not None:
+            outcome_text = outcome.assistant_text
+            metadata = {
+                "execution_status": "blocked",
+                "tool_activities": [],
+                "structured_results": [
+                    {
+                        "type": "pending_clarification",
+                        "status": "pending",
+                        **pending_clarification_result,
+                    }
+                ],
+                "warnings": [
+                    "Some unrelated workflow results exceeded the safe conversation storage limit."
+                ],
+                "error_code": None,
+                "usage": {
+                    "input_tokens": outcome.usage.input_tokens,
+                    "output_tokens": outcome.usage.output_tokens,
+                },
+            }
+        else:
+            outcome_text = (
+                "The request produced results that exceeded the safe conversation storage limit. "
+                "Please retry with a narrower request."
+            )
+            metadata = {
+                "execution_status": "partial",
+                "tool_activities": [],
+                "structured_results": [],
+                "warnings": ["The conversation response exceeded its storage limit."],
+                "error_code": "response_too_large",
+                "usage": {
+                    "input_tokens": outcome.usage.input_tokens,
+                    "output_tokens": outcome.usage.output_tokens,
+                },
+            }
     else:
         outcome_text = outcome.assistant_text
 
@@ -2272,7 +2476,12 @@ def send_conversation_message(
                 source_identity = trace["data"].get("source_identity")
                 if isinstance(source_identity, dict):
                     fingerprint = source_identity.get("source_fingerprint")
-                    workflow.source_scope = {
+                    workflow_scope = (
+                        dict(workflow.source_scope)
+                        if isinstance(workflow.source_scope, dict)
+                        else {}
+                    )
+                    workflow_scope.update({
                         "project_id": context["project_id"],
                         "dataset_id": source_identity.get(
                             "dataset_id",
@@ -2284,7 +2493,8 @@ def send_conversation_message(
                             if isinstance(fingerprint, str) and len(fingerprint) <= 128
                             else None
                         ),
-                    }
+                    })
+                    workflow.source_scope = workflow_scope
             workflow_status = {
                 "completed": "completed",
                 "partial": "partial",
@@ -2313,10 +2523,64 @@ def send_conversation_message(
                     workflow_status = "blocked"
                 else:
                     workflow_status = "failed"
+            workflow_scope = (
+                dict(workflow.source_scope)
+                if isinstance(workflow.source_scope, dict)
+                else {}
+            )
+            if pending_clarification_result is not None:
+                workflow_status = "blocked"
+                workflow_scope["pending_clarification"] = {
+                    "state": "pending",
+                    "questions": pending_clarification_result["questions"],
+                }
+                metadata["execution_status"] = "blocked"
+                assistant_message.metadata_json = metadata
+
+            prior_pending = context.get("pending_clarification")
+            prior_workflow_id = (
+                prior_pending.get("workflow_id")
+                if isinstance(prior_pending, dict)
+                else None
+            )
+            if (
+                isinstance(prior_workflow_id, str)
+                and prior_workflow_id != workflow.id
+                and (
+                    pending_clarification_result is not None
+                    or outcome.status in {"completed", "partial"}
+                )
+            ):
+                prior_workflow = session.get(WorkflowExecution, prior_workflow_id)
+                if (
+                    prior_workflow is not None
+                    and prior_workflow.owner_user_id == context["owner_user_id"]
+                    and prior_workflow.conversation_id == conversation_id
+                ):
+                    prior_scope = (
+                        dict(prior_workflow.source_scope)
+                        if isinstance(prior_workflow.source_scope, dict)
+                        else {}
+                    )
+                    prior_clarification = prior_scope.get("pending_clarification")
+                    if (
+                        isinstance(prior_clarification, dict)
+                        and prior_clarification.get("state") == "pending"
+                    ):
+                        prior_scope["pending_clarification"] = {
+                            **prior_clarification,
+                            "state": "resolved",
+                            "resolved_by_workflow_id": workflow.id,
+                        }
+                        prior_workflow.source_scope = prior_scope
+                        prior_workflow.status = "completed"
+                        prior_workflow.completed_at = _utcnow()
+
+            workflow.source_scope = workflow_scope
             if task_statuses or workflow.error_code in {
                 "workflow_task_persistence_failed",
                 "workflow_task_execution_failed",
-            }:
+            } or pending_clarification_result is not None:
                 metadata["execution_status"] = workflow_status
                 if workflow.error_code and metadata.get("error_code") is None:
                     metadata["error_code"] = workflow.error_code

@@ -437,7 +437,9 @@ def run_data_intelligence(
         instruction=(
             "You are Agent 1, Data Intelligence. Use only the provided selected-file "
             "metadata and stored profile. Select observed field names only from that "
-            "evidence. Recommend exactly the operation already requested."
+            "evidence. Recommend exactly the operation already requested. If required "
+            "evidence is missing or uncertain, return a blocked status and explain the "
+            "uncertainty for the 8B orchestrator; do not question the user directly."
         ),
         context={
             "workflow_id": workflow_id,
@@ -519,7 +521,9 @@ def run_analytics_decision(
         instruction=(
             "You are Agent 2, Analytics and Modelling. The deterministic engine "
             "performs calculations. Approve only the exact explicitly requested "
-            "allowlisted tool and arguments supplied; never invent or modify arguments."
+            "allowlisted tool and arguments supplied; never invent or modify arguments. "
+            "If the operation or evidence is ambiguous, return a blocked or unsupported "
+            "status for the 8B orchestrator; do not question the user directly."
         ),
         context=context,
         model=AnalyticsDecision,
@@ -563,7 +567,9 @@ def run_presentation(
             "You are Agent 3, Insights and Visualization. Interpret only the supplied "
             "verified engine output. Cite only supplied references. Do not introduce "
             "new numerical claims, metrics, fields, or successful operations. Return "
-            "no visualization specification unless the engine result supports it."
+            "no visualization specification unless the engine result supports it. If "
+            "the output is insufficient or uncertain, surface that limitation to the "
+            "8B orchestrator; do not question the user directly."
         ),
         context={
             "workflow_id": workflow_id,

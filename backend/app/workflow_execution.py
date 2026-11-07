@@ -43,10 +43,17 @@ class WorkflowPlanError(ValueError):
 
 
 class WorkflowTaskExecutionError(RuntimeError):
-    def __init__(self, code: str, summary: str):
+    def __init__(
+        self,
+        code: str,
+        summary: str,
+        *,
+        retryable: bool | None = None,
+    ):
         super().__init__(summary)
         self.code = code
         self.summary = summary
+        self.retryable = retryable
 
 
 def _utcnow() -> datetime:
@@ -564,6 +571,12 @@ def recover_persisted_workflow(
             if not task.idempotent or task.task_type not in handlers:
                 report["not_replayed"].append(task.task_key)
                 continue
+            if (
+                not isinstance(task.result_summary, dict)
+                or task.result_summary.get("retryable") is not True
+            ):
+                report["not_replayed"].append(task.task_key)
+                continue
             if task.retry_count >= task.max_retries:
                 report["not_replayed"].append(task.task_key)
                 continue
@@ -727,6 +740,7 @@ def run_persisted_workflow(
                 if (
                     task.idempotent
                     and not task.task_type.startswith("specialist_")
+                    and getattr(error, "retryable", True) is True
                     and task.retry_count < task.max_retries
                 ):
                     task.retry_count += 1
@@ -745,12 +759,18 @@ def run_persisted_workflow(
                     and 1 <= len(code) <= 64
                     else "task_execution_failed"
                 )
-                if isinstance(summary, str) and summary:
-                    task.result_summary = {
-                        "status": "failed",
-                        "summary": summary[:1000],
-                        "error_code": task.error_code,
-                    }
+                task.result_summary = {
+                    "status": "failed",
+                    "summary": (
+                        summary[:1000]
+                        if isinstance(summary, str) and summary
+                        else "The workflow task failed."
+                    ),
+                    "error_code": task.error_code,
+                }
+                retryable = getattr(error, "retryable", True)
+                if isinstance(retryable, bool):
+                    task.result_summary["retryable"] = retryable
                 task.completed_at = _utcnow()
                 session.flush()
                 break

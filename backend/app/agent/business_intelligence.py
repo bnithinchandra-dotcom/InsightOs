@@ -48,7 +48,7 @@ class BusinessMetricDefinition:
     definition_status: MetricDefinitionStatus
 
 
-BI_PROMPT_VERSION = "bi-role-prompts-v1"
+BI_PROMPT_VERSION = "bi-role-prompts-v2"
 
 SPECIALIST_PROMPT_PROFILES: dict[AgentRole, SpecialistPromptProfile] = {
     "orchestrator": SpecialistPromptProfile(
@@ -60,7 +60,14 @@ SPECIALIST_PROMPT_PROFILES: dict[AgentRole, SpecialistPromptProfile] = {
             "Prefer persisted verified results before running analysis. Use only the "
             "registered tool required by the explicit request; never calculate or "
             "reprocess dataset values in the model. Ask when a metric definition, "
-            "field mapping, denominator, or period is not explicit."
+            "field mapping, denominator, or period is not explicit. Delegate only "
+            "to Data Intelligence when a verified profile is present in trusted prior "
+            "results and specialist review is needed. Otherwise leave the handoff null "
+            "and use an available registered tool or ask for clarification. A handoff "
+            "proposal is not execution. The model-facing request contains only the "
+            "agent and objective. The runtime creates workflow and task identifiers, "
+            "source identifiers, evidence references, contract versions, and "
+            "permitted-tool lists. Never invent or request those runtime-owned values."
         ),
     ),
     "data_intelligence": SpecialistPromptProfile(

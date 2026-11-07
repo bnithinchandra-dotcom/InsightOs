@@ -525,7 +525,15 @@ class OllamaProvider(_HttpProvider):
                 "options": options,
                 **thinking_option,
                 **keep_alive_option,
-                **({"format": "json"} if request.response_format == "json" else {}),
+                **(
+                    {
+                        "format": request.response_format
+                        if isinstance(request.response_format, dict)
+                        else "json"
+                    }
+                    if request.response_format is not None
+                    else {}
+                ),
             },
             {},
             timeout_seconds=request.timeout_seconds,
@@ -691,6 +699,11 @@ class OpenAICompatibleProvider(_HttpProvider):
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         self._validate_request_capabilities(request)
+        if isinstance(request.response_format, dict):
+            raise ProviderError(
+                "provider_capability_unverified",
+                "The configured OpenAI-compatible provider has not been verified for JSON Schema constrained output; use JSON-only mode instead.",
+            )
         if (
             not isinstance(request.model, str)
             or not request.model.strip()

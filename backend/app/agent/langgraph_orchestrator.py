@@ -335,6 +335,12 @@ def _engine_result_payload(result: ToolResult) -> dict[str, Any]:
         "references": [dict(item) for item in result.references[:MAX_GRAPH_REFERENCES]],
         "limitations": list(result.limitations[:32]),
         "error_code": result.error_code,
+        "retryable": result.retryable,
+        "scheduler_attempts": result.scheduler_attempts,
+        "scheduler_max_retries": result.scheduler_max_retries,
+        "scheduler_task_id": result.scheduler_task_id,
+        "scheduler_workflow_id": result.scheduler_workflow_id,
+        "retry_identity": result.retry_identity,
     }
     if _encoded_size(payload) > 32 * 1024:
         raise SpecialistAgentError(
@@ -845,12 +851,20 @@ def build_specialist_graph(
             task_key=engine_task_key,
         )
         if engine_result.status != "succeeded":
-            return _failure(
+            failed = _failure(
                 state,
                 node="deterministic_bi_engine",
                 code=engine_result.error_code or "engine_execution_failed",
                 message=engine_result.summary,
             )
+            try:
+                failed["engine_result"] = _engine_result_payload(engine_result)
+            except SpecialistAgentError:
+                return failed
+            if task_key:
+                failed["engine_task_reference"] = task_key
+                failed["engine_result_reference"] = task_key
+            return failed
         engine_data = engine_result.data
         if (
             not isinstance(engine_data, dict)

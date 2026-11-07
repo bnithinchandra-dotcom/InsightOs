@@ -1250,6 +1250,7 @@ def _engine_intent_allowed(tool_name: str, context: dict[str, Any] | None) -> bo
         not isinstance(context, dict)
         or not isinstance(context.get("dataset_id"), int)
         or isinstance(context.get("dataset_id"), bool)
+        or context.get("_engine_operation_executed") is True
     ):
         return False
     message = context.get("user_message")
@@ -1290,6 +1291,29 @@ class ToolRegistry:
                 or _engine_intent_allowed(definition.name, context)
             )
         )
+
+    def validate_proposal(
+        self,
+        name: str,
+        raw_arguments: dict[str, Any],
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        definition = self._definitions.get(name)
+        if definition is None:
+            raise LookupError("The proposed tool is not registered.")
+        exposed_names = {
+            function["name"]
+            for schema in self.provider_schemas(context=context)
+            if isinstance((function := schema.get("function")), dict)
+            and isinstance(function.get("name"), str)
+        }
+        if name not in exposed_names:
+            raise PermissionError("The proposed tool is not available in this context.")
+        if not isinstance(raw_arguments, dict):
+            raise TypeError("Tool arguments must be a JSON object.")
+        arguments = definition.arguments_model.model_validate(raw_arguments)
+        return arguments.model_dump(mode="json")
 
     def is_engine_operation(self, name: str) -> bool:
         definition = self._definitions.get(name)
@@ -1531,6 +1555,7 @@ class ToolRegistry:
                     status="failed",
                     summary=error.message,
                     error_code=error.code,
+                    retryable=error.retryable,
                 )
             except Exception as error:
                 logger.error("Agent tool %s failed (%s)", name, type(error).__name__)
@@ -1565,6 +1590,7 @@ class ToolRegistry:
                 "references": value.references,
                 "limitations": value.limitations,
                 "error_code": value.error_code,
+                "retryable": value.retryable,
             },
         )
         if execution.status != "completed":

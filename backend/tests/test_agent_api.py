@@ -1,3 +1,4 @@
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -130,6 +131,194 @@ class ConversationApiTests(unittest.TestCase):
         self.assertEqual(page.json()["total_messages"], 3)
         self.assertEqual([item["sequence"] for item in page.json()["messages"]], [2, 3])
 
+    def test_clarification_is_persisted_as_a_paused_workflow(self):
+        conversation = self._create_conversation()
+
+        def clarify(**kwargs):
+            workflow_id = kwargs["context"]["workflow_id"]
+            return AgentOutcome(
+                status="blocked",
+                assistant_text="Which dataset should I use?",
+                activities=(),
+                structured_results=(
+                    {
+                        "type": "pending_clarification",
+                        "status": "pending",
+                        "workflow_id": workflow_id,
+                        "questions": ["Which dataset should I use?"],
+                    },
+                ),
+                warnings=(),
+                usage=UsageMetadata(),
+            )
+
+        with patch.object(
+            chat_api,
+            "get_initialized_postgres_checkpoint_saver",
+            return_value=object(),
+        ), patch.object(
+            chat_api,
+            "execute_agent_request",
+            side_effect=clarify,
+        ):
+            response = self.client.post(
+                f"/api/v1/chat/conversations/{conversation['id']}/messages",
+                json={"content": "Build a dashboard from my data."},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["execution_status"], "blocked")
+        workflow_id = response.json()["workflow_id"]
+        with self.session_factory() as session:
+            workflow = session.get(WorkflowExecution, workflow_id)
+            self.assertEqual(workflow.status, "blocked")
+            self.assertEqual(
+                workflow.source_scope["pending_clarification"],
+                {
+                    "state": "pending",
+                    "questions": ["Which dataset should I use?"],
+                },
+            )
+
+    def test_user_answer_resumes_the_pending_clarification_workflow(self):
+        conversation = self._create_conversation()
+
+        def clarify(**kwargs):
+            workflow_id = kwargs["context"]["workflow_id"]
+            return AgentOutcome(
+                status="blocked",
+                assistant_text="Which dataset should I use?",
+                activities=(),
+                structured_results=(
+                    {
+                        "type": "pending_clarification",
+                        "status": "pending",
+                        "workflow_id": workflow_id,
+                        "questions": ["Which dataset should I use?"],
+                    },
+                ),
+                warnings=(),
+                usage=UsageMetadata(),
+            )
+
+        with patch.object(
+            chat_api,
+            "get_initialized_postgres_checkpoint_saver",
+            return_value=object(),
+        ), patch.object(chat_api, "execute_agent_request", side_effect=clarify):
+            first = self.client.post(
+                f"/api/v1/chat/conversations/{conversation['id']}/messages",
+                json={"content": "Build a dashboard from my data."},
+            )
+        self.assertEqual(first.status_code, 200, first.text)
+        pending_workflow_id = first.json()["workflow_id"]
+        captured_context = {}
+
+        def resume(**kwargs):
+            captured_context.update(kwargs["context"])
+            return AgentOutcome(
+                status="completed",
+                assistant_text="I will continue with dataset 42.",
+                activities=(),
+                structured_results=(),
+                warnings=(),
+                usage=UsageMetadata(),
+            )
+
+        with patch.object(
+            chat_api,
+            "get_initialized_postgres_checkpoint_saver",
+            return_value=object(),
+        ), patch.object(chat_api, "execute_agent_request", side_effect=resume):
+            second = self.client.post(
+                f"/api/v1/chat/conversations/{conversation['id']}/messages",
+                json={"content": "Use dataset 42."},
+            )
+
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(
+            captured_context["pending_clarification"],
+            {
+                "workflow_id": pending_workflow_id,
+                "questions": ["Which dataset should I use?"],
+            },
+        )
+        self.assertNotEqual(second.json()["workflow_id"], pending_workflow_id)
+        with self.session_factory() as session:
+            parent = session.get(WorkflowExecution, pending_workflow_id)
+            child = session.get(WorkflowExecution, second.json()["workflow_id"])
+            self.assertEqual(parent.status, "completed")
+            self.assertEqual(
+                parent.source_scope["pending_clarification"]["state"],
+                "resolved",
+            )
+            self.assertEqual(
+                child.source_scope["continuation_of_workflow_id"],
+                pending_workflow_id,
+            )
+
+    def test_failed_clarification_resume_keeps_the_original_question_pending(self):
+        conversation = self._create_conversation()
+
+        def clarify(**kwargs):
+            workflow_id = kwargs["context"]["workflow_id"]
+            return AgentOutcome(
+                status="blocked",
+                assistant_text="Which dataset should I use?",
+                activities=(),
+                structured_results=(
+                    {
+                        "type": "pending_clarification",
+                        "status": "pending",
+                        "workflow_id": workflow_id,
+                        "questions": ["Which dataset should I use?"],
+                    },
+                ),
+                warnings=(),
+                usage=UsageMetadata(),
+            )
+
+        with patch.object(
+            chat_api,
+            "get_initialized_postgres_checkpoint_saver",
+            return_value=object(),
+        ), patch.object(chat_api, "execute_agent_request", side_effect=clarify):
+            first = self.client.post(
+                f"/api/v1/chat/conversations/{conversation['id']}/messages",
+                json={"content": "Build a dashboard from my data."},
+            )
+        self.assertEqual(first.status_code, 200, first.text)
+        pending_workflow_id = first.json()["workflow_id"]
+        failure = AgentOutcome(
+            status="failed",
+            assistant_text="The model is unavailable.",
+            activities=(),
+            structured_results=(),
+            warnings=("Provider unavailable.",),
+            usage=UsageMetadata(),
+            error_code="provider_unavailable",
+        )
+        with patch.object(
+            chat_api,
+            "get_initialized_postgres_checkpoint_saver",
+            return_value=object(),
+        ), patch.object(
+            chat_api,
+            "execute_agent_request",
+            return_value=failure,
+        ):
+            second = self.client.post(
+                f"/api/v1/chat/conversations/{conversation['id']}/messages",
+                json={"content": "Use dataset 42."},
+            )
+        self.assertEqual(second.status_code, 200, second.text)
+        with self.session_factory() as session:
+            pending_workflow = session.get(WorkflowExecution, pending_workflow_id)
+            self.assertEqual(
+                pending_workflow.source_scope["pending_clarification"]["state"],
+                "pending",
+            )
+
     def test_invalid_context_ids_and_mismatched_dataset_return_client_errors(self):
         missing = self.client.post(
             "/api/v1/chat/conversations",
@@ -233,16 +422,35 @@ class ConversationApiTests(unittest.TestCase):
                     ModelResponse(
                         ProviderMessage(
                             role="assistant",
-                            content="Hello from the configured model.",
+                            content=json.dumps(
+                                {
+                                    "decision": "answer",
+                                    "intent": "Greet the user.",
+                                    "plan": [],
+                                    "tool_calls": [],
+                                    "handoff_request": None,
+                                    "response": "Hello from the configured model.",
+                                    "clarification_questions": [],
+                                }
+                            ),
                         ),
                         finish_reason="stop",
                     ),
                     ModelResponse(
                         ProviderMessage(
                             role="assistant",
-                            content="",
-                            tool_calls=(
-                                ToolCall("call-1", "list_projects", {}),
+                            content=json.dumps(
+                                {
+                                    "decision": "continue",
+                                    "intent": "List the projects.",
+                                    "plan": ["Use the registered project lookup."],
+                                    "tool_calls": [
+                                        {"name": "list_projects", "arguments": {}}
+                                    ],
+                                    "handoff_request": None,
+                                    "response": "The project lookup is proposed.",
+                                    "clarification_questions": [],
+                                }
                             ),
                         ),
                         finish_reason="tool_calls",
@@ -250,9 +458,19 @@ class ConversationApiTests(unittest.TestCase):
                     ModelResponse(
                         ProviderMessage(
                             role="assistant",
-                            content=(
-                                "The available projects are Assistant fixture "
-                                "and Other assistant fixture."
+                            content=json.dumps(
+                                {
+                                    "decision": "answer",
+                                    "intent": "Summarize the project lookup.",
+                                    "plan": ["Report the returned project names."],
+                                    "tool_calls": [],
+                                    "handoff_request": None,
+                                    "response": (
+                                        "The available projects are Assistant fixture "
+                                        "and Other assistant fixture."
+                                    ),
+                                    "clarification_questions": [],
+                                }
                             ),
                         ),
                         finish_reason="stop",
@@ -675,6 +893,7 @@ class ConversationApiTests(unittest.TestCase):
                     status="failed",
                     summary="The provider timed out.",
                     error_code="provider_timeout",
+                    retryable=True,
                 ),
                 "data_intelligence",
             ),
@@ -927,7 +1146,7 @@ class ConversationApiTests(unittest.TestCase):
         self.assertEqual(recovered.json()["status"], "completed")
         recovered_tasks = recovered.json()["recovery"]["recovered"]
         self.assertEqual(len(recovered_tasks), 1)
-        self.assertTrue(recovered_tasks[0].startswith("tool:list_files:"))
+        self.assertTrue(recovered_tasks[0].startswith("tool:"))
         self.assertEqual(repeated.status_code, 200, repeated.text)
         self.assertEqual(repeated.json()["recovery"]["recovered"], [])
         self.assertEqual(len(executions), 1)

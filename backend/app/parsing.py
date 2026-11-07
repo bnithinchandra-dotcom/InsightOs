@@ -748,7 +748,7 @@ class _XmlNode:
     attrib: dict[str, str]
     text: str = ""
     tail: str = ""
-    children: list[_XmlNode] = field(default_factory=list)
+    children: list["_XmlNode"] = field(default_factory=list)
 
     def __iter__(self):
         return iter(self.children)

@@ -58,6 +58,14 @@ class BusinessIntelligenceProfileTests(unittest.TestCase):
         self.assertIn("fixed checklist", optimized)
         self.assertNotIn(baseline, optimized)
 
+    def test_orchestrator_guidance_leaves_runtime_owned_handoff_fields_to_runtime(self):
+        instruction = SPECIALIST_PROMPT_PROFILES["orchestrator"].instruction
+
+        self.assertIn("Otherwise leave the handoff null", instruction)
+        self.assertIn("A handoff proposal is not execution", instruction)
+        self.assertIn("runtime creates workflow and task identifiers", instruction)
+        self.assertIn("permitted-tool lists", instruction)
+
     def test_model_specialization_profiles_do_not_change_registry_approval(self):
         self.assertEqual(
             MODEL_SPECIALIZATION_PROFILES["qwen3:8b"].intended_role,
