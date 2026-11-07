@@ -150,6 +150,64 @@ describe('conversation workspace', () => {
     expect(request).toBeTruthy()
   })
 
+  it('labels prepared, blocked, and repaired orchestrator outcomes clearly', async () => {
+    const defaultFetch = globalThis.fetch.getMockImplementation()
+    globalThis.fetch.mockImplementation(async (input, options = {}) => {
+      const url = new URL(String(input), window.location.origin)
+      if (
+        url.pathname === `/api/v1/chat/conversations/${conversation.id}`
+        && options.method !== 'POST'
+      ) {
+        return jsonResponse({
+          ...conversation,
+          total_messages: 1,
+          limit: 25,
+          offset: 0,
+          messages: [{
+            id: 23,
+            sequence: 2,
+            role: 'assistant',
+            content: 'The handoff was not dispatched.',
+            metadata: {
+              execution_status: 'partial',
+              tool_activities: [],
+              structured_results: [
+                {
+                  tool: 'specialist_handoff',
+                  status: 'proposed',
+                  summary: 'A runtime-owned specialist input contract was prepared.',
+                  data: { execution_status: 'not_dispatched' },
+                },
+                {
+                  tool: 'specialist_handoff',
+                  status: 'blocked',
+                  summary: 'No verified profile was available.',
+                  data: { reason: 'Missing trusted profile state.' },
+                },
+                {
+                  tool: 'orchestrator_contract_repair',
+                  status: 'succeeded',
+                  summary: 'The response was repaired before dispatch.',
+                  data: { repair_attempts: 1 },
+                },
+              ],
+              warnings: [],
+            },
+            created_at: '2026-10-19T10:01:01',
+          }],
+        })
+      }
+      return defaultFetch(input, options)
+    })
+
+    render(<ConversationWorkspace selectedConversationId={conversation.id} />)
+
+    expect(await screen.findByText('The handoff was not dispatched.')).toBeTruthy()
+    expect(screen.getByText('Specialist handoff prepared — not dispatched')).toBeTruthy()
+    expect(screen.getByText('Specialist handoff blocked')).toBeTruthy()
+    expect(screen.getByText('Orchestrator response repaired before dispatch')).toBeTruthy()
+  })
+
   it('creates a dashboard and saves a completed Assistant report by reference', async () => {
     const dashboard = {
       id: 'a'.repeat(32),

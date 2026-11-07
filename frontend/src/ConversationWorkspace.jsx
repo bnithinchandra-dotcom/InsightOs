@@ -187,6 +187,15 @@ function ToolActivityTimeline({ activities }) {
 function StructuredResultCard({ result, onSave, showCharts = true }) {
   const [expanded, setExpanded] = useState(false)
   const isReport = ['generate_evidence_report', 'generate_eda_evidence_report'].includes(result.tool)
+  const resultLabel = result.tool === 'specialist_handoff'
+    ? result.status === 'proposed'
+      ? 'Specialist handoff prepared — not dispatched'
+      : result.status === 'blocked'
+        ? 'Specialist handoff blocked'
+        : 'Specialist handoff'
+    : result.tool === 'orchestrator_contract_repair'
+      ? 'Orchestrator response repaired before dispatch'
+      : `${result.tool.replaceAll('_', ' ')} result`
   const saveRefs = isReport && result.status === 'succeeded'
     ? (result.references ?? []).filter(
         (reference) =>
@@ -198,7 +207,7 @@ function StructuredResultCard({ result, onSave, showCharts = true }) {
 
   return (
     <details className="structured-chat-result result-card" open>
-      <summary>{result.tool.replaceAll('_', ' ')} result</summary>
+      <summary>{resultLabel}</summary>
       {result.summary && <p className="result-card-summary">{result.summary}</p>}
       {showCharts && result.data?.charts?.map((chart) => (
         <ChartCard chart={chart} key={`${chart.title}-${chart.x_field}-${chart.y_field}`} />
